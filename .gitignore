@@ -1,0 +1,9 @@
+data/daily/
+forecasts/templates/
+forecasts/actuals/
+promos/raw/
+config/
+logs/
+__pycache__/
+*.pyc
+
