@@ -292,8 +292,19 @@ def sync_schedules_from_firebase(fb_client: firestore.Client, db_client: DBClien
         return 0
     
     user_data = user_doc.to_dict() or {}
-    settings = user_data.get('settings', {})
-    cycles = settings.get('orderCycles', [])
+    
+    # Try the correct nested path first (userSettings.notifications.scheduling.orderCycles)
+    cycles = (
+        user_data.get('userSettings', {})
+        .get('notifications', {})
+        .get('scheduling', {})
+        .get('orderCycles', [])
+    )
+    
+    # Fallback to old path for backwards compatibility
+    if not cycles:
+        settings = user_data.get('settings', {})
+        cycles = settings.get('orderCycles', [])
     
     count = 0
     now = datetime.now(timezone.utc).isoformat()
@@ -453,10 +464,10 @@ def regenerate_forecasts_after_finalization(
         print(f"     🧹 Cleaned up {cleaned} past forecasts")
     
     try:
-        # Get user's order schedules
-        schedules = get_user_schedules(fb_client, user_id)
+        # Get user's order schedules (tries DuckDB first, then Firebase)
+        schedules = get_user_schedules(fb_client, db_client, route_number)
         if not schedules:
-            print(f"     ⚠️  No schedules found for user {user_id}")
+            print(f"     ⚠️  No schedules found for route {route_number}")
             return
         
         # Calculate next delivery dates for each schedule
@@ -527,22 +538,40 @@ def regenerate_forecasts_after_finalization(
         print(f"     ❌ Error regenerating forecasts: {e}")
 
 
-def get_user_schedules(fb_client: firestore.Client, user_id: str) -> List[Dict]:
-    """Get user's order schedules from Firebase."""
-    if not user_id:
-        return []
+def get_user_schedules(fb_client: firestore.Client, db_client: DBClient, route_number: str) -> List[Dict]:
+    """Get user's order schedules - tries DuckDB first, falls back to Firebase.
     
+    Uses schedule_utils.get_order_cycles which handles the correct Firebase path
+    (userSettings.notifications.scheduling.orderCycles) with fallback.
+    """
     try:
-        user_doc = fb_client.collection('users').document(user_id).get()
-        if not user_doc.exists:
-            return []
-        
-        user_data = user_doc.to_dict() or {}
-        settings = user_data.get('settings', {})
-        return settings.get('orderCycles', [])
-    except Exception as e:
-        print(f"     ⚠️  Error getting user schedules: {e}")
-        return []
+        from schedule_utils import get_order_cycles
+        return get_order_cycles(fb_client, route_number, db_client=db_client)
+    except ImportError:
+        pass
+    
+    # Fallback: try to get from DuckDB directly
+    if db_client:
+        try:
+            result = db_client.query("""
+                SELECT order_day, load_day, delivery_day
+                FROM user_schedules
+                WHERE route_number = ? AND is_active = TRUE
+            """, [route_number])
+            
+            cycles = []
+            for row in result.get('rows', []):
+                cycles.append({
+                    'orderDay': row['order_day'],
+                    'loadDay': row['load_day'],
+                    'deliveryDay': row['delivery_day'],
+                })
+            if cycles:
+                return cycles
+        except Exception as e:
+            print(f"     ⚠️  Error getting schedules from DuckDB: {e}")
+    
+    return []
 
 
 def get_next_delivery_date(from_date, delivery_weekday: int) -> datetime:
