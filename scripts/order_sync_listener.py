@@ -218,6 +218,7 @@ def sync_stores_from_firebase(fb_client: firestore.Client, db_client: DBClient, 
         store_id = store_doc.id
         
         try:
+            # Note: Mobile app stores field as 'number', not 'storeNumber'
             db_client.write("""
                 INSERT INTO stores (store_id, route_number, store_name, store_number, is_active, synced_at)
                 VALUES (?, ?, ?, ?, ?, ?)
@@ -230,7 +231,7 @@ def sync_stores_from_firebase(fb_client: firestore.Client, db_client: DBClient, 
                 store_id,
                 route_number,
                 data.get('name', ''),
-                data.get('storeNumber', ''),
+                data.get('number', ''),  # Field is 'number' in Firestore
                 data.get('isActive', True),
                 now
             ])

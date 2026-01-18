@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Iterable, List, Optional, Dict
+from typing import Iterable, List, Optional, Dict, Tuple
 import sys
 import uuid
 
@@ -85,7 +85,7 @@ MIN_ORDERS_FOR_TRAINING = 8  # Minimum orders needed to train a model (more stri
 
 # Support running as a script without package context
 try:
-    from .models import ForecastItem, ForecastPayload, Product, StoreConfig, PriorOrderContext
+    from .models import ForecastItem, ForecastPayload, Product, StoreConfig, PriorOrderContext, ExpiryReplacementInfo
     from .firebase_loader import (
         get_firestore_client,
         load_master_catalog,
@@ -96,9 +96,10 @@ try:
     from .firebase_writer import write_cached_forecast
     from .schedule_utils import normalize_delivery_date, weekday_key, get_order_day_for_delivery, get_days_until_next_delivery, get_schedule_info
     from .case_allocator import allocate_cases_across_stores, get_historical_shares, get_item_case_pattern, set_db_client
+    from .low_quantity_loader import get_items_for_order_date, get_stores_for_sap, get_saps_to_suppress
 except ImportError:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
-    from models import ForecastItem, ForecastPayload, Product, StoreConfig, PriorOrderContext
+    from models import ForecastItem, ForecastPayload, Product, StoreConfig, PriorOrderContext, ExpiryReplacementInfo
     from firebase_loader import (
         get_firestore_client,
         load_master_catalog,
@@ -109,6 +110,7 @@ except ImportError:
     from firebase_writer import write_cached_forecast
     from schedule_utils import normalize_delivery_date, weekday_key, get_order_day_for_delivery, get_days_until_next_delivery, get_schedule_info
     from case_allocator import allocate_cases_across_stores, get_historical_shares, get_item_case_pattern, set_db_client
+    from low_quantity_loader import get_items_for_order_date, get_stores_for_sap, get_saps_to_suppress
 
 
 def _build_active_promo_lookup(
@@ -1074,6 +1076,133 @@ def generate_forecast(config: ForecastConfig) -> ForecastPayload:
                         promo_active=is_promo,
                     )
                 )
+
+    # ==========================================================================
+    # LOW QUANTITY HANDLING
+    # ==========================================================================
+    # Two-step process:
+    # 1. SUPPRESSION: Zero out predictions for low-qty items on wrong order dates
+    # 2. FLOOR INJECTION: Apply minimum (1 case) for low-qty items on correct date
+
+    # Calculate order date from delivery date and schedule
+    # schedule_key is 'monday', 'tuesday', etc. (the ORDER day)
+    order_day_num = {
+        'monday': 0, 'tuesday': 1, 'wednesday': 2, 'thursday': 3,
+        'friday': 4, 'saturday': 5, 'sunday': 6
+    }.get(schedule_key.lower(), 0)
+
+    # Find the order date that corresponds to this delivery
+    # Order date is before delivery date, on the schedule_key day
+    days_back = (target_dt.weekday() - order_day_num) % 7
+    if days_back == 0:
+        days_back = 7  # If same day, go back a week
+    order_date_dt = target_dt - timedelta(days=days_back)
+    order_date_iso = order_date_dt.strftime('%Y-%m-%d')
+
+    # ==========================================================================
+    # STEP 1: LOW QUANTITY SUPPRESSION
+    # ==========================================================================
+    # Zero out predictions for low-qty items where today is NOT their order_by_date.
+    # This prevents over-ordering low-qty items on the wrong day.
+    try:
+        suppress_saps = get_saps_to_suppress(
+            db=db,
+            route_number=config.route_number,
+            order_date=order_date_iso,
+            db_client=db_client,
+        )
+        
+        if suppress_saps:
+            suppressed_count = 0
+            for item in items:
+                if item.sap in suppress_saps:
+                    item.recommended_units = 0.0
+                    item.recommended_cases = 0.0
+                    suppressed_count += 1
+            if suppressed_count > 0:
+                print(f"[forecast] Suppressed {suppressed_count} predictions for low-qty items (wrong order date)")
+    except Exception as e:
+        print(f"[forecast] Warning: Low-qty suppression failed: {e}")
+        # Continue without suppression
+
+    # ==========================================================================
+    # STEP 2: LOW QUANTITY FLOOR INJECTION
+    # ==========================================================================
+    # Apply floor for items with single expiry date (low quantity = 1 case left)
+    # This ensures we order replacement stock before the expiry is pulled.
+
+    try:
+        low_qty_items = get_items_for_order_date(
+            db=db,
+            route_number=config.route_number,
+            order_date=order_date_iso,
+            db_client=db_client,
+        )
+
+        if low_qty_items:
+            print(f"[forecast] Processing {len(low_qty_items)} low-qty items for order date {order_date_iso}")
+
+            # Build lookup of existing predictions: (store_id, sap) -> index in items list
+            existing_items: Dict[Tuple[str, str], int] = {}
+            for idx, item in enumerate(items):
+                existing_items[(item.store_id, item.sap)] = idx
+
+            # Track store name lookup from stores_cfg
+            store_name_lookup = {s.store_id: s.store_name for s in stores_cfg}
+
+            for lq_item in low_qty_items:
+                # Get stores that stock this SAP
+                store_ids = get_stores_for_sap(db_client, config.route_number, lq_item.sap)
+
+                if not store_ids:
+                    continue  # Warning already logged by get_stores_for_sap
+
+                # Get case pack for floor quantity
+                case_pack = _case_pack_for_sap(products, lq_item.sap)
+                floor_units = case_pack if case_pack and case_pack > 0 else 1
+
+                for store_id in store_ids:
+                    # Skip stores not in this order cycle
+                    if store_id not in valid_store_ids:
+                        continue
+
+                    key = (store_id, lq_item.sap)
+                    expiry_info = ExpiryReplacementInfo(
+                        expiry_date=lq_item.expiry_date,
+                        min_units_required=floor_units,
+                        reason="low_qty_expiry",
+                    )
+
+                    if key in existing_items:
+                        # Apply floor to existing prediction
+                        idx = existing_items[key]
+                        if items[idx].recommended_units < floor_units:
+                            items[idx].recommended_units = float(floor_units)
+                            items[idx].recommended_cases = floor_units / case_pack if case_pack else None
+                            items[idx].expiry_replacement = expiry_info
+                            print(f"[forecast] Applied floor to {lq_item.sap} @ {store_id}: {floor_units} units (expires {lq_item.expiry_date})")
+                        else:
+                            # ML already predicted enough, just attach metadata
+                            items[idx].expiry_replacement = expiry_info
+                    else:
+                        # No prediction exists - add new item
+                        store_name = store_name_lookup.get(store_id, '')
+                        items.append(ForecastItem(
+                            store_id=store_id,
+                            store_name=store_name,
+                            sap=lq_item.sap,
+                            recommended_units=float(floor_units),
+                            recommended_cases=floor_units / case_pack if case_pack else None,
+                            source="expiry_replacement",
+                            expiry_replacement=expiry_info,
+                            promo_active=active_promos.get(key, False),
+                        ))
+                        print(f"[forecast] Added {lq_item.sap} @ {store_id}: {floor_units} units (expiry replacement, expires {lq_item.expiry_date})")
+
+            print(f"[forecast] Low-qty floor injection complete")
+    except Exception as e:
+        print(f"[forecast] Warning: Low-qty floor injection failed: {e}")
+        # Continue without low-qty injection - forecast still valid
 
     forecast = ForecastPayload(
         forecast_id=str(uuid.uuid4()),

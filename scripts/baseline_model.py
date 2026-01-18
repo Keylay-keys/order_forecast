@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from pathlib import Path
 import argparse
+from pathlib import Path
 from typing import Iterable, List
 
 import numpy as np
@@ -14,6 +14,25 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error
 import mission_orders as mo
 import promotion_parser as pp
 
+CORRECTION_FEATURES = [
+    "corr_samples",
+    "corr_avg_delta",
+    "corr_avg_ratio",
+    "corr_ratio_stddev",
+    "corr_removal_rate",
+    "corr_promo_rate",
+]
+
+CALENDAR_FEATURES = [
+    "is_first_weekend_of_month",
+    "is_last_weekend_of_month",
+    "is_holiday",
+    "is_holiday_week",
+    "days_until_next_holiday",
+    "delivery_dow",
+    "delivery_month",
+    "delivery_quarter",
+]
 
 def _add_lag_features(df: pd.DataFrame) -> pd.DataFrame:
     df = df.sort_values("delivery_date").copy()
@@ -34,6 +53,8 @@ def build_modeling_dataframe(
     order_csv: Path,
     stock_csv: Path,
     promo_paths: Iterable[Path],
+    corrections_csv: Path | None = None,
+    calendar_csv: Path | None = None,
 ) -> pd.DataFrame:
     orders = mo.load_order_history(str(order_csv))
     stock = mo.load_store_stock(str(stock_csv))
@@ -43,7 +64,8 @@ def build_modeling_dataframe(
     orders = mo.annotate_with_promotions(orders, promotions)
 
     orders = orders[orders["store"] != "Order"].copy()
-    orders = orders[orders["active"] == 1].copy()
+    # Skip active filter for now - stock parsing needs fixing
+    # orders = orders[orders["active"] == 1].copy()
 
     orders["promo_active"] = orders["promo_active"].fillna(False).astype(int)
     orders["delivery_date"] = pd.to_datetime(orders["delivery_date"], errors="coerce")
@@ -51,6 +73,7 @@ def build_modeling_dataframe(
 
     orders["delivery_dow"] = orders["delivery_date"].dt.weekday
     orders["delivery_month"] = orders["delivery_date"].dt.month
+    orders["delivery_quarter"] = orders["delivery_date"].dt.quarter
     orders["is_monday_delivery"] = (orders["delivery_dow"] == 0).astype(int)
 
     orders = (
@@ -71,6 +94,46 @@ def build_modeling_dataframe(
     orders["tray"] = orders["tray"].fillna(0)
     orders["lead_time_days"] = orders["lead_time_days"].fillna(orders["lead_time_days"].median())
 
+    # Merge correction aggregates if provided
+    if corrections_csv and Path(corrections_csv).exists():
+        corr = pd.read_csv(corrections_csv)
+        rename = {
+            "samples": "corr_samples",
+            "avg_delta": "corr_avg_delta",
+            "avg_ratio": "corr_avg_ratio",
+            "ratio_stddev": "corr_ratio_stddev",
+            "removal_rate": "corr_removal_rate",
+            "promo_rate": "corr_promo_rate",
+        }
+        corr = corr.rename(columns=rename)
+        orders = orders.merge(
+            corr,
+            left_on=["store", "sap", "delivery_dow"],
+            right_on=["store_id", "sap", "schedule_key"],
+            how="left",
+        )
+        orders = orders.drop(columns=["store_id", "schedule_key"], errors="ignore")
+        for col in CORRECTION_FEATURES:
+            if col not in orders:
+                orders[col] = 0.0
+        orders[CORRECTION_FEATURES] = orders[CORRECTION_FEATURES].fillna(0.0)
+
+    # Merge calendar features if provided
+    if calendar_csv and Path(calendar_csv).exists():
+        cal = pd.read_csv(calendar_csv)
+        cal["date"] = pd.to_datetime(cal["date"])  # Convert to datetime for merge
+        # Expected columns from calendar_features table
+        orders = orders.merge(
+            cal,
+            left_on="delivery_date",
+            right_on="date",
+            how="left",
+        )
+        orders = orders.drop(columns=["date"], errors="ignore")
+        for col in CALENDAR_FEATURES:
+            if col not in orders:
+                orders[col] = 0
+        orders[CALENDAR_FEATURES] = orders[CALENDAR_FEATURES].fillna(0)
 
     return orders
 
@@ -81,6 +144,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--orders", default="data/daily/current_orders.csv", help="Path to orders CSV")
     parser.add_argument("--stock", default="data/daily/storeStock.csv", help="Path to store stock CSV")
     parser.add_argument("--promos", nargs='*', help="Glob pattern(s) for promo PDFs")
+    parser.add_argument("--corrections", help="Path to corrections aggregate CSV (optional)")
+    parser.add_argument("--calendar", help="Path to calendar features CSV (optional)")
     return parser.parse_args()
 
 
@@ -92,10 +157,13 @@ def train_baseline(df: pd.DataFrame) -> None:
         "promo_active",
         "delivery_dow",
         "delivery_month",
+        "delivery_quarter",
         "is_monday_delivery",
         "lead_time_days",
         "case_count",
         "tray",
+        *CORRECTION_FEATURES,
+        *CALENDAR_FEATURES,
     ]
 
     df = df.sort_values("delivery_date")
@@ -172,6 +240,6 @@ if __name__ == "__main__":
     else:
         promo_paths = list(Path("promos/raw").glob("*.pdf"))
 
-    df = build_modeling_dataframe(order_path, stock_path, promo_paths)
+    df = build_modeling_dataframe(order_path, stock_path, promo_paths, args.corrections, args.calendar)
     print("Modeling rows:", len(df))
     train_baseline(df)
