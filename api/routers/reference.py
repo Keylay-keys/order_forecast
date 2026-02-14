@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Dict, Any, List, Optional
 
 from fastapi import APIRouter, Depends, Query, Request
@@ -11,11 +12,11 @@ from ..dependencies import (
     verify_firebase_token,
     require_route_access,
     get_firestore,
-    get_duckdb,
 )
 from ..middleware.rate_limit import rate_limit_history
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 
 @router.get("/products")
@@ -41,7 +42,7 @@ async def get_products(
             data["casePack"] = data.get("case_pack")
         items.append(data)
 
-    print(f"[DEBUG] GET /products route={route} count={len(items)} saps={[i.get('sap') for i in items[:10]]}...")
+    logger.debug(f"GET /products route={route} count={len(items)} saps={[i.get('sap') for i in items[:10]]}...")
     return {"routeNumber": route, "products": items}
 
 
@@ -74,14 +75,13 @@ async def get_schedule(
     route: str = Query(..., pattern=r"^\d{1,10}$", description="Route number"),
     decoded_token: dict = Depends(verify_firebase_token),
     db: firestore.Client = Depends(get_firestore),
-    duckdb = Depends(get_duckdb),
 ) -> Dict[str, Any]:
     """Return order cycles and schedule info for a route."""
     await require_route_access(route, decoded_token, db)
 
     from schedule_utils import get_schedule_info
 
-    schedule_info = get_schedule_info(db, route, db_client=duckdb._db_client)
+    schedule_info = get_schedule_info(db, route)
     return {
         "routeNumber": route,
         **schedule_info,

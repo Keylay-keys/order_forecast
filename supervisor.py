@@ -44,7 +44,7 @@ PID_FILE = BASE_DIR / '.supervisor.pid'
 LOG_DIR = BASE_DIR / 'logs'
 
 # PCF Pipeline paths (separate project)
-PCF_DIR = Path('/Users/kylemacmini/Desktop/projects/pcf_pipeline')
+PCF_DIR = Path('/Users/kylemacmini/projects/pcf_pipeline')
 PCF_VENV_PYTHON = PCF_DIR / '.venv' / 'bin' / 'python'
 PCF_SA_PATH = PCF_DIR / 'config' / 'serviceAccountKey.json'
 

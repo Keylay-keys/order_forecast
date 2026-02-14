@@ -1,19 +1,29 @@
 """Client helper for communicating with the DB Manager service.
 
-Other services use this to send requests to the centralized DB Manager
-instead of accessing DuckDB directly.
+⚠️  DEPRECATED: This module is deprecated. Use direct PostgreSQL via pg_utils instead.
 
-Usage:
+The DB Manager service has been removed from supervisor_docker.py. All services now use
+direct PostgreSQL connections instead of the message bus pattern (dbRequests collection).
+
+For new code, use:
+    from pg_utils import fetch_all, fetch_one, execute, get_archived_dates, get_order_by_date
+
+For sync_order functionality, import handle_sync_order from db_manager_pg:
+    from db_manager_pg import handle_sync_order
+
+This module is kept for backwards compatibility but will be removed in a future release.
+
+Legacy usage (deprecated):
     from db_client import DBClient
-    
+
     client = DBClient(firestore_client)
-    
+
     # Query
     result = client.query("SELECT * FROM orders_historical WHERE route_number = ?", ["989262"])
-    
+
     # Sync an order
     result = client.sync_order("order-989262-123456", "989262")
-    
+
     # Get historical shares
     shares = client.get_historical_shares("989262", "31032", "tuesday")
 """

@@ -11,7 +11,6 @@ from ..dependencies import (
     verify_firebase_token,
     require_route_access,
     get_firestore,
-    get_duckdb,
 )
 from ..middleware.rate_limit import rate_limit_history
 
@@ -39,7 +38,6 @@ async def get_low_quantity(
     orderDate: Optional[str] = Query(default=None, description="Filter to order date YYYY-MM-DD"),
     decoded_token: dict = Depends(verify_firebase_token),
     db: firestore.Client = Depends(get_firestore),
-    duckdb = Depends(get_duckdb),
 ) -> Dict[str, Any]:
     """Return low-quantity items for a route."""
     await require_route_access(route, decoded_token, db)
@@ -55,8 +53,8 @@ async def get_low_quantity(
     from schedule_utils import get_order_cycles
 
     if orderDate:
-        items = get_items_for_order_date(db, route, orderDate, db_client=duckdb._db_client)
-        gap_items = get_gap_items(db, route, db_client=duckdb._db_client)
+        items = get_items_for_order_date(db, route, orderDate)
+        gap_items = get_gap_items(db, route)
         # Sort by expiry date ascending (soonest first)
         items_sorted = sorted(items, key=lambda x: x.expiry_date or "9999-12-31")
         gap_items_sorted = sorted(gap_items, key=lambda x: x.expiry_date or "9999-12-31")
@@ -69,7 +67,7 @@ async def get_low_quantity(
 
     # No order date filter: return all low-qty items with their order-by dates
     pcf_items = load_pcf_items(db, route)
-    order_cycles = get_order_cycles(db, route, db_client=duckdb._db_client)
+    order_cycles = get_order_cycles(db, route)
     user_tz = get_user_timezone(db, route)
     today = get_current_datetime(user_tz)
     all_items = get_low_quantity_items(pcf_items, order_cycles, today=today)

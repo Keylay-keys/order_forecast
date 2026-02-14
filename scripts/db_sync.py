@@ -27,6 +27,11 @@ import json
 
 # Handle imports for both direct execution and module import
 try:
+    from google.cloud.firestore_v1.base_query import FieldFilter
+except ImportError:
+    FieldFilter = None
+
+try:
     from .db_schema import get_connection, create_schema, print_schema_summary
     from .firebase_loader import (
         get_firestore_client,
@@ -34,7 +39,6 @@ try:
         load_store_configs,
         load_orders,
         load_promotions,
-        load_forecast_feedback,
     )
     from .models import Product, StoreConfig, Order, StoreOrder, OrderItem
     FIREBASE_AVAILABLE = True
@@ -47,7 +51,6 @@ except ImportError:
             load_store_configs,
             load_orders,
             load_promotions,
-            load_forecast_feedback,
         )
         from models import Product, StoreConfig, Order, StoreOrder, OrderItem
         FIREBASE_AVAILABLE = True
@@ -527,7 +530,10 @@ class DuckDBSync:
             return 0
 
         # Find users with this route - route is stored in profile.routeNumber
-        users = db.collection('users').where('profile.routeNumber', '==', route_number).stream()
+        if FieldFilter:
+            users = db.collection('users').where(filter=FieldFilter('profile.routeNumber', '==', route_number)).stream()
+        else:
+            users = db.collection('users').where('profile.routeNumber', '==', route_number).stream()
 
         count = 0
         for user_doc in users:
@@ -594,108 +600,6 @@ class DuckDBSync:
         return count
 
     # =========================================================================
-    # CORRECTION SYNC
-    # =========================================================================
-
-    def sync_correction(self, correction: dict) -> bool:
-        """Sync a single forecast correction to DuckDB.
-        
-        Args:
-            correction: Correction dict from Firebase.
-            
-        Returns:
-            True if synced successfully.
-        """
-        correction_id = correction.get('correctionId') or correction.get('id')
-        if not correction_id:
-            return False
-        
-        delivery_date = parse_date(correction.get('deliveryDate', ''))
-        
-        self.conn.execute("""
-            INSERT INTO forecast_corrections (
-                correction_id, forecast_id, order_id, route_number,
-                schedule_key, delivery_date, store_id, store_name, sap,
-                predicted_units, predicted_cases, final_units, final_cases,
-                correction_delta, correction_ratio, was_removed,
-                promo_id, promo_active, submitted_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT (correction_id) DO NOTHING
-        """, [
-            correction_id,
-            correction.get('forecastId'),
-            correction.get('orderId'),
-            correction.get('routeNumber'),
-            correction.get('scheduleKey', '').lower(),
-            delivery_date.strftime('%Y-%m-%d') if delivery_date else None,
-            correction.get('storeId'),
-            correction.get('storeName'),
-            correction.get('sap'),
-            correction.get('predictedUnits', 0),
-            correction.get('predictedCases', 0),
-            correction.get('finalUnits', 0),
-            correction.get('finalCases', 0),
-            correction.get('correctionDelta', 0),
-            correction.get('correctionRatio', 1.0),
-            correction.get('wasRemoved', False),
-            correction.get('promoId'),
-            correction.get('promoActive', False),
-            correction.get('submittedAt'),
-        ])
-        
-        return True
-    
-    def sync_corrections(self, route_number: str, since_days: int = 90) -> int:
-        """Sync forecast corrections from Firebase.
-        
-        Pulls from forecast_feedback/{route}/entries/* and inserts into
-        forecast_corrections table.
-        
-        Args:
-            route_number: Route to sync.
-            since_days: How many days of feedback to sync.
-            
-        Returns:
-            Number of corrections synced.
-        """
-        print(f"\n📊 Syncing forecast corrections for route {route_number}...")
-
-        db = self._get_firestore()
-        if not db:
-            print("   ⚠️  Firebase not available")
-            return 0
-
-        feedback_list = load_forecast_feedback(db, route_number, since_days=since_days)
-        
-        synced = 0
-        for feedback in feedback_list:
-            # Each feedback doc may contain multiple corrections (one per item)
-            corrections = feedback.get('corrections', [])
-            if not corrections:
-                # Single correction format
-                if self.sync_correction(feedback):
-                    synced += 1
-            else:
-                # Multiple corrections in one feedback doc
-                for corr in corrections:
-                    # Merge parent fields into correction
-                    merged = {
-                        'forecastId': feedback.get('forecastId'),
-                        'orderId': feedback.get('orderId'),
-                        'routeNumber': feedback.get('routeNumber', route_number),
-                        'scheduleKey': feedback.get('scheduleKey'),
-                        'deliveryDate': feedback.get('deliveryDate'),
-                        'submittedAt': feedback.get('submittedAt') or feedback.get('createdAt'),
-                        **corr,
-                    }
-                    merged['correctionId'] = f"{feedback.get('orderId', 'unknown')}-{corr.get('storeId', '')}-{corr.get('sap', '')}"
-                    if self.sync_correction(merged):
-                        synced += 1
-        
-        print(f"   ✅ Synced {synced} corrections")
-        return synced
-    
-    # =========================================================================
     # FULL SYNC
     # =========================================================================
     
@@ -720,7 +624,6 @@ class DuckDBSync:
             'orders': 0,
             'line_items': 0,
             'promos': 0,
-            'corrections': 0,
             'schedules': 0,
         }
         
@@ -749,9 +652,6 @@ class DuckDBSync:
         stats['promos'] = self.sync_promos(route_number)
         print(f"   ✅ {stats['promos']} promos synced")
         
-        # Sync forecast corrections
-        stats['corrections'] = self.sync_corrections(route_number, since_days=since_days)
-
         # Sync user schedules
         print("\n📅 Syncing user schedules...")
         stats['schedules'] = self.sync_user_schedules(route_number)
@@ -846,4 +746,3 @@ def main():
 
 if __name__ == '__main__':
     exit(main())
-

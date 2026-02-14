@@ -103,6 +103,9 @@ class ForecastItem:
     sap: str
     recommended_units: float
     recommended_cases: Optional[float] = None
+    p10_units: Optional[float] = None
+    p50_units: Optional[float] = None
+    p90_units: Optional[float] = None
     promo_active: bool = False
     promo_lift_pct: Optional[float] = None
     is_first_weekend: Optional[bool] = None
@@ -111,6 +114,7 @@ class ForecastItem:
     prior_order_context: Optional[PriorOrderContext] = None  # If item was ordered in overlapping delivery
     last_order_quantity: Optional[int] = None  # Quantity ordered in the most recent same-schedule order
     expiry_replacement: Optional[ExpiryReplacementInfo] = None  # If item injected due to low-qty expiry
+    whole_case_adjustment: Optional[Dict[str, Any]] = None  # Metadata when whole-case enforcement adjusted units
 
 
 @dataclass

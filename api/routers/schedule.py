@@ -13,7 +13,6 @@ from ..dependencies import (
     verify_firebase_token,
     require_route_access,
     get_firestore,
-    get_duckdb,
 )
 
 

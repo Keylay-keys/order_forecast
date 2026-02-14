@@ -96,8 +96,12 @@ def get_firestore_client(sa_path: str) -> firestore.Client:
 
 
 def get_duckdb_conn(db_path: str) -> duckdb.DuckDBPyConnection:
-    """Get DuckDB connection with write access."""
-    return duckdb.connect(db_path, read_only=False)
+    """Get DuckDB connection with write access.
+    
+    Uses single thread to minimize GIL contention with gRPC threads.
+    db_manager processes requests sequentially, so parallelism isn't needed.
+    """
+    return duckdb.connect(db_path, read_only=False, config={'threads': 1})
 
 
 # =============================================================================
@@ -283,8 +287,12 @@ def handle_sync_order(conn: duckdb.DuckDBPyConnection, db: firestore.Client, pay
                 ])
                 
                 # Extract correction if forecast data exists
-                # App uses "forecastSuggestedUnits" as the field name
-                forecasted_qty = item.get('forecastSuggestedUnits') or item.get('forecastedQuantity')
+                # Canonical field: forecastRecommendedUnits (legacy: forecastSuggestedUnits)
+                forecasted_qty = (
+                    item.get('forecastRecommendedUnits')
+                    or item.get('forecastSuggestedUnits')
+                    or item.get('forecastedQuantity')
+                )
                 user_adjusted = item.get('userAdjusted', False)
                 
                 # Create correction if:
@@ -326,7 +334,10 @@ def handle_sync_order(conn: duckdb.DuckDBPyConnection, db: firestore.Client, pay
                         store_name,
                         sap,
                         predicted,
-                        item.get('forecastSuggestedCases') or item.get('forecastedCases', 0) or 0,
+                        item.get('forecastRecommendedCases')
+                        or item.get('forecastSuggestedCases')
+                        or item.get('forecastedCases', 0)
+                        or 0,
                         final,
                         item.get('cases', 0) or 0,
                         delta,
@@ -808,6 +819,127 @@ def watch_requests(sa_path: str, duckdb_path: str):
 
 
 # =============================================================================
+# Polling Mode (Low CPU Alternative)
+# =============================================================================
+
+def watch_requests_polling(sa_path: str, duckdb_path: str, poll_interval: float = 0.5):
+    """Poll for pending requests instead of using on_snapshot.
+    
+    This avoids gRPC streaming overhead and reduces idle CPU significantly.
+    Trade-off: slightly higher latency (up to poll_interval).
+    
+    Args:
+        sa_path: Path to Firebase service account JSON
+        duckdb_path: Path to DuckDB database file
+        poll_interval: Seconds between polls (default 0.5s)
+    """
+    print(f"\n🗄️  Database Manager Service (Polling Mode)")
+    print(f"   Worker ID: {WORKER_ID}")
+    print(f"   Database: {duckdb_path}")
+    print(f"   Poll interval: {poll_interval}s")
+    print(f"   Watching: dbRequests/* (polling)")
+    print(f"\n   Press Ctrl+C to stop\n")
+    
+    db = get_firestore_client(sa_path)
+    
+    # Ensure schema exists
+    print("   Initializing schema...")
+    init_conn = get_duckdb_conn(duckdb_path)
+    from db_schema import create_schema
+    create_schema(init_conn)
+    init_conn.close()
+    print("   ✅ Schema ready")
+    
+    requests_col = db.collection("dbRequests")
+    
+    # Setup graceful shutdown
+    def shutdown_handler(signum, frame):
+        global _shutdown_requested
+        _shutdown_requested = True
+        signal_name = 'SIGTERM' if signum == signal.SIGTERM else 'SIGINT'
+        print(f"\n\n👋 Received {signal_name} - stopping DB Manager gracefully...")
+    
+    signal.signal(signal.SIGTERM, shutdown_handler)
+    signal.signal(signal.SIGINT, shutdown_handler)
+    
+    try:
+        while not _shutdown_requested:
+            try:
+                # Query for pending requests
+                pending_docs = requests_col.where("status", "==", "pending").limit(10).stream()
+                
+                for doc in pending_docs:
+                    if _shutdown_requested:
+                        break
+                    
+                    data = doc.to_dict() or {}
+                    request_id = data.get("requestId", doc.id)
+                    request_type = data.get("type", "")
+                    payload = data.get("payload", {})
+                    
+                    print(f"  📥 Request: {request_type} ({request_id[:20]}...)")
+                    
+                    # Claim the request
+                    try:
+                        doc.reference.update({
+                            "status": "processing",
+                            "workerId": WORKER_ID,
+                            "processingAt": firestore.SERVER_TIMESTAMP,
+                        })
+                    except Exception as e:
+                        print(f"     ⚠️  Could not claim: {e}")
+                        continue
+                    
+                    # Process with fresh connection
+                    start_time = time.time()
+                    conn = None
+                    try:
+                        conn = get_duckdb_conn(duckdb_path)
+                        result = process_request(conn, db, request_type, payload)
+                        elapsed = time.time() - start_time
+                        
+                        doc.reference.update({
+                            "status": "completed",
+                            "result": result,
+                            "completedAt": firestore.SERVER_TIMESTAMP,
+                            "elapsedMs": int(elapsed * 1000),
+                        })
+                        
+                        if 'error' in result:
+                            print(f"     ❌ Error: {result['error'][:100]}")
+                        else:
+                            print(f"     ✅ Done in {elapsed*1000:.0f}ms")
+                            
+                    except Exception as e:
+                        elapsed = time.time() - start_time
+                        print(f"     ❌ Exception: {e}")
+                        
+                        doc.reference.update({
+                            "status": "error",
+                            "error": str(e),
+                            "completedAt": firestore.SERVER_TIMESTAMP,
+                            "elapsedMs": int(elapsed * 1000),
+                        })
+                    finally:
+                        if conn:
+                            try:
+                                conn.close()
+                            except Exception:
+                                pass
+                
+            except Exception as e:
+                print(f"  ⚠️  Poll error: {e}")
+            
+            # Sleep between polls
+            time.sleep(poll_interval)
+            
+    except KeyboardInterrupt:
+        pass
+    
+    print("   DB Manager stopped.\n")
+
+
+# =============================================================================
 # CLI Entry Point
 # =============================================================================
 
@@ -818,8 +950,14 @@ if __name__ == "__main__":
     )
     parser.add_argument('--serviceAccount', required=True, help='Path to Firebase service account JSON')
     parser.add_argument('--duckdb', required=True, help='Path to DuckDB database')
+    parser.add_argument('--mode', choices=['listener', 'polling'], default='polling',
+                       help='Mode: listener (real-time, high CPU) or polling (low CPU, default)')
+    parser.add_argument('--poll-interval', type=float, default=0.5,
+                       help='Poll interval in seconds (only for polling mode)')
     
     args = parser.parse_args()
     
-    watch_requests(args.serviceAccount, args.duckdb)
-
+    if args.mode == 'polling':
+        watch_requests_polling(args.serviceAccount, args.duckdb, args.poll_interval)
+    else:
+        watch_requests(args.serviceAccount, args.duckdb)

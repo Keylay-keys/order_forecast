@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.routespark.pcf-archive-sync</string>
+    
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>-lc</string>
+        <string>LOG_FILE="/Users/kylemacmini/Library/Logs/routespark-pcf-archive-sync.log"; PCF_DIR="/Users/kylemacmini/projects/pcf_pipeline"; PCF_VENV_PYTHON="$PCF_DIR/.venv/bin/python"; export PCF_ARCHIVE_REMOTE="keylay@100.64.201.120:/mnt/archive/pcf/pcf_archive"; echo "$(date): Starting PCF archive sync" >> "$LOG_FILE"; cd "$PCF_DIR"; "$PCF_VENV_PYTHON" scripts/sync_archive_to_server.py --delete-local >> "$LOG_FILE" 2>&1; echo "$(date): PCF archive sync complete" >> "$LOG_FILE"</string>
+    </array>
+    
+    <!-- Run every 48 hours -->
+    <key>StartInterval</key>
+    <integer>172800</integer>
+    
+    <key>StandardOutPath</key>
+    <string>/Users/kylemacmini/Library/Logs/routespark-pcf-archive-sync-launchd.log</string>
+    
+    <key>StandardErrorPath</key>
+    <string>/Users/kylemacmini/Library/Logs/routespark-pcf-archive-sync-launchd.log</string>
+    
+    <key>RunAtLoad</key>
+    <false/>
+</dict>
+</plist>

@@ -49,43 +49,66 @@ def _collect_promotions(paths: Iterable[Path]) -> pd.DataFrame:
     return pp.extract_promotions_from_pdfs([str(path) for path in pdf_paths])
 
 
-def build_modeling_dataframe(
-    order_csv: Path,
-    stock_csv: Path,
-    promo_paths: Iterable[Path],
-    corrections_csv: Path | None = None,
+def build_modeling_dataframe_from_orders_df(
+    orders: pd.DataFrame,
+    corrections_df: pd.DataFrame | None = None,
     calendar_csv: Path | None = None,
 ) -> pd.DataFrame:
-    orders = mo.load_order_history(str(order_csv))
-    stock = mo.load_store_stock(str(stock_csv))
-    orders = mo.annotate_with_stock(orders, stock)
+    """Build modeling dataframe from a preloaded orders DataFrame (e.g., PostgreSQL)."""
+    orders = orders.copy()
 
-    promotions = _collect_promotions(promo_paths)
-    orders = mo.annotate_with_promotions(orders, promotions)
+    # Normalize columns expected downstream
+    if "promo_active" not in orders.columns:
+        orders["promo_active"] = False
+    orders["promo_active"] = orders["promo_active"].fillna(False).astype(int)
+
+    if "delivery_date" in orders.columns:
+        orders["delivery_date"] = pd.to_datetime(orders["delivery_date"], errors="coerce")
+    else:
+        orders["delivery_date"] = pd.NaT
+
+    orders = orders.dropna(subset=["delivery_date"])  # guard against unexpected NaT
+
+    # Compute lead_time_days if missing
+    if "lead_time_days" not in orders.columns:
+        if "order_date" in orders.columns:
+            orders["order_date"] = pd.to_datetime(orders["order_date"], errors="coerce")
+            orders["lead_time_days"] = (orders["delivery_date"] - orders["order_date"]).dt.days
+        else:
+            orders["lead_time_days"] = pd.NA
+
+    # Ensure cases exists (used by lag features)
+    if "cases" not in orders.columns:
+        if "units" in orders.columns and "tray" in orders.columns:
+            orders["cases"] = orders["units"] / orders["tray"].replace({0: pd.NA})
+        else:
+            orders["cases"] = 0
+
+    # Normalize store column
+    if "store" not in orders.columns and "store_name" in orders.columns:
+        orders["store"] = orders["store_name"]
 
     orders = orders[orders["store"] != "Order"].copy()
-    # Skip active filter for now - stock parsing needs fixing
-    # orders = orders[orders["active"] == 1].copy()
-
-    orders["promo_active"] = orders["promo_active"].fillna(False).astype(int)
-    orders["delivery_date"] = pd.to_datetime(orders["delivery_date"], errors="coerce")
-    orders = orders.dropna(subset=["delivery_date"])  # guard against unexpected NaT
 
     orders["delivery_dow"] = orders["delivery_date"].dt.weekday
     orders["delivery_month"] = orders["delivery_date"].dt.month
     orders["delivery_quarter"] = orders["delivery_date"].dt.quarter
     orders["is_monday_delivery"] = (orders["delivery_dow"] == 0).astype(int)
 
-    orders = (
-        orders.groupby(["store", "sap"], group_keys=False)
-        .apply(_add_lag_features)
-        .reset_index(drop=True)
-    )
+    # Add lag features per store/sap group
+    # Preserve store and sap columns after groupby by not using them as index
+    grouped_frames = []
+    for (store, sap), group_df in orders.groupby(["store", "sap"], sort=False):
+        group_with_lags = _add_lag_features(group_df)
+        grouped_frames.append(group_with_lags)
+    orders = pd.concat(grouped_frames, ignore_index=True)
 
     orders = orders.dropna(subset=["lag_1"]).copy()
 
     numeric_cols = ["case_count", "tray", "lead_time_days"]
     for col in numeric_cols:
+        if col not in orders.columns:
+            orders[col] = 0
         orders[col] = pd.to_numeric(orders[col], errors="coerce")
 
     orders = orders.fillna({"lag_2": 0.0, "rolling_mean_4": orders["lag_1"]})
@@ -95,8 +118,8 @@ def build_modeling_dataframe(
     orders["lead_time_days"] = orders["lead_time_days"].fillna(orders["lead_time_days"].median())
 
     # Merge correction aggregates if provided
-    if corrections_csv and Path(corrections_csv).exists():
-        corr = pd.read_csv(corrections_csv)
+    if corrections_df is not None and not corrections_df.empty:
+        corr = corrections_df.copy()
         rename = {
             "samples": "corr_samples",
             "avg_delta": "corr_avg_delta",
@@ -106,10 +129,22 @@ def build_modeling_dataframe(
             "promo_rate": "corr_promo_rate",
         }
         corr = corr.rename(columns=rename)
+
+        if "schedule_key" in orders.columns and "schedule_key" in corr.columns:
+            if "store_id" in orders.columns and "store_id" in corr.columns:
+                left_on = ["store_id", "sap", "schedule_key"]
+                right_on = ["store_id", "sap", "schedule_key"]
+            else:
+                left_on = ["store", "sap", "schedule_key"]
+                right_on = ["store_id", "sap", "schedule_key"]
+        else:
+            left_on = ["store", "sap", "delivery_dow"]
+            right_on = ["store_id", "sap", "schedule_key"]
+
         orders = orders.merge(
             corr,
-            left_on=["store", "sap", "delivery_dow"],
-            right_on=["store_id", "sap", "schedule_key"],
+            left_on=left_on,
+            right_on=right_on,
             how="left",
         )
         orders = orders.drop(columns=["store_id", "schedule_key"], errors="ignore")
@@ -136,6 +171,31 @@ def build_modeling_dataframe(
         orders[CALENDAR_FEATURES] = orders[CALENDAR_FEATURES].fillna(0)
 
     return orders
+
+
+def build_modeling_dataframe(
+    order_csv: Path,
+    stock_csv: Path,
+    promo_paths: Iterable[Path],
+    corrections_csv: Path | None = None,
+    calendar_csv: Path | None = None,
+) -> pd.DataFrame:
+    orders = mo.load_order_history(str(order_csv))
+    stock = mo.load_store_stock(str(stock_csv))
+    orders = mo.annotate_with_stock(orders, stock)
+
+    promotions = _collect_promotions(promo_paths)
+    orders = mo.annotate_with_promotions(orders, promotions)
+
+    corrections_df = None
+    if corrections_csv and Path(corrections_csv).exists():
+        corrections_df = pd.read_csv(corrections_csv)
+
+    return build_modeling_dataframe_from_orders_df(
+        orders=orders,
+        corrections_df=corrections_df,
+        calendar_csv=calendar_csv,
+    )
 
 
 

@@ -9,11 +9,19 @@ This prevents IP spoofing when the API is exposed directly.
 from __future__ import annotations
 
 import os
+import logging
 from fastapi import Request
 
 # Environment flag for trusted proxy mode
 # Set to "1" or "true" when behind Cloudflare Tunnel or trusted reverse proxy
-TRUST_PROXY = os.environ.get("TRUST_PROXY", "").lower() in ("1", "true")
+logger = logging.getLogger("api.client_ip")
+
+_behind_cloudflare = os.environ.get("BEHIND_CLOUDFLARE", "").lower() in ("1", "true")
+_trust_proxy_env = os.environ.get("TRUST_PROXY", "").lower() in ("1", "true")
+TRUST_PROXY = _trust_proxy_env and _behind_cloudflare
+
+if _trust_proxy_env and not _behind_cloudflare:
+    logger.warning("TRUST_PROXY set without BEHIND_CLOUDFLARE=1; proxy headers will be ignored.")
 
 
 def get_client_ip(request: Request) -> str:

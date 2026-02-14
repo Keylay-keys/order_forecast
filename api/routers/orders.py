@@ -49,6 +49,16 @@ def _to_datetime(value: Any) -> Optional[datetime]:
     return None
 
 
+def _order_ref(db: firestore.Client, route_number: str, order_id: str):
+    """Build a route-scoped order document reference."""
+    return (
+        db.collection("routes")
+        .document(route_number)
+        .collection("orders")
+        .document(order_id)
+    )
+
+
 def _log_order_audit(
     db: firestore.Client,
     order_id: str,
@@ -58,7 +68,7 @@ def _log_order_audit(
     meta: Optional[Dict[str, Any]] = None,
 ) -> None:
     """Write a lightweight audit entry for order changes."""
-    db.collection("orders").document(order_id).collection("audit").add({
+    _order_ref(db, route_number, order_id).collection("audit").add({
         "orderId": order_id,
         "routeNumber": route_number,
         "userId": user_id,
@@ -87,10 +97,9 @@ async def get_active_order(
     """Get the active (draft) order for a route."""
     await require_route_access(route, decoded_token, db)
 
-    orders_ref = db.collection("orders")
+    orders_ref = db.collection("routes").document(route).collection("orders")
     q = (
-        orders_ref.where("routeNumber", "==", route)
-        .where("status", "==", "draft")
+        orders_ref.where("status", "==", "draft")
         .order_by("createdAt", direction=firestore.Query.DESCENDING)
         .limit(1)
     )
@@ -112,20 +121,24 @@ async def get_active_order(
 async def get_order(
     request: Request,
     order_id: str,
+    route: str = Query(..., pattern=r"^\d{1,10}$", description="Route number"),
     decoded_token: dict = Depends(verify_firebase_token),
     db: firestore.Client = Depends(get_firestore),
 ) -> Order:
     """Get an order by ID."""
-    order_ref = db.collection("orders").document(order_id)
+    await require_route_access(route, decoded_token, db)
+
+    order_ref = _order_ref(db, route, order_id)
     order_doc = order_ref.get()
-    
+
     if not order_doc.exists:
         raise HTTPException(404, "Order not found")
-    
+
     order_data = order_doc.to_dict() or {}
-    route_number = str(order_data.get("routeNumber", ""))
-    await require_route_access(route_number, decoded_token, db)
-    
+    # Verify doc route matches path route
+    if str(order_data.get("routeNumber", "")) != route:
+        raise HTTPException(403, "Route mismatch")
+
     return Order(**order_data)
 
 
@@ -168,7 +181,7 @@ async def create_order(
         "isHolidaySchedule": payload.isHolidaySchedule,
     }
 
-    db.collection("orders").document(order_id).set(order_doc)
+    _order_ref(db, payload.routeNumber, order_id).set(order_doc)
     _log_order_audit(
         db,
         order_id,
@@ -197,18 +210,22 @@ async def update_order(
     request: Request,
     order_id: str,
     payload: OrderUpdateRequest,
+    route: str = Query(..., pattern=r"^\d{1,10}$", description="Route number"),
     decoded_token: dict = Depends(verify_firebase_token),
     db: firestore.Client = Depends(get_firestore),
 ) -> Order:
     """Update an order's stores/items with optimistic locking."""
-    order_ref = db.collection("orders").document(order_id)
+    await require_route_access(route, decoded_token, db)
+
+    order_ref = _order_ref(db, route, order_id)
     order_doc = order_ref.get()
     if not order_doc.exists:
         raise HTTPException(404, "Order not found")
 
     order_data = order_doc.to_dict() or {}
     route_number = str(order_data.get("routeNumber", ""))
-    await require_route_access(route_number, decoded_token, db)
+    if route_number != route:
+        raise HTTPException(403, "Route mismatch")
 
     if order_data.get("status") != "draft":
         raise HTTPException(400, "Order is not editable")
@@ -221,12 +238,52 @@ async def update_order(
                 raise HTTPException(409, "Order was modified by another session")
 
     now = datetime.utcnow()
+
+    # IMPORTANT: Clients (notably the web portal) may send a minimal item payload
+    # like {sap, quantity} and omit forecast metadata fields. Because `stores` is
+    # stored as an ARRAY of MAPs in Firestore, a full `stores` replacement would
+    # otherwise drop those omitted keys. We merge against the existing order doc
+    # to preserve forecast metadata when the client didn't explicitly change it.
+    existing_stores: List[Dict[str, Any]] = order_data.get("stores") or []
+    existing_store_by_id: Dict[str, Dict[str, Any]] = {
+        str(s.get("storeId")): s for s in existing_stores if s.get("storeId") is not None
+    }
+
+    merged_stores: List[Dict[str, Any]] = []
+    for store in payload.stores:
+        incoming_store = store.dict(exclude_unset=True)
+        store_id = str(incoming_store.get("storeId", ""))
+        existing_store = existing_store_by_id.get(store_id, {})
+
+        existing_items = existing_store.get("items") or []
+        existing_item_by_sap: Dict[str, Dict[str, Any]] = {
+            str(it.get("sap")): it for it in existing_items if it.get("sap") is not None
+        }
+
+        merged_items: List[Dict[str, Any]] = []
+        for item in store.items:
+            incoming_item = item.dict(exclude_unset=True, by_alias=False)
+            sap = str(incoming_item.get("sap", "")).strip()
+            base = existing_item_by_sap.get(sap, {})
+            merged_items.append({**base, **incoming_item})
+
+        merged_store = {**existing_store, **incoming_store, "items": merged_items}
+        merged_stores.append(merged_store)
+
     update_data = {
-        "stores": [store.dict() for store in payload.stores],
+        "stores": merged_stores,
         "updatedAt": now,
     }
     if payload.notes is not None:
         update_data["notes"] = payload.notes
+
+    # Transfer metadata (web portal parity)
+    if payload.inboundTransfersUsed is not None:
+        update_data["inboundTransfersUsed"] = [t.dict() for t in payload.inboundTransfersUsed]
+    if payload.routeTransfers is not None:
+        update_data["routeTransfers"] = [t.dict() for t in payload.routeTransfers]
+    if payload.routeSplittingEnabled is not None:
+        update_data["routeSplittingEnabled"] = payload.routeSplittingEnabled
 
     order_ref.update(update_data)
 
@@ -256,21 +313,78 @@ async def update_order(
 async def delete_order(
     request: Request,
     order_id: str,
+    route: str = Query(..., pattern=r"^\d{1,10}$", description="Route number"),
     decoded_token: dict = Depends(verify_firebase_token),
     db: firestore.Client = Depends(get_firestore),
 ) -> Dict[str, Any]:
     """Delete a draft order."""
-    order_ref = db.collection("orders").document(order_id)
+    await require_route_access(route, decoded_token, db)
+
+    order_ref = _order_ref(db, route, order_id)
     order_doc = order_ref.get()
     if not order_doc.exists:
         raise HTTPException(404, "Order not found")
 
     order_data = order_doc.to_dict() or {}
     route_number = str(order_data.get("routeNumber", ""))
-    await require_route_access(route_number, decoded_token, db)
+    if route_number != route:
+        raise HTTPException(403, "Route mismatch")
 
     if order_data.get("status") != "draft":
         raise HTTPException(409, "Only draft orders can be deleted")
+
+    # Release transfer reservations before deleting (best-effort cleanup)
+    route_group_id = route_number  # Primary route acts as routeGroupId
+
+    # 1. Release inbound transfer reservations
+    inbound_transfers = order_data.get("inboundTransfersUsed") or []
+    for transfer_use in inbound_transfers:
+        transfer_key = transfer_use.get("transferKey")
+        if not transfer_key:
+            continue
+        try:
+            transfer_ref = (
+                db.collection("routeTransfers")
+                .document(route_group_id)
+                .collection("transfers")
+                .document(transfer_key)
+            )
+            transfer_ref.update({
+                f"reservedBy.{order_id}": firestore.DELETE_FIELD,
+                "updatedAt": firestore.SERVER_TIMESTAMP,
+            })
+        except Exception:
+            pass  # Best-effort — continue even if cleanup fails
+
+    # 2. Delete planned outbound transfers (only if no other orders have reserved from them)
+    route_transfers = order_data.get("routeTransfers") or []
+    for transfer_alloc in route_transfers:
+        to_route = transfer_alloc.get("toRouteNumber")
+        sap = transfer_alloc.get("sap")
+        if not to_route or not sap:
+            continue
+
+        # Transfer key format: {orderId}:{fromRoute}:{toRoute}:{sap}
+        transfer_key = f"{order_id}:{route_number}:{to_route}:{sap}".replace("/", "_")
+        try:
+            transfer_ref = (
+                db.collection("routeTransfers")
+                .document(route_group_id)
+                .collection("transfers")
+                .document(transfer_key)
+            )
+            transfer_snap = transfer_ref.get()
+            if transfer_snap.exists:
+                transfer_data = transfer_snap.to_dict()
+                status = transfer_data.get("status")
+                reserved_by = transfer_data.get("reservedBy", {})
+                reserved_total = sum(v for v in reserved_by.values() if isinstance(v, (int, float)))
+
+                # Only delete if it's planned and has no reservations
+                if status == "planned" and reserved_total == 0:
+                    transfer_ref.delete()
+        except Exception:
+            pass  # Best-effort cleanup
 
     _log_order_audit(
         db,
@@ -297,18 +411,22 @@ async def delete_order(
 async def finalize_order(
     request: Request,
     order_id: str,
+    route: str = Query(..., pattern=r"^\d{1,10}$", description="Route number"),
     decoded_token: dict = Depends(verify_firebase_token),
     db: firestore.Client = Depends(get_firestore),
 ) -> Dict[str, Any]:
-    """Finalize an order and trigger DuckDB sync via DBClient."""
-    order_ref = db.collection("orders").document(order_id)
+    """Finalize an order and trigger PostgreSQL sync."""
+    await require_route_access(route, decoded_token, db)
+
+    order_ref = _order_ref(db, route, order_id)
     order_doc = order_ref.get()
     if not order_doc.exists:
         raise HTTPException(404, "Order not found")
 
     order_data = order_doc.to_dict() or {}
     route_number = str(order_data.get("routeNumber", ""))
-    await require_route_access(route_number, decoded_token, db)
+    if route_number != route:
+        raise HTTPException(403, "Route mismatch")
 
     now = datetime.utcnow()
     order_ref.update({
@@ -316,6 +434,58 @@ async def finalize_order(
         "submittedAt": now,
         "updatedAt": now,
     })
+
+    # Commit outbound transfers (change status from 'planned' to 'committed')
+    route_group_id = route_number
+    route_transfers = order_data.get("routeTransfers") or []
+    uid = decoded_token["uid"]
+
+    for transfer_alloc in route_transfers:
+        to_route = transfer_alloc.get("toRouteNumber")
+        sap = transfer_alloc.get("sap")
+        units = transfer_alloc.get("units", 0)
+
+        if not to_route or not sap or units <= 0:
+            continue
+
+        # Transfer key format: {orderId}:{fromRoute}:{toRoute}:{sap}
+        transfer_key = f"{order_id}:{route_number}:{to_route}:{sap}".replace("/", "_")
+
+        try:
+            transfer_ref = (
+                db.collection("routeTransfers")
+                .document(route_group_id)
+                .collection("transfers")
+                .document(transfer_key)
+            )
+
+            # Upsert with status='committed'
+            transfer_data = {
+                "routeGroupId": route_group_id,
+                "purchaseRouteNumber": route_number,
+                "fromRouteNumber": route_number,
+                "toRouteNumber": to_route,
+                "sap": sap,
+                "units": units,
+                "casePack": transfer_alloc.get("casePack", 1),
+                "transferDate": transfer_alloc.get("transferDate") or order_data.get("expectedDeliveryDate") or order_data.get("orderDate"),
+                "status": "committed",
+                "reason": "pooled_order",
+                "sourceOrderId": order_id,
+                "createdByUid": uid,
+                "updatedAt": firestore.SERVER_TIMESTAMP,
+            }
+
+            # Set createdAt if new doc
+            transfer_snap = transfer_ref.get()
+            if not transfer_snap.exists:
+                transfer_data["createdAt"] = firestore.SERVER_TIMESTAMP
+
+            # Merge to preserve reservedBy map
+            transfer_ref.set(transfer_data, merge=True)
+        except Exception as exc:
+            # Best-effort — log but don't fail the finalize
+            print(f"[finalize_order] Failed to commit transfer {transfer_key}: {exc}")
 
     _log_order_audit(
         db,
@@ -325,13 +495,24 @@ async def finalize_order(
         "order_finalized",
     )
 
-    # Trigger DBManager sync (best-effort)
+    # Trigger direct PostgreSQL sync (best-effort)
     sync_result: Dict[str, Any] = {"synced": False}
     try:
-        from db_client import DBClient
-        db_client = DBClient(db)
-        result = db_client.sync_order(order_id, route_number)
-        sync_result = {"synced": True, **result}
+        from ..dependencies import get_pg_connection, return_pg_connection
+        from db_manager_pg import handle_sync_order
+
+        conn = get_pg_connection()
+        try:
+            result = handle_sync_order(conn, db, {
+                'orderId': order_id,
+                'routeNumber': route_number,
+            })
+            if 'error' in result:
+                sync_result = {"synced": False, "error": result['error']}
+            else:
+                sync_result = {"synced": True, **result}
+        finally:
+            return_pg_connection(conn)
     except Exception as exc:
         sync_result = {"synced": False, "error": str(exc)}
 
@@ -354,18 +535,21 @@ async def finalize_order(
 async def get_order_audit(
     request: Request,
     order_id: str,
+    route: str = Query(..., pattern=r"^\d{1,10}$", description="Route number"),
     decoded_token: dict = Depends(verify_firebase_token),
     db: firestore.Client = Depends(get_firestore),
 ) -> Dict[str, Any]:
     """Return audit log entries for an order."""
-    order_ref = db.collection("orders").document(order_id)
+    await require_route_access(route, decoded_token, db)
+
+    order_ref = _order_ref(db, route, order_id)
     order_doc = order_ref.get()
     if not order_doc.exists:
         raise HTTPException(404, "Order not found")
 
     order_data = order_doc.to_dict() or {}
-    route_number = str(order_data.get("routeNumber", ""))
-    await require_route_access(route_number, decoded_token, db)
+    if str(order_data.get("routeNumber", "")) != route:
+        raise HTTPException(403, "Route mismatch")
 
     audit_ref = order_ref.collection("audit").order_by(
         "createdAt", direction=firestore.Query.DESCENDING

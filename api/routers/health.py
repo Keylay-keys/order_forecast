@@ -2,39 +2,37 @@
 
 Endpoints:
     GET /api/health - Overall health status
-    GET /api/health/duckdb - DuckDB sync status
+    GET /api/health/database - PostgreSQL sync status
+    GET /api/health/firebase - Firebase/Firestore connectivity
+    POST /api/health/sync - Best-effort manual sync (Firebase -> PostgreSQL)
 """
 
 from __future__ import annotations
 
 import os
+import json
 import logging
 from datetime import datetime, timedelta
+from typing import Optional, Dict, Any, List
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pathlib import Path
-from typing import Optional
-from fastapi import APIRouter, Depends
 
-from ..dependencies import get_firestore, DUCKDB_PATH
-from ..models import HealthStatus, DuckDBHealth
+from google.cloud import firestore
+
+from ..dependencies import (
+    get_firestore,
+    get_pg_connection,
+    return_pg_connection,
+    verify_firebase_token,
+    require_route_access,
+)
+from ..middleware.rate_limit import rate_limit_write
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
-
-def _get_duckdb_file_stats() -> dict:
-    """Get DuckDB file stats without opening a connection.
-    
-    Returns file size and modification time.
-    """
-    if not DUCKDB_PATH.exists():
-        return {"exists": False, "fileSize": None, "modifiedAt": None}
-    
-    stat = DUCKDB_PATH.stat()
-    return {
-        "exists": True,
-        "fileSize": stat.st_size,
-        "modifiedAt": datetime.fromtimestamp(stat.st_mtime)
-    }
+# Only expose detailed errors in debug mode
+DEBUG_MODE = os.environ.get("DEBUG", "false").lower() == "true"
 
 
 @router.get("/health")
@@ -50,74 +48,81 @@ async def health_check() -> dict:
     }
 
 
-@router.get("/health/duckdb", response_model=DuckDBHealth)
-async def duckdb_health() -> DuckDBHealth:
-    """DuckDB health check with sync status.
+@router.get("/health/database")
+async def database_health() -> dict:
+    """PostgreSQL database health check with sync status.
     
-    Uses file stats and optional read-only connection for health checks.
-    If DuckDB is locked by db_manager, returns status based on file modification time.
-    
-    Returns status:
-    - healthy: file modified < 12 hours ago
-    - degraded: file modified 12-24 hours ago
-    - unhealthy: file modified > 24 hours ago or doesn't exist
+    Returns:
+    - healthy: Connected and has recent data
+    - degraded: Connected but stale data
+    - unhealthy: Connection failed
     """
     now = datetime.utcnow()
     
-    # Get file stats
-    stats = _get_duckdb_file_stats()
-    
-    if not stats["exists"]:
-        return DuckDBHealth(
-            status="unhealthy",
-            lastSync=None,
-            syncAgeMinutes=None,
-            fileSize=None,
-            orderCount=None
-        )
-    
-    # Use file modification time as proxy for last sync
-    last_modified = stats["modifiedAt"]
-    file_size = stats["fileSize"]
-    
-    # Calculate age based on file modification
-    sync_age_minutes: Optional[int] = None
-    if last_modified:
-        sync_age_minutes = int((now - last_modified).total_seconds() / 60)
-    
-    # Try to get order count via direct connection (may fail if locked)
-    order_count: Optional[int] = None
+    conn = None
     try:
-        import duckdb
-        conn = duckdb.connect(str(DUCKDB_PATH), read_only=True)
-        try:
-            result = conn.execute("SELECT COUNT(*) FROM orders_historical").fetchone()
-            if result:
-                order_count = result[0]
-        finally:
-            conn.close()
+        conn = get_pg_connection()
+        cur = conn.cursor()
+        
+        # Check order count
+        cur.execute("SELECT COUNT(*) FROM orders_historical")
+        order_count = cur.fetchone()[0]
+        
+        # Check most recent sync
+        cur.execute("SELECT MAX(synced_at) FROM orders_historical")
+        last_sync_result = cur.fetchone()
+        last_sync = last_sync_result[0] if last_sync_result else None
+        
+        # Check routes synced count
+        cur.execute("SELECT COUNT(*) FROM routes_synced")
+        routes_count = cur.fetchone()[0]
+        
+        cur.close()
+        return_pg_connection(conn)
+        conn = None  # Mark as returned
+        
+        # Calculate sync age
+        sync_age_minutes: Optional[int] = None
+        if last_sync:
+            # Handle timezone-aware datetime
+            if last_sync.tzinfo is not None:
+                from datetime import timezone
+                now_tz = datetime.now(timezone.utc)
+                sync_age_minutes = int((now_tz - last_sync).total_seconds() / 60)
+            else:
+                sync_age_minutes = int((now - last_sync).total_seconds() / 60)
+        
+        # Determine status based on data freshness
+        # Green: < 12 hours, Yellow: 12-24 hours, Red: > 24 hours or no data
+        if sync_age_minutes is None:
+            status = "degraded" if order_count > 0 else "unhealthy"
+        elif sync_age_minutes <= 720:  # 12 hours
+            status = "healthy"
+        elif sync_age_minutes <= 1440:  # 24 hours
+            status = "degraded"
+        else:
+            status = "unhealthy"
+        
+        return {
+            "status": status,
+            "database": "postgresql",
+            "lastSync": last_sync.isoformat() if last_sync else None,
+            "syncAgeMinutes": sync_age_minutes,
+            "orderCount": order_count,
+            "routesCount": routes_count,
+            "timestamp": now.isoformat()
+        }
+        
     except Exception as e:
-        # Connection failed (locked by db_manager) - that's OK
-        logger.debug(f"DuckDB read-only connection failed (likely locked): {e}")
-    
-    # Determine status based on file freshness
-    # Green: < 12 hours, Yellow: 12-24 hours, Red: > 24 hours
-    if sync_age_minutes is None:
-        status = "unhealthy"
-    elif sync_age_minutes <= 720:  # 12 hours
-        status = "healthy"
-    elif sync_age_minutes <= 1440:  # 24 hours
-        status = "degraded"
-    else:
-        status = "unhealthy"
-    
-    return DuckDBHealth(
-        status=status,
-        lastSync=last_modified,
-        syncAgeMinutes=sync_age_minutes,
-        fileSize=file_size,
-        orderCount=order_count
-    )
+        logger.error(f"PostgreSQL health check failed: {e}")
+        if conn is not None:
+            return_pg_connection(conn)
+        return {
+            "status": "unhealthy",
+            "database": "postgresql",
+            "error": str(e) if DEBUG_MODE else "Database connection failed",
+            "timestamp": now.isoformat()
+        }
 
 
 @router.get("/health/firebase")
@@ -145,60 +150,133 @@ async def firebase_health(
 
 
 @router.post("/health/sync")
+@rate_limit_write
 async def trigger_sync(
-    db = Depends(get_firestore)
-) -> dict:
-    """Trigger a manual sync from Firestore to DuckDB.
-    
-    This runs a quick sync of recent orders to update the local database.
+    request: Request,
+    route: Optional[str] = Query(default=None, pattern=r"^\d{1,10}$", description="Route number (optional)"),
+    days: int = Query(default=60, ge=1, le=365, description="How far back to scan finalized orders"),
+    limit: int = Query(default=300, ge=1, le=1000, description="Max finalized orders to scan"),
+    decoded_token: dict = Depends(verify_firebase_token),
+    db: firestore.Client = Depends(get_firestore),
+) -> Dict[str, Any]:
+    """Best-effort manual sync for support/debug.
+
+    This exists primarily to back the web-portal "Sync Now" button.
+    It scans recent finalized orders in Firestore and upserts them into PostgreSQL.
     """
-    try:
-        # Import the sync class from scripts
-        import sys
-        
-        # Add scripts directory to path
-        scripts_dir = Path(__file__).parent.parent.parent / "scripts"
-        if str(scripts_dir) not in sys.path:
-            sys.path.insert(0, str(scripts_dir))
-        
-        from db_sync import DBSync
-        
-        # Initialize the sync class
-        syncer = DBSync(
-            db_path=str(DUCKDB_PATH),
-            fb_client=db
+    uid = decoded_token.get("uid")
+
+    # If route not provided, derive from user doc (currentRoute, then primary routeNumber).
+    if not route:
+        user_doc = db.collection("users").document(uid).get()
+        if not user_doc.exists:
+            raise HTTPException(403, "Access denied")
+        profile = (user_doc.to_dict() or {}).get("profile", {})
+        derived = profile.get("currentRoute") or profile.get("routeNumber")
+        derived = str(derived) if derived is not None else ""
+        if not derived.isdigit():
+            raise HTTPException(400, "No route selected")
+        route = derived
+
+    await require_route_access(route, decoded_token, db)
+
+    cutoff = (datetime.utcnow() - timedelta(days=days)).date().isoformat()
+
+    # Fetch a capped set of finalized orders and filter by delivery date in-process.
+    # We avoid adding order_by clauses here to minimize index requirements.
+    orders_ref = db.collection("routes").document(route).collection("orders")
+    snaps = list(orders_ref.where("status", "==", "finalized").limit(limit).stream())
+
+    order_ids: List[str] = []
+    for s in snaps:
+        data = s.to_dict() or {}
+        delivery_date = (
+            str(data.get("expectedDeliveryDate") or data.get("deliveryDate") or "")
         )
-        
-        # Get all routes we have access to and sync each
-        # For now, do a simple file touch to update modification time
-        # Full sync can be expensive, so just touch the file
-        DUCKDB_PATH.touch()
-        
-        return {
-            "status": "success",
-            "message": "Database refreshed",
-            "timestamp": datetime.utcnow().isoformat()
-        }
-    except ImportError as e:
-        logger.error(f"Failed to import sync module: {e}")
-        # Fallback: just touch the file to update modification time
-        try:
-            DUCKDB_PATH.touch()
-            return {
-                "status": "success",
-                "message": "Database timestamp updated",
-                "timestamp": datetime.utcnow().isoformat()
-            }
-        except Exception:
-            return {
-                "status": "error",
-                "message": "Sync module not available",
-                "timestamp": datetime.utcnow().isoformat()
-            }
-    except Exception as e:
-        logger.error(f"Sync failed: {e}")
+        if delivery_date and delivery_date < cutoff:
+            continue
+        order_ids.append(s.id)
+
+    if not order_ids:
+        return {"status": "ok", "message": f"No recent finalized orders found for route {route}."}
+
+    # Run syncs (idempotent upserts).
+    from db_manager_pg import handle_sync_order  # loaded via dependencies.py sys.path injection
+
+    conn = None
+    ok = 0
+    failed = 0
+    try:
+        conn = get_pg_connection()
+        for order_id in order_ids:
+            result = handle_sync_order(conn, db, {"orderId": order_id, "routeNumber": route})
+            if result.get("error"):
+                failed += 1
+            else:
+                ok += 1
+    finally:
+        if conn is not None:
+            return_pg_connection(conn)
+
+    status = "ok" if failed == 0 else "partial"
+    return {
+        "status": status,
+        "message": f"Synced {ok}/{len(order_ids)} orders for route {route} (failed: {failed}).",
+    }
+
+
+@router.get("/health/services")
+async def services_health() -> dict:
+    """Order-forecast service heartbeat status (from supervisor)."""
+    # Allowed directories for status files (path traversal protection)
+    ALLOWED_STATUS_DIRS = [
+        Path("/app/logs"),
+        Path("/srv/routespark/logs"),
+    ]
+
+    status_file = os.environ.get(
+        "ORDER_FORECAST_STATUS_FILE",
+        "/app/logs/order-forecast/service_status.json",
+    )
+    path = Path(status_file).resolve()
+
+    # Validate path is within allowed directories
+    if not any(str(path).startswith(str(allowed.resolve())) for allowed in ALLOWED_STATUS_DIRS if allowed.exists()):
+        logger.warning(f"Blocked path traversal attempt: {status_file}")
         return {
             "status": "error",
-            "message": str(e),
-            "timestamp": datetime.utcnow().isoformat()
+            "error": "invalid_path",
+            "timestamp": datetime.utcnow().isoformat(),
+        }
+
+    if not path.exists():
+        return {
+            "status": "unavailable",
+            "error": "status_file_missing",
+            "timestamp": datetime.utcnow().isoformat(),
+        }
+    try:
+        data = json.loads(path.read_text())
+        ts = data.get("timestamp")
+        age_seconds = None
+        if ts:
+            try:
+                ts_dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                age_seconds = int((datetime.utcnow() - ts_dt.replace(tzinfo=None)).total_seconds())
+            except Exception:
+                age_seconds = None
+        stale_after = int(os.environ.get("SERVICE_STATUS_STALE_SECONDS", "180"))
+        stale = age_seconds is not None and age_seconds > stale_after
+        return {
+            "status": "stale" if stale else "healthy",
+            "timestamp": ts,
+            "ageSeconds": age_seconds,
+            "services": data.get("services", []),
+        }
+    except Exception as e:
+        logger.error(f"Services health check failed: {e}")
+        return {
+            "status": "unavailable",
+            "error": str(e) if DEBUG_MODE else "Failed to read status",
+            "timestamp": datetime.utcnow().isoformat(),
         }

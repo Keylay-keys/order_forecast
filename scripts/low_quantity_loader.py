@@ -12,7 +12,7 @@ Usage:
     items = get_items_for_order_date(db, 'RTK-123456', '2026-01-20')
 
     # Get stores that stock a specific SAP
-    stores = get_stores_for_sap(db_client, 'RTK-123456', '31032')
+    stores = get_stores_for_sap('RTK-123456', '31032')
 """
 
 from __future__ import annotations
@@ -31,6 +31,16 @@ try:
     from .schedule_utils import get_order_cycles, normalize_delivery_date
 except ImportError:
     from schedule_utils import get_order_cycles, normalize_delivery_date
+
+try:
+    from .pg_utils import fetch_all
+except ImportError:
+    from pg_utils import fetch_all
+
+try:
+    from google.cloud.firestore_v1.base_query import FieldFilter
+except ImportError:
+    FieldFilter = None  # Will be imported later if needed
 
 
 # =============================================================================
@@ -347,7 +357,10 @@ def load_pcf_items(db, route_number: str) -> List[PCFItem]:
             containers_ref = delivery_doc.reference.collection('containers')
             # Query for containers that aren't fully expired
             try:
-                containers_query = containers_ref.where('allItemsExpired', '==', False)
+                if FieldFilter:
+                    containers_query = containers_ref.where(filter=FieldFilter('allItemsExpired', '==', False))
+                else:
+                    containers_query = containers_ref.where('allItemsExpired', '==', False)
                 containers = containers_query.stream()
             except Exception:
                 # If field doesn't exist, get all containers
@@ -513,7 +526,6 @@ def get_items_for_order_date(
     db,
     route_number: str,
     order_date: str,
-    db_client=None,
 ) -> List[LowQuantityItem]:
     """Get low quantity items that should be ordered on a specific date.
 
@@ -523,8 +535,6 @@ def get_items_for_order_date(
         db: Firestore client
         route_number: Route to check
         order_date: Order date to match (ISO format YYYY-MM-DD)
-        db_client: Optional DBClient for faster DuckDB lookups
-
     Returns:
         List of low quantity items where order_by_date matches
     """
@@ -542,7 +552,7 @@ def get_items_for_order_date(
         return []
 
     # Get order cycles
-    order_cycles = get_order_cycles(db, route_number, db_client=db_client)
+    order_cycles = get_order_cycles(db, route_number)
     if not order_cycles:
         print(f"[low_qty] No order cycles found for route {route_number}")
         return []
@@ -565,22 +575,21 @@ def get_saps_to_suppress(
     db,
     route_number: str,
     order_date: str,
-    db_client=None,
 ) -> set:
     """Get SAPs that should be suppressed (zeroed) for a given order date.
     
     These are low-qty items where:
     - They have a computed order_by_date (are flagged as low-qty)
     - Their order_by_date is NOT the given order_date
+    - They are NOT high-velocity items (ordered > 50% of the time)
     
-    This prevents ML from ordering low-qty items on the wrong day.
+    This prevents ML from ordering low-qty items on the wrong day,
+    while allowing high-velocity items to pass through even if PCF data is stale.
     
     Args:
         db: Firestore client
         route_number: Route to check
         order_date: The order date being forecast (ISO format YYYY-MM-DD)
-        db_client: Optional DBClient for faster DuckDB lookups
-    
     Returns:
         Set of SAP codes to suppress (zero out predictions)
     """
@@ -592,10 +601,10 @@ def get_saps_to_suppress(
     if not pcf_items:
         return set()
     
-    # Get order cycles from DuckDB or Firebase
+    # Get order cycles from PostgreSQL or Firebase
     try:
         from schedule_utils import get_order_cycles
-        order_cycles = get_order_cycles(db, route_number, db_client=db_client)
+        order_cycles = get_order_cycles(db, route_number)
     except ImportError:
         order_cycles = []
     
@@ -606,10 +615,55 @@ def get_saps_to_suppress(
     all_low_qty = get_low_quantity_items(pcf_items, order_cycles, today=today)
     
     # Find SAPs where order_by_date != the given order_date
-    suppress_saps = set()
+    candidate_saps = set()
     for item in all_low_qty:
         if item.order_by_date and item.order_by_date != order_date:
-            suppress_saps.add(item.sap)
+            candidate_saps.add(item.sap)
+    
+    if not candidate_saps:
+        return set()
+    
+    # Exclude high-velocity items (ordered > 50% of the time)
+    # These shouldn't be suppressed even if PCF data is stale
+    high_velocity_saps = set()
+    if candidate_saps:
+        try:
+            sap_list = list(candidate_saps)
+            placeholders = ', '.join(['%s' for _ in sap_list])
+            
+            rows = fetch_all(f"""
+                WITH total_orders AS (
+                    SELECT COUNT(DISTINCT order_id) as total
+                    FROM orders_historical
+                    WHERE route_number = %s
+                ),
+                sap_orders AS (
+                    SELECT 
+                        oli.sap,
+                        COUNT(DISTINCT o.order_id) as times_ordered
+                    FROM order_line_items oli
+                    JOIN orders_historical o ON oli.order_id = o.order_id
+                    WHERE o.route_number = %s
+                      AND oli.sap IN ({placeholders})
+                    GROUP BY oli.sap
+                )
+                SELECT 
+                    s.sap,
+                    s.times_ordered::float / NULLIF(t.total, 0) as order_freq
+                FROM sap_orders s, total_orders t
+                WHERE s.times_ordered::float / NULLIF(t.total, 0) > 0.5
+            """, [route_number, route_number] + sap_list)
+            
+            for row in rows:
+                high_velocity_saps.add(str(row['sap']))
+                    
+            if high_velocity_saps:
+                print(f"[low_qty] Excluding {len(high_velocity_saps)} high-velocity SAPs from suppression (order_freq > 50%)")
+        except Exception as e:
+            print(f"[low_qty] Warning: Could not check order frequency: {e}")
+    
+    # Final suppress list excludes high-velocity items
+    suppress_saps = candidate_saps - high_velocity_saps
     
     if suppress_saps:
         print(f"[low_qty] {len(suppress_saps)} SAPs will be suppressed (order_by_date != {order_date})")
@@ -618,36 +672,29 @@ def get_saps_to_suppress(
 
 
 def get_stores_for_sap(
-    db_client,
     route_number: str,
     sap: str,
 ) -> List[str]:
     """Get list of store IDs that stock a specific SAP.
 
-    Uses the store_items table in DuckDB (synced from Manage Items).
+    Uses the store_items table in PostgreSQL (synced from Manage Items).
 
     Args:
-        db_client: DBClient for DuckDB queries
         route_number: Route to check
         sap: SAP code to look up
 
     Returns:
         List of store_id strings, or empty list if none found
     """
-    if db_client is None:
-        print(f"[low_qty] Warning: No db_client provided, cannot look up stores for SAP {sap}")
-        return []
-
     try:
-        result = db_client.query("""
+        rows = fetch_all("""
             SELECT store_id
             FROM store_items
-            WHERE route_number = ?
-              AND sap = ?
+            WHERE route_number = %s
+              AND sap = %s
               AND is_active = TRUE
         """, [route_number, sap])
 
-        rows = result.get('rows', [])
         store_ids = [row['store_id'] for row in rows]
 
         if not store_ids:
@@ -663,7 +710,6 @@ def get_stores_for_sap(
 def get_gap_items(
     db,
     route_number: str,
-    db_client=None,
 ) -> List[LowQuantityItem]:
     """Get low quantity items that have no viable order cycle (will have gap).
 
@@ -672,8 +718,6 @@ def get_gap_items(
     Args:
         db: Firestore client
         route_number: Route to check
-        db_client: Optional DBClient for faster DuckDB lookups
-
     Returns:
         List of low quantity items where will_have_gap is True
     """
@@ -687,7 +731,7 @@ def get_gap_items(
     today = get_current_datetime(user_timezone)
 
     # Get order cycles
-    order_cycles = get_order_cycles(db, route_number, db_client=db_client)
+    order_cycles = get_order_cycles(db, route_number)
 
     # Get all low quantity items
     low_qty_items = get_low_quantity_items(pcf_items, order_cycles, today=today)

@@ -1,12 +1,12 @@
 """Unified order sync listener - watches ALL orders across all routes.
 
 Multi-user support: Automatically syncs new routes when their first order appears.
-Uses DBClient to communicate with DB Manager (no direct DuckDB access).
+Uses direct PostgreSQL connections (no DB Manager / DuckDB dependency).
 
 Flow:
 1. Watches `/orders` collection for all users
-2. On new order: sends sync request to DB Manager
-3. DB Manager handles all database operations
+2. On new order: syncs route metadata into PostgreSQL
+3. On finalized order: syncs order data directly to PostgreSQL
 4. On finalized order: syncs order data for retraining
 
 Usage:
@@ -16,18 +16,51 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import os
 import socket
 import time
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Dict, List
 
+import psycopg2
+from psycopg2.extras import execute_values, RealDictCursor
 from google.cloud import firestore  # type: ignore
 
-# Import DBClient for database operations
 try:
-    from .db_client import DBClient
+    from .db_manager_pg import handle_sync_order
 except ImportError:
-    from db_client import DBClient
+    from db_manager_pg import handle_sync_order
+
+try:
+    from .forecast_engine import ForecastConfig, generate_forecast
+except ImportError:
+    from forecast_engine import ForecastConfig, generate_forecast
+
+try:
+    from google.cloud.firestore_v1.base_query import FieldFilter
+except Exception:
+    FieldFilter = None  # type: ignore
+
+# =============================================================================
+# Direct PostgreSQL connection (for high-volume operations)
+# =============================================================================
+
+_pg_conn: Optional[psycopg2.extensions.connection] = None
+
+
+def get_pg_connection() -> psycopg2.extensions.connection:
+    """Get or create a PostgreSQL connection for direct DB access."""
+    global _pg_conn
+    if _pg_conn is None or _pg_conn.closed:
+        _pg_conn = psycopg2.connect(
+            host=os.environ.get('POSTGRES_HOST', 'localhost'),
+            port=int(os.environ.get('POSTGRES_PORT', 5432)),
+            database=os.environ.get('POSTGRES_DB', 'routespark'),
+            user=os.environ.get('POSTGRES_USER', 'routespark'),
+            password=os.environ.get('POSTGRES_PASSWORD', ''),
+        )
+        _pg_conn.autocommit = True
+    return _pg_conn
 
 # US Holiday weeks (start_date, end_date, name) - weeks containing major holidays
 # Orders placed during these weeks should be marked as is_holiday_week=TRUE
@@ -43,8 +76,8 @@ HOLIDAY_WEEKS_2025 = [
 ]
 
 HOLIDAY_WEEKS_2026 = [
-    ('2025-11-23', '2025-11-29', 'Thanksgiving'),  # Thanksgiving Nov 26
-    ('2025-12-21', '2025-12-27', 'Christmas'),      # Christmas Dec 25
+    ('2026-11-23', '2026-11-29', 'Thanksgiving'),  # Thanksgiving Nov 26
+    ('2026-12-21', '2026-12-27', 'Christmas'),      # Christmas Dec 25
 ]
 
 ALL_HOLIDAY_WEEKS = HOLIDAY_WEEKS_2024 + HOLIDAY_WEEKS_2025 + HOLIDAY_WEEKS_2026
@@ -90,13 +123,155 @@ _store_alias_cache: Dict[str, Dict[str, str]] = {}  # route_number -> {alias_id:
 def get_firestore_client(sa_path: str) -> firestore.Client:
     return firestore.Client.from_service_account_json(sa_path)
 
+def _forecast_exists(
+    fb_client: firestore.Client,
+    route_number: str,
+    delivery_date: str,
+    schedule_key: str,
+) -> bool:
+    """Return True if a non-expired cached forecast exists for delivery_date + schedule_key."""
+    try:
+        cached_ref = fb_client.collection('forecasts').document(str(route_number)).collection('cached')
+        if FieldFilter is not None:
+            query = (
+                cached_ref
+                .where(filter=FieldFilter('deliveryDate', '==', delivery_date))
+                .where(filter=FieldFilter('scheduleKey', '==', schedule_key))
+            )
+            docs = query.stream()
+        else:
+            # Fallback for older client: scan.
+            docs = cached_ref.stream()
+
+        now = datetime.now(timezone.utc)
+        for doc in docs:
+            data = doc.to_dict() or {}
+            if FieldFilter is None:
+                if data.get('deliveryDate') != delivery_date or data.get('scheduleKey') != schedule_key:
+                    continue
+            expires_at = data.get('expiresAt')
+            if not expires_at:
+                return True
+            try:
+                if hasattr(expires_at, 'timestamp'):
+                    if expires_at.timestamp() > now.timestamp():
+                        return True
+                else:
+                    if expires_at > now:
+                        return True
+            except Exception:
+                # If expiry is malformed, err on "exists" to avoid regenerating repeatedly.
+                return True
+        return False
+    except Exception:
+        return False
+
+
+def _get_next_unordered_delivery(route_number: str) -> Optional[Dict[str, str]]:
+    """Pick the single next delivery across all active schedules that doesn't already have a finalized order."""
+    conn = get_pg_connection()
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            """
+            SELECT schedule_key, delivery_day
+            FROM user_schedules
+            WHERE route_number = %s AND is_active = TRUE
+            """,
+            [str(route_number)],
+        )
+        schedules = cur.fetchall() or []
+        if not schedules:
+            return None
+
+        candidates: List[Dict[str, str]] = []
+        today = datetime.now(timezone.utc).date()
+        for sched in schedules:
+            schedule_key = (sched.get('schedule_key') or '').lower()
+            delivery_dow = int(sched.get('delivery_day') or 0)  # 1=Mon ... 7=Sun
+            if not schedule_key or delivery_dow <= 0:
+                continue
+
+            for days in range(1, 15):
+                check_date = today + timedelta(days=days)
+                check_dow = check_date.weekday() + 1
+                if check_dow != delivery_dow:
+                    continue
+
+                delivery_date_str = check_date.strftime('%Y-%m-%d')
+                cur.execute(
+                    """
+                    SELECT COUNT(*) AS cnt
+                    FROM orders_historical
+                    WHERE route_number = %s
+                      AND schedule_key = %s
+                      AND delivery_date = %s
+                    """,
+                    [str(route_number), schedule_key, delivery_date_str],
+                )
+                row = cur.fetchone() or {}
+                if int(row.get('cnt') or 0) > 0:
+                    continue
+
+                candidates.append(
+                    {
+                        'delivery_date': delivery_date_str,
+                        'schedule_key': schedule_key,
+                    }
+                )
+                break
+
+        if not candidates:
+            return None
+        candidates.sort(key=lambda x: x['delivery_date'])
+        return candidates[0]
+
+
+def _maybe_generate_next_forecast_after_finalization(fb_client: firestore.Client, route_number: str) -> None:
+    """Generate exactly one next forecast (if missing) right after an order finalizes.
+
+    This avoids waiting up to 24h for retrain_daemon, and is guarded by existence checks so
+    we don't regenerate repeatedly on duplicate finalize events.
+    """
+    enabled = os.environ.get('FORECAST_ON_FINALIZE', '0').lower() in ('1', 'true', 'yes')
+    if not enabled:
+        return
+
+    nxt = _get_next_unordered_delivery(route_number)
+    if not nxt:
+        return
+
+    delivery_date = nxt['delivery_date']
+    schedule_key = nxt['schedule_key']
+
+    if _forecast_exists(fb_client, str(route_number), delivery_date, schedule_key):
+        return
+
+    sa_path = os.environ.get('GOOGLE_APPLICATION_CREDENTIALS') or '/app/config/serviceAccountKey.json'
+    print(f"  🔮 Generating next forecast after finalization: {delivery_date} ({schedule_key})")
+    cfg = ForecastConfig(
+        route_number=str(route_number),
+        delivery_date=delivery_date,
+        schedule_key=schedule_key,
+        service_account=sa_path,
+        since_days=365,
+        round_cases=True,
+        ttl_days=7,
+    )
+    try:
+        forecast = generate_forecast(cfg)
+        print(f"     ✅ Forecast {forecast.forecast_id}: {len(forecast.items)} items")
+    except RuntimeError as e:
+        # Whole-case invariant or other hard gate: skip emission and keep listener running.
+        print(f"     ❌ Forecast skipped (hard gate): {e}")
+        return
+
 
 # =============================================================================
 # Store ID Alias Resolution
 # =============================================================================
 
-def load_store_aliases(db_client: DBClient, route_number: str) -> Dict[str, str]:
-    """Load store ID aliases for a route from DuckDB.
+def load_store_aliases(route_number: str) -> Dict[str, str]:
+    """Load store ID aliases for a route from PostgreSQL.
     
     Returns:
         Dict mapping alias_id -> canonical_id
@@ -108,15 +283,18 @@ def load_store_aliases(db_client: DBClient, route_number: str) -> Dict[str, str]
         return _store_alias_cache[route_number]
     
     try:
-        result = db_client.query("""
-            SELECT alias_id, canonical_id 
-            FROM store_id_aliases 
-            WHERE route_number = ?
-        """, [route_number])
-        
-        aliases = {}
-        for row in result.get('rows', []):
-            aliases[row['alias_id']] = row['canonical_id']
+        conn = get_pg_connection()
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT alias_id, canonical_id 
+                FROM store_id_aliases 
+                WHERE route_number = %s
+                """,
+                [route_number],
+            )
+            rows = cur.fetchall()
+        aliases = {row['alias_id']: row['canonical_id'] for row in rows}
         
         # Cache it
         _store_alias_cache[route_number] = aliases
@@ -129,13 +307,13 @@ def load_store_aliases(db_client: DBClient, route_number: str) -> Dict[str, str]
         return {}
 
 
-def resolve_store_id(db_client: DBClient, route_number: str, store_id: str) -> str:
+def resolve_store_id(route_number: str, store_id: str) -> str:
     """Resolve a store_id to its canonical form using the alias table.
     
     If the store_id is found in the alias table, returns the canonical_id.
     Otherwise, returns the original store_id unchanged.
     """
-    aliases = load_store_aliases(db_client, route_number)
+    aliases = load_store_aliases(route_number)
     canonical = aliases.get(store_id)
     if canonical:
         return canonical
@@ -152,112 +330,165 @@ def clear_alias_cache(route_number: str = None):
 
 
 # =============================================================================
-# Route Sync Status (via DBClient)
+# Route Sync Status (PostgreSQL)
 # =============================================================================
 
-def is_route_synced(client: DBClient, route_number: str) -> bool:
-    """Check if a route has been synced to DuckDB."""
+def is_route_synced(route_number: str) -> bool:
+    """Check if a route has been synced to PostgreSQL."""
     try:
-        result = client.check_route_synced(route_number)
-        return result.get('synced', False)
+        conn = get_pg_connection()
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT sync_status
+                FROM routes_synced
+                WHERE route_number = %s
+                """,
+                [route_number],
+            )
+            row = cur.fetchone()
+        return bool(row and row.get('sync_status') == 'ready')
     except Exception as e:
         print(f"     ⚠️  Error checking sync status: {e}")
         return False
 
 
-def mark_route_syncing(client: DBClient, route_number: str, user_id: str, trigger_order_id: str):
+def mark_route_syncing(route_number: str, user_id: str, trigger_order_id: str):
     """Mark a route as currently syncing."""
     now = datetime.now(timezone.utc).isoformat()
     try:
-        client.write("""
+        conn = get_pg_connection()
+        with conn.cursor() as cur:
+            cur.execute("""
             INSERT INTO routes_synced (
                 route_number, user_id, first_synced_at, last_synced_at,
                 worker_id, triggered_by, trigger_order_id, sync_status
-            ) VALUES (?, ?, ?, ?, ?, 'first_order', ?, 'syncing')
+            ) VALUES (%s, %s, %s, %s, %s, 'first_order', %s, 'syncing')
             ON CONFLICT (route_number) DO UPDATE SET
                 last_synced_at = EXCLUDED.last_synced_at,
                 worker_id = EXCLUDED.worker_id,
                 sync_status = 'syncing'
-        """, [route_number, user_id, now, now, WORKER_ID, trigger_order_id])
+            """, [route_number, user_id, now, now, WORKER_ID, trigger_order_id])
     except Exception as e:
         print(f"     ⚠️  Error marking route syncing: {e}")
 
 
-def mark_route_ready(client: DBClient, route_number: str, stores: int, products: int, orders: int):
+def mark_route_ready(route_number: str, stores: int, products: int, orders: int):
     """Mark a route as synced and ready."""
     now = datetime.now(timezone.utc).isoformat()
     try:
-        client.write("""
+        conn = get_pg_connection()
+        with conn.cursor() as cur:
+            cur.execute("""
             UPDATE routes_synced SET
                 sync_status = 'ready',
-                last_synced_at = ?,
-                stores_count = ?,
-                products_count = ?,
-                orders_count = ?,
+                last_synced_at = %s,
+                stores_count = %s,
+                products_count = %s,
+                orders_count = %s,
                 schedules_synced = TRUE
-            WHERE route_number = ?
-        """, [now, stores, products, orders, route_number])
+            WHERE route_number = %s
+            """, [now, stores, products, orders, route_number])
     except Exception as e:
         print(f"     ⚠️  Error marking route ready: {e}")
 
 
 # =============================================================================
-# Firebase Sync Functions (via DBClient)
+# Firebase Sync Functions (PostgreSQL writes)
 # =============================================================================
 
-def sync_stores_from_firebase(fb_client: firestore.Client, db_client: DBClient, route_number: str) -> int:
-    """Sync stores from Firebase to DuckDB via DB Manager."""
+def sync_stores_from_firebase(fb_client: firestore.Client, route_number: str) -> int:
+    """Sync stores from Firebase to PostgreSQL."""
     stores_ref = fb_client.collection('routes').document(route_number).collection('stores')
     stores = stores_ref.stream()
     
     count = 0
     now = datetime.now(timezone.utc).isoformat()
     
+    rows = []
     for store_doc in stores:
         data = store_doc.to_dict() or {}
         store_id = store_doc.id
-        
-        try:
-            # Note: Mobile app stores field as 'number', not 'storeNumber'
-            db_client.write("""
+
+        # Note: Mobile app stores field as 'number', not 'storeNumber'
+        rows.append((
+            store_id,
+            route_number,
+            data.get('name', ''),
+            data.get('number', ''),
+            data.get('isActive', True),
+            now,
+        ))
+
+    if not rows:
+        return 0
+
+    try:
+        conn = get_pg_connection()
+        with conn.cursor() as cur:
+            execute_values(
+                cur,
+                """
                 INSERT INTO stores (store_id, route_number, store_name, store_number, is_active, synced_at)
-                VALUES (?, ?, ?, ?, ?, ?)
+                VALUES %s
                 ON CONFLICT (store_id) DO UPDATE SET
                     store_name = EXCLUDED.store_name,
                     store_number = EXCLUDED.store_number,
                     is_active = EXCLUDED.is_active,
                     synced_at = EXCLUDED.synced_at
-            """, [
-                store_id,
-                route_number,
-                data.get('name', ''),
-                data.get('number', ''),  # Field is 'number' in Firestore
-                data.get('isActive', True),
-                now
-            ])
-            count += 1
-        except Exception as e:
-            print(f"     ⚠️  Error syncing store {store_id}: {e}")
+                """,
+                rows,
+            )
+        count = len(rows)
+    except Exception as e:
+        print(f"     ⚠️  Error syncing stores: {e}")
     
     return count
 
 
-def sync_products_from_firebase(fb_client: firestore.Client, db_client: DBClient, route_number: str) -> int:
-    """Sync products from Firebase to DuckDB via DB Manager."""
-    products_ref = fb_client.collection('routes').document(route_number).collection('products')
-    products = products_ref.stream()
+def sync_products_from_firebase(fb_client: firestore.Client, route_number: str) -> int:
+    """Sync products from Firebase to PostgreSQL.
+
+    Source of truth is masterCatalog/{route}/products (casePack/tray live here).
+    Falls back to legacy routes/{route}/products if masterCatalog is empty.
+    """
+    products_ref = fb_client.collection('masterCatalog').document(route_number).collection('products')
+    products = list(products_ref.stream())
+    if not products:
+        legacy_ref = fb_client.collection('routes').document(route_number).collection('products')
+        products = list(legacy_ref.stream())
     
     count = 0
     now = datetime.now(timezone.utc).isoformat()
     
+    rows = []
     for prod_doc in products:
         data = prod_doc.to_dict() or {}
         sap = data.get('sap', prod_doc.id)
-        
-        try:
-            db_client.write("""
+
+        rows.append((
+            sap,
+            route_number,
+            data.get('fullName') or data.get('name') or data.get('product') or '',
+            data.get('shortName', ''),
+            data.get('brand', ''),
+            data.get('category', ''),
+            data.get('casePack') or data.get('tray') or 1,
+            data.get('active', data.get('isActive', True)),
+            now,
+        ))
+
+    if not rows:
+        return 0
+
+    try:
+        conn = get_pg_connection()
+        with conn.cursor() as cur:
+            execute_values(
+                cur,
+                """
                 INSERT INTO product_catalog (sap, route_number, full_name, short_name, brand, category, case_pack, is_active, synced_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES %s
                 ON CONFLICT (sap, route_number) DO UPDATE SET
                     full_name = EXCLUDED.full_name,
                     short_name = EXCLUDED.short_name,
@@ -266,26 +497,18 @@ def sync_products_from_firebase(fb_client: firestore.Client, db_client: DBClient
                     case_pack = EXCLUDED.case_pack,
                     is_active = EXCLUDED.is_active,
                     synced_at = EXCLUDED.synced_at
-            """, [
-                sap,
-                route_number,
-                data.get('name', data.get('fullName', '')),
-                data.get('shortName', ''),
-                data.get('brand', ''),
-                data.get('category', ''),
-                data.get('casePack', 1),
-                data.get('isActive', True),
-                now
-            ])
-            count += 1
-        except Exception as e:
-            print(f"     ⚠️  Error syncing product {sap}: {e}")
+                """,
+                rows,
+            )
+        count = len(rows)
+    except Exception as e:
+        print(f"     ⚠️  Error syncing products: {e}")
     
     return count
 
 
-def sync_schedules_from_firebase(fb_client: firestore.Client, db_client: DBClient, route_number: str, user_id: str) -> int:
-    """Sync order schedules from Firebase to DuckDB via DB Manager."""
+def sync_schedules_from_firebase(fb_client: firestore.Client, route_number: str, user_id: str) -> int:
+    """Sync order schedules from Firebase to PostgreSQL."""
     user_ref = fb_client.collection('users').document(user_id)
     user_doc = user_ref.get()
     
@@ -312,6 +535,7 @@ def sync_schedules_from_firebase(fb_client: firestore.Client, db_client: DBClien
     day_names = {1: 'monday', 2: 'tuesday', 3: 'wednesday', 4: 'thursday', 
                  5: 'friday', 6: 'saturday', 0: 'sunday'}
     
+    rows = []
     for i, cycle in enumerate(cycles):
         order_day = cycle.get('orderDay', 1)
         load_day = cycle.get('loadDay', 3)
@@ -320,11 +544,30 @@ def sync_schedules_from_firebase(fb_client: firestore.Client, db_client: DBClien
         schedule_key = day_names.get(order_day, 'unknown')
         
         schedule_id = f"{route_number}-cycle-{i}"
-        
-        try:
-            db_client.write("""
+
+        rows.append((
+            schedule_id,
+            route_number,
+            user_id,
+            order_day,
+            load_day,
+            delivery_day,
+            schedule_key,
+            True,
+            now,
+        ))
+
+    if not rows:
+        return 0
+
+    try:
+        conn = get_pg_connection()
+        with conn.cursor() as cur:
+            execute_values(
+                cur,
+                """
                 INSERT INTO user_schedules (id, route_number, user_id, order_day, load_day, delivery_day, schedule_key, is_active, synced_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES %s
                 ON CONFLICT (id) DO UPDATE SET
                     order_day = EXCLUDED.order_day,
                     load_day = EXCLUDED.load_day,
@@ -332,45 +575,37 @@ def sync_schedules_from_firebase(fb_client: firestore.Client, db_client: DBClien
                     schedule_key = EXCLUDED.schedule_key,
                     is_active = EXCLUDED.is_active,
                     synced_at = EXCLUDED.synced_at
-            """, [
-                schedule_id,
-                route_number,
-                user_id,
-                order_day,
-                load_day,
-                delivery_day,
-                schedule_key,
-                True,
-                now
-            ])
-            count += 1
-        except Exception as e:
-            print(f"     ⚠️  Error syncing schedule {schedule_id}: {e}")
+                """,
+                rows,
+            )
+        count = len(rows)
+    except Exception as e:
+        print(f"     ⚠️  Error syncing schedules: {e}")
     
     return count
 
 
-def sync_full_route(fb_client: firestore.Client, db_client: DBClient, 
+def sync_full_route(fb_client: firestore.Client, 
                    route_number: str, user_id: str, trigger_order_id: str) -> bool:
-    """Perform a full sync of a route from Firebase to DuckDB."""
+    """Perform a full sync of a route from Firebase to PostgreSQL."""
     print(f"  🔄 Syncing route {route_number}...")
     
     try:
         # Mark as syncing
-        mark_route_syncing(db_client, route_number, user_id, trigger_order_id)
+        mark_route_syncing(route_number, user_id, trigger_order_id)
         
         # Sync each entity type
-        stores_count = sync_stores_from_firebase(fb_client, db_client, route_number)
+        stores_count = sync_stores_from_firebase(fb_client, route_number)
         print(f"     ✓ Synced {stores_count} stores")
         
-        products_count = sync_products_from_firebase(fb_client, db_client, route_number)
+        products_count = sync_products_from_firebase(fb_client, route_number)
         print(f"     ✓ Synced {products_count} products")
         
-        schedules_count = sync_schedules_from_firebase(fb_client, db_client, route_number, user_id)
+        schedules_count = sync_schedules_from_firebase(fb_client, route_number, user_id)
         print(f"     ✓ Synced {schedules_count} schedules")
         
         # Mark as ready
-        mark_route_ready(db_client, route_number, stores_count, products_count, 0)
+        mark_route_ready(route_number, stores_count, products_count, 0)
         
         print(f"  ✅ Route {route_number} synced and ready!")
         return True
@@ -396,7 +631,7 @@ def update_firebase_sync_status(fb_client: firestore.Client, route_number: str, 
 # Order Event Handlers
 # =============================================================================
 
-def handle_new_order(fb_client: firestore.Client, db_client: DBClient, order_id: str, data: dict):
+def handle_new_order(fb_client: firestore.Client, order_id: str, data: dict):
     """Handle a new order being created."""
     route_number = data.get('routeNumber')
     user_id = data.get('userId')
@@ -408,16 +643,16 @@ def handle_new_order(fb_client: firestore.Client, db_client: DBClient, order_id:
     print(f"  📦 New order: {order_id} (route: {route_number}, status: {status})")
     
     # Check if this route is already synced
-    if not is_route_synced(db_client, route_number):
+    if not is_route_synced(route_number):
         print(f"  🆕 First order for route {route_number} - syncing...")
-        if sync_full_route(fb_client, db_client, route_number, user_id, order_id):
+        if sync_full_route(fb_client, route_number, user_id, order_id):
             update_firebase_sync_status(fb_client, route_number, True)
     else:
         print(f"     Route {route_number} already synced")
 
 
-def handle_finalized_order(fb_client: firestore.Client, db_client: DBClient, order_id: str, data: dict):
-    """Handle an order being finalized - sync it to DuckDB and regenerate forecasts."""
+def handle_finalized_order(fb_client: firestore.Client, order_id: str, data: dict):
+    """Handle an order being finalized - sync it to PostgreSQL and regenerate forecasts."""
     route_number = data.get('routeNumber')
     user_id = data.get('userId')
     schedule_key = data.get('scheduleKey')
@@ -427,9 +662,12 @@ def handle_finalized_order(fb_client: firestore.Client, db_client: DBClient, ord
     
     print(f"  ✅ Order finalized: {order_id}")
     
-    # Use DB Manager's sync_order handler
+    # Use db_manager_pg's sync_order handler
     try:
-        result = db_client.sync_order(order_id, route_number)
+        result = handle_sync_order(get_pg_connection(), fb_client, {
+            'orderId': order_id,
+            'routeNumber': route_number,
+        })
         if 'error' in result:
             print(f"     ⚠️  Sync error: {result['error']}")
         else:
@@ -437,27 +675,38 @@ def handle_finalized_order(fb_client: firestore.Client, db_client: DBClient, ord
             corrections_count = result.get('correctionsExtracted', 0)
             if corrections_count > 0:
                 print(f"     📊 Extracted {corrections_count} corrections for ML training")
-            create_delivery_allocations(db_client, fb_client, order_id, route_number, data)
-            link_promos_for_order(db_client, order_id, route_number, data)
+            create_delivery_allocations(fb_client, order_id, route_number, data)
+            link_promos_for_order(order_id, route_number, data)
             
-            # Regenerate forecasts for all upcoming deliveries (incorporates new corrections)
-            regenerate_forecasts_after_finalization(fb_client, db_client, route_number, user_id)
+            # Update Firebase sync status so app knows data is current
+            update_firebase_sync_status(fb_client, route_number, True)
+            
+            # NOTE: Removed auto-regeneration - was causing duplicate forecasts on every order sync.
+            # Forecasts should only be generated:
+            #   1. Once per complete order cycle (by retrain_daemon.py)
+            #   2. Manually via run_forecast.py when needed
+            # The daemon already incorporates corrections when generating forecasts.
+            # regenerate_forecasts_after_finalization(fb_client, route_number, user_id)
+            _maybe_generate_next_forecast_after_finalization(fb_client, route_number)
     except Exception as e:
         print(f"     ❌ Error syncing order: {e}")
 
 
 def regenerate_forecasts_after_finalization(
     fb_client: firestore.Client,
-    db_client: DBClient,
     route_number: str,
     user_id: str,
 ) -> None:
-    """Regenerate forecasts for all upcoming deliveries after an order is finalized.
+    """Generate a forecast for ONLY the next upcoming delivery after finalization.
     
-    This ensures the latest corrections are incorporated into upcoming forecasts.
-    Deletes existing cached forecasts and regenerates them.
+    Cross-cycle dependency: what is ordered in Cycle A affects what should be
+    recommended in Cycle B.  So we generate ONE forecast at a time:
+    
+        Order(CycleA) → Forecast(CycleB) → Order(CycleB) → Retrain → Forecast(CycleA) → …
+    
+    This ensures each forecast incorporates the most recent order data.
     """
-    print(f"  🔄 Regenerating forecasts with latest corrections...")
+    print(f"  🔄 Generating next forecast after finalization...")
     
     # First, clean up old forecasts (past delivery dates)
     cleaned = cleanup_old_forecasts(fb_client, route_number)
@@ -465,14 +714,14 @@ def regenerate_forecasts_after_finalization(
         print(f"     🧹 Cleaned up {cleaned} past forecasts")
     
     try:
-        # Get user's order schedules (tries DuckDB first, then Firebase)
-        schedules = get_user_schedules(fb_client, db_client, route_number)
+        # Get user's order schedules (tries PostgreSQL first, then Firebase)
+        schedules = get_user_schedules(fb_client, route_number)
         if not schedules:
             print(f"     ⚠️  No schedules found for route {route_number}")
             return
         
-        # Calculate next delivery dates for each schedule
-        upcoming_deliveries = []
+        # Find the SINGLE soonest unordered delivery across all schedules
+        candidates = []
         today = datetime.now(timezone.utc).date()
         
         for schedule in schedules:
@@ -484,51 +733,72 @@ def regenerate_forecasts_after_finalization(
                         4: 'thursday', 5: 'friday', 6: 'saturday'}
             schedule_key = day_names.get(order_day, 'unknown')
             
-            # Find next delivery date
+            # Find next delivery date for this schedule
             next_delivery = get_next_delivery_date(today, delivery_day)
-            upcoming_deliveries.append({
-                'delivery_date': next_delivery.isoformat(),
+            next_delivery_str = next_delivery.strftime('%Y-%m-%d') if hasattr(next_delivery, 'strftime') else next_delivery.isoformat()[:10]
+            
+            # Check if this delivery already has a finalized order (PostgreSQL)
+            try:
+                from db_manager_pg import fetch_one
+                order_check = fetch_one("""
+                    SELECT COUNT(*) as cnt
+                    FROM orders_historical
+                    WHERE route_number = %s
+                      AND schedule_key = %s
+                      AND delivery_date = %s
+                """, [route_number, schedule_key, next_delivery_str])
+                if (order_check.get('cnt', 0) if order_check else 0) > 0:
+                    print(f"     ⏭️  Skipping {next_delivery_str} ({schedule_key}) - already ordered")
+                    continue
+            except Exception:
+                pass  # If PG check fails, include this candidate
+            
+            candidates.append({
+                'delivery_date': next_delivery_str,
                 'schedule_key': schedule_key,
             })
         
-        if not upcoming_deliveries:
-            print(f"     No upcoming deliveries to regenerate")
+        if not candidates:
+            print(f"     No upcoming unordered deliveries to forecast")
             return
         
-        # Delete existing forecasts for these dates
-        deleted = delete_forecasts_for_dates(fb_client, route_number, upcoming_deliveries)
-        if deleted > 0:
-            print(f"     🗑️  Deleted {deleted} stale forecasts")
+        # Pick the SOONEST delivery (serial chain)
+        candidates.sort(key=lambda x: x['delivery_date'])
+        target = candidates[0]
+        delivery_date = target['delivery_date']
+        schedule_key = target['schedule_key']
         
-        # Import and run forecast generation
+        print(f"     📋 Next forecast target: {delivery_date} ({schedule_key})")
+        
+        # Delete any existing forecast for this date (will be replaced)
+        deleted = delete_forecasts_for_dates(fb_client, route_number, [target])
+        if deleted > 0:
+            print(f"     🗑️  Deleted {deleted} stale forecast(s) for {delivery_date}")
+        
+        # Generate fresh forecast
         try:
             from forecast_engine import ForecastConfig, generate_forecast
             
-            for delivery in upcoming_deliveries:
-                delivery_date = delivery['delivery_date']
-                schedule_key = delivery['schedule_key']
-                
-                print(f"     🔮 Generating forecast for {delivery_date} ({schedule_key})...")
-                
-                # Find service account path (from environment or default)
-                import os
-                sa_path = os.environ.get(
-                    'FIREBASE_SA_PATH',
-                    '/Users/kylemacmini/Desktop/routespark/routespark-1f47d-firebase-adminsdk-tnv5k-b259331cbc.json'
-                )
-                
-                config = ForecastConfig(
-                    route_number=route_number,
-                    delivery_date=delivery_date,
-                    schedule_key=schedule_key,
-                    service_account=sa_path,
-                    since_days=365,
-                    round_cases=True,
-                    ttl_days=7,
-                )
-                
-                forecast = generate_forecast(config)
-                print(f"     ✅ Forecast {forecast.forecast_id}: {len(forecast.items)} items")
+            import os
+            sa_path = os.environ.get(
+                'FIREBASE_SA_PATH',
+                '/Users/kylemacmini/Desktop/routespark/routespark-1f47d-firebase-adminsdk-tnv5k-b259331cbc.json'
+            )
+            
+            print(f"     🔮 Generating forecast for {delivery_date} ({schedule_key})...")
+            
+            config = ForecastConfig(
+                route_number=route_number,
+                delivery_date=delivery_date,
+                schedule_key=schedule_key,
+                service_account=sa_path,
+                since_days=365,
+                round_cases=True,
+                ttl_days=7,
+            )
+            
+            forecast = generate_forecast(config)
+            print(f"     ✅ Forecast {forecast.forecast_id}: {len(forecast.items)} items")
                 
         except ImportError as e:
             print(f"     ⚠️  Could not import forecast_engine: {e}")
@@ -539,38 +809,17 @@ def regenerate_forecasts_after_finalization(
         print(f"     ❌ Error regenerating forecasts: {e}")
 
 
-def get_user_schedules(fb_client: firestore.Client, db_client: DBClient, route_number: str) -> List[Dict]:
-    """Get user's order schedules - tries DuckDB first, falls back to Firebase.
+def get_user_schedules(fb_client: firestore.Client, route_number: str) -> List[Dict]:
+    """Get user's order schedules - uses PostgreSQL, falls back to Firebase.
     
     Uses schedule_utils.get_order_cycles which handles the correct Firebase path
     (userSettings.notifications.scheduling.orderCycles) with fallback.
     """
     try:
         from schedule_utils import get_order_cycles
-        return get_order_cycles(fb_client, route_number, db_client=db_client)
+        return get_order_cycles(fb_client, route_number)
     except ImportError:
         pass
-    
-    # Fallback: try to get from DuckDB directly
-    if db_client:
-        try:
-            result = db_client.query("""
-                SELECT order_day, load_day, delivery_day
-                FROM user_schedules
-                WHERE route_number = ? AND is_active = TRUE
-            """, [route_number])
-            
-            cycles = []
-            for row in result.get('rows', []):
-                cycles.append({
-                    'orderDay': row['order_day'],
-                    'loadDay': row['load_day'],
-                    'deliveryDay': row['delivery_day'],
-                })
-            if cycles:
-                return cycles
-        except Exception as e:
-            print(f"     ⚠️  Error getting schedules from DuckDB: {e}")
     
     return []
 
@@ -765,7 +1014,6 @@ def calculate_store_delivery_date(
 
 
 def create_delivery_allocations(
-    db_client: DBClient,
     fb_client: firestore.Client,
     order_id: str,
     route_number: str,
@@ -773,6 +1021,7 @@ def create_delivery_allocations(
 ) -> None:
     """Create delivery allocation rows for a finalized order.
     
+    Uses direct PostgreSQL with batch inserts for efficiency (no Firebase round-trips).
     Calculates the correct delivery date per store based on their configured
     delivery days. Marks items as case splits when delivery differs from primary.
     """
@@ -787,7 +1036,8 @@ def create_delivery_allocations(
     # Load store delivery days from Firebase
     store_delivery_days = get_store_delivery_days(fb_client, route_number)
     
-    inserted = 0
+    # Collect all rows for batch insert
+    allocation_rows = []
     case_splits = 0
     
     for store in stores:
@@ -799,7 +1049,7 @@ def create_delivery_allocations(
             continue
 
         # Resolve store ID to canonical form (handles old/alias IDs)
-        store_id = resolve_store_id(db_client, route_number, raw_store_id)
+        store_id = resolve_store_id(route_number, raw_store_id)
         if store_id != raw_store_id:
             print(f"     📍 Resolved store alias: {raw_store_id} -> {store_id}")
 
@@ -821,13 +1071,31 @@ def create_delivery_allocations(
                 continue
 
             allocation_id = f"{order_id}-{store_id}-{sap}"
-            try:
-                db_client.write(
+            allocation_rows.append((
+                allocation_id,
+                route_number,
+                order_id,
+                order_date or delivery_date,
+                sap,
+                store_id,
+                store_name,
+                qty,
+                actual_delivery_date,
+                is_case_split,
+            ))
+
+    # Batch insert using direct PostgreSQL (no Firebase round-trips)
+    if allocation_rows:
+        try:
+            conn = get_pg_connection()
+            with conn.cursor() as cur:
+                execute_values(
+                    cur,
                     """
                     INSERT INTO delivery_allocations (
                         allocation_id, route_number, source_order_id, source_order_date,
                         sap, store_id, store_name, quantity, delivery_date, is_case_split
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES %s
                     ON CONFLICT (allocation_id) DO UPDATE SET
                         route_number = EXCLUDED.route_number,
                         source_order_date = EXCLUDED.source_order_date,
@@ -836,92 +1104,84 @@ def create_delivery_allocations(
                         delivery_date = EXCLUDED.delivery_date,
                         is_case_split = EXCLUDED.is_case_split
                     """,
-                    [
-                        allocation_id,
-                        route_number,
-                        order_id,
-                        order_date or delivery_date,
-                        sap,
-                        store_id,
-                        store_name,
-                        qty,
-                        actual_delivery_date,
-                        is_case_split,
-                    ],
+                    allocation_rows,
                 )
-                inserted += 1
-            except Exception as e:
-                print(f"     ⚠️  Failed to write allocation {allocation_id}: {e}")
-
-    if inserted:
-        msg = f"     ✓ Created/updated {inserted} delivery allocation rows"
-        if case_splits > 0:
-            msg += f" ({case_splits} stores with case splits)"
-        print(msg)
+            
+            msg = f"     ✓ Created/updated {len(allocation_rows)} delivery allocation rows"
+            if case_splits > 0:
+                msg += f" ({case_splits} stores with case splits)"
+            print(msg)
+        except Exception as e:
+            print(f"     ⚠️  Failed to batch insert allocations: {e}")
     
     # Post-process: Mark case splits based on comparing source order dates
     # For each store+delivery_date, the LATEST source_order_date is the "primary"
     # Earlier source_order_dates are case splits
-    mark_case_splits_for_route(db_client, route_number)
+    mark_case_splits_for_route(route_number)
 
 
-def mark_case_splits_for_route(db_client: DBClient, route_number: str) -> None:
+def mark_case_splits_for_route(route_number: str) -> None:
     """Mark case splits by comparing source order dates per store+delivery_date.
+    
+    Uses direct PostgreSQL for efficiency (no Firebase round-trips).
     
     For each store+delivery_date combination:
     - The LATEST source_order_date is the "primary" order (is_case_split = FALSE)
     - Earlier source_order_dates are case splits (is_case_split = TRUE)
     """
     try:
-        # Find all cases where a store+delivery_date has multiple source_order_dates
-        result = db_client.query("""
-            WITH order_dates_per_delivery AS (
-                SELECT 
-                    store_id,
-                    delivery_date,
-                    MAX(source_order_date) as primary_order_date
-                FROM delivery_allocations
-                WHERE route_number = ?
-                GROUP BY store_id, delivery_date
-            )
-            SELECT store_id, delivery_date, primary_order_date
-            FROM order_dates_per_delivery
-        """, [route_number])
-        
-        if not result.get('rows'):
-            return
-        
-        # For each store+delivery_date, set is_case_split based on source_order_date
-        updates = 0
-        for row in result['rows']:
-            store_id = row['store_id']
-            delivery_date = row['delivery_date']
-            primary_order_date = row['primary_order_date']
+        conn = get_pg_connection()
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            # Find all store+delivery_date combinations
+            cur.execute("""
+                WITH order_dates_per_delivery AS (
+                    SELECT 
+                        store_id,
+                        delivery_date,
+                        MAX(source_order_date) as primary_order_date
+                    FROM delivery_allocations
+                    WHERE route_number = %s
+                    GROUP BY store_id, delivery_date
+                )
+                SELECT store_id, delivery_date, primary_order_date
+                FROM order_dates_per_delivery
+            """, [route_number])
             
-            # Set is_case_split = FALSE for items from primary order date
-            db_client.write("""
-                UPDATE delivery_allocations
-                SET is_case_split = FALSE
-                WHERE route_number = ?
-                  AND store_id = ?
-                  AND delivery_date = ?
-                  AND source_order_date = ?
-            """, [route_number, store_id, delivery_date, primary_order_date])
+            rows = cur.fetchall()
+            if not rows:
+                return
             
-            # Set is_case_split = TRUE for items from earlier order dates
-            db_client.write("""
-                UPDATE delivery_allocations
-                SET is_case_split = TRUE
-                WHERE route_number = ?
-                  AND store_id = ?
-                  AND delivery_date = ?
-                  AND source_order_date < ?
-            """, [route_number, store_id, delivery_date, primary_order_date])
+            # For each store+delivery_date, set is_case_split based on source_order_date
+            updates = 0
+            for row in rows:
+                store_id = row['store_id']
+                delivery_date = row['delivery_date']
+                primary_order_date = row['primary_order_date']
+                
+                # Set is_case_split = FALSE for items from primary order date
+                cur.execute("""
+                    UPDATE delivery_allocations
+                    SET is_case_split = FALSE
+                    WHERE route_number = %s
+                      AND store_id = %s
+                      AND delivery_date = %s
+                      AND source_order_date = %s
+                """, [route_number, store_id, delivery_date, primary_order_date])
+                
+                # Set is_case_split = TRUE for items from earlier order dates
+                cur.execute("""
+                    UPDATE delivery_allocations
+                    SET is_case_split = TRUE
+                    WHERE route_number = %s
+                      AND store_id = %s
+                      AND delivery_date = %s
+                      AND source_order_date < %s
+                """, [route_number, store_id, delivery_date, primary_order_date])
+                
+                updates += 1
             
-            updates += 1
-        
-        if updates > 0:
-            print(f"     ✓ Updated case split flags for {updates} store+delivery combinations")
+            if updates > 0:
+                print(f"     ✓ Updated case split flags for {updates} store+delivery combinations")
     except Exception as e:
         print(f"     ⚠️  Error marking case splits: {e}")
 
@@ -930,7 +1190,7 @@ def mark_case_splits_for_route(db_client: DBClient, route_number: str) -> None:
 # Promo linkage
 # =============================================================================
 
-def link_promos_for_order(db_client: DBClient, order_id: str, route_number: str, data: dict) -> None:
+def link_promos_for_order(order_id: str, route_number: str, data: dict) -> None:
     """Link finalized order items to active promos (date-window + SAP) and compute ML features."""
     order_date = data.get('orderDate') or data.get('expectedDeliveryDate')
     stores = data.get('stores', []) or []
@@ -943,7 +1203,7 @@ def link_promos_for_order(db_client: DBClient, order_id: str, route_number: str,
     for store in stores:
         raw_store_id = store.get('id') or store.get('storeId') or ''
         # Resolve store ID to canonical form
-        store_id = resolve_store_id(db_client, route_number, raw_store_id) if raw_store_id else ''
+        store_id = resolve_store_id(route_number, raw_store_id) if raw_store_id else ''
         
         for item in store.get('items', []) or []:
             sap = item.get('sap')
@@ -951,10 +1211,10 @@ def link_promos_for_order(db_client: DBClient, order_id: str, route_number: str,
             cases = item.get('cases', 0)
             if not sap or qty == 0:
                 continue
-            promo_info = _find_promo_info(db_client, route_number, sap, order_date)
+            promo_info = _find_promo_info(route_number, sap, order_date)
             if promo_info:
                 # Get baseline quantity (avg non-promo orders for this store/sap)
-                baseline = _get_baseline_quantity(db_client, route_number, store_id, sap)
+                baseline = _get_baseline_quantity(route_number, store_id, sap)
                 quantity_lift = qty / baseline if baseline and baseline > 0 else None
                 
                 promo_items.append({
@@ -974,10 +1234,31 @@ def link_promos_for_order(db_client: DBClient, order_id: str, route_number: str,
     if not promo_items:
         return
 
-    inserted = 0
-    for entry in promo_items:
-        try:
-            db_client.write(
+    # Batch insert using direct PostgreSQL
+    try:
+        rows = []
+        for entry in promo_items:
+            rows.append((
+                f"{order_id}-{entry['store_id']}-{entry['sap']}-{entry['promo_id']}",
+                route_number,
+                entry['promo_id'],
+                order_id,
+                entry['store_id'],
+                entry['sap'],
+                entry['promo_price'],
+                entry['discount_percent'],
+                entry['quantity'],
+                entry['cases'],
+                entry['baseline_quantity'],
+                entry['quantity_lift'],
+                entry['weeks_into_promo'],
+                entry['is_first_occurrence'],
+            ))
+        
+        conn = get_pg_connection()
+        with conn.cursor() as cur:
+            execute_values(
+                cur,
                 """
                 INSERT INTO promo_order_history (
                     id, route_number, promo_id, order_id, store_id, sap,
@@ -986,118 +1267,110 @@ def link_promos_for_order(db_client: DBClient, order_id: str, route_number: str,
                     baseline_quantity, quantity_lift,
                     weeks_into_promo, is_first_promo_occurrence,
                     created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ) VALUES %s
                 ON CONFLICT (id) DO UPDATE SET
                     quantity_ordered = EXCLUDED.quantity_ordered,
                     cases_ordered = EXCLUDED.cases_ordered,
                     baseline_quantity = EXCLUDED.baseline_quantity,
                     quantity_lift = EXCLUDED.quantity_lift
                 """,
-                [
-                    f"{order_id}-{entry['store_id']}-{entry['sap']}-{entry['promo_id']}",
-                    route_number,
-                    entry['promo_id'],
-                    order_id,
-                    entry['store_id'],
-                    entry['sap'],
-                    entry['promo_price'],
-                    entry['discount_percent'],
-                    entry['quantity'],
-                    entry['cases'],
-                    entry['baseline_quantity'],
-                    entry['quantity_lift'],
-                    entry['weeks_into_promo'],
-                    entry['is_first_occurrence'],
-                ],
+                rows,
+                template="(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)",
             )
-            inserted += 1
-        except Exception as e:
-            print(f"     ⚠️  Failed to write promo_order_history: {e}")
-
-    if inserted:
-        print(f"     ✓ Linked {inserted} promo items for order {order_id}")
+        
+        print(f"     ✓ Linked {len(promo_items)} promo items for order {order_id}")
+    except Exception as e:
+        print(f"     ⚠️  Failed to write promo_order_history: {e}")
 
 
-def _find_promo_info(db_client: DBClient, route_number: str, sap: str, order_date: str) -> dict | None:
-    """Lookup promo info for sap/date window including ML features."""
+def _find_promo_info(route_number: str, sap: str, order_date: str) -> dict | None:
+    """Lookup promo info for sap/date window including ML features.
+    
+    Uses direct PostgreSQL for efficiency.
+    """
     try:
-        result = db_client.query(
-            """
-            SELECT 
-                pi.promo_id,
-                pi.special_price,
-                pi.discount_percent,
-                ph.start_date,
-                ph.times_seen
-            FROM promo_items pi
-            JOIN promo_history ph ON pi.promo_id = ph.promo_id
-            WHERE pi.sap = ?
-              AND ph.route_number = ?
-              AND DATE(?) BETWEEN ph.start_date AND ph.end_date
-            LIMIT 1
-            """,
-            [sap, route_number, order_date],
-        )
-        rows = result.get('rows') if result else []
-        if rows:
-            row = rows[0]
-            promo_id = row.get('promo_id')
-            start_date = row.get('start_date')
-            times_seen = row.get('times_seen', 0)
-            
-            # Calculate weeks into promo
-            weeks_into = 1
-            if start_date and order_date:
-                try:
-                    from datetime import datetime
-                    if isinstance(start_date, str):
-                        start_dt = datetime.fromisoformat(start_date.replace('/', '-'))
-                    else:
-                        start_dt = start_date
-                    if isinstance(order_date, str):
-                        if '/' in order_date:
-                            order_dt = datetime.strptime(order_date, '%m/%d/%Y')
+        conn = get_pg_connection()
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT 
+                    pi.promo_id,
+                    pi.special_price,
+                    pi.discount_percent,
+                    ph.start_date,
+                    ph.times_seen
+                FROM promo_items pi
+                JOIN promo_history ph ON pi.promo_id = ph.promo_id
+                WHERE pi.sap = %s
+                  AND ph.route_number = %s
+                  AND DATE(%s) BETWEEN ph.start_date AND ph.end_date
+                LIMIT 1
+                """,
+                [sap, route_number, order_date],
+            )
+            row = cur.fetchone()
+            if row:
+                promo_id = row.get('promo_id')
+                start_date = row.get('start_date')
+                times_seen = row.get('times_seen', 0)
+                
+                # Calculate weeks into promo
+                weeks_into = 1
+                if start_date and order_date:
+                    try:
+                        if isinstance(start_date, str):
+                            start_dt = datetime.fromisoformat(start_date.replace('/', '-'))
                         else:
-                            order_dt = datetime.fromisoformat(order_date)
-                    else:
-                        order_dt = order_date
-                    weeks_into = max(1, ((order_dt - start_dt).days // 7) + 1)
-                except:
-                    pass
-            
-            return {
-                'promo_id': promo_id,
-                'special_price': row.get('special_price'),
-                'discount_percent': row.get('discount_percent'),
-                'weeks_into_promo': weeks_into,
-                'is_first_occurrence': times_seen == 0,
-            }
+                            start_dt = start_date
+                        if isinstance(order_date, str):
+                            if '/' in order_date:
+                                order_dt = datetime.strptime(order_date, '%m/%d/%Y')
+                            else:
+                                order_dt = datetime.fromisoformat(order_date)
+                        else:
+                            order_dt = order_date
+                        weeks_into = max(1, ((order_dt - start_dt).days // 7) + 1)
+                    except:
+                        pass
+                
+                return {
+                    'promo_id': promo_id,
+                    'special_price': row.get('special_price'),
+                    'discount_percent': row.get('discount_percent'),
+                    'weeks_into_promo': weeks_into,
+                    'is_first_occurrence': times_seen == 0,
+                }
     except Exception as e:
         print(f"     ⚠️  Promo lookup failed for SAP {sap}: {e}")
     return None
 
 
-def _get_baseline_quantity(db_client: DBClient, route_number: str, store_id: str, sap: str) -> float | None:
-    """Get baseline (non-promo) average quantity for this store/sap."""
+def _get_baseline_quantity(route_number: str, store_id: str, sap: str) -> float | None:
+    """Get baseline (non-promo) average quantity for this store/sap.
+    
+    Uses direct PostgreSQL for efficiency.
+    """
     try:
-        result = db_client.query(
-            """
-            SELECT AVG(oli.quantity) as avg_qty
-            FROM order_line_items oli
-            LEFT JOIN promo_order_history poh 
-                ON oli.order_id = poh.order_id 
-                AND oli.store_id = poh.store_id 
-                AND oli.sap = poh.sap
-            WHERE oli.route_number = ?
-              AND oli.store_id = ?
-              AND oli.sap = ?
-              AND poh.id IS NULL  -- Only non-promo orders
-            """,
-            [route_number, store_id, sap],
-        )
-        rows = result.get('rows') if result else []
-        if rows and rows[0].get('avg_qty'):
-            return float(rows[0]['avg_qty'])
+        conn = get_pg_connection()
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT AVG(oli.quantity) as avg_qty
+                FROM order_line_items oli
+                LEFT JOIN promo_order_history poh 
+                    ON oli.order_id = poh.order_id 
+                    AND oli.store_id = poh.store_id 
+                    AND oli.sap = poh.sap
+                WHERE oli.route_number = %s
+                  AND oli.store_id = %s
+                  AND oli.sap = %s
+                  AND poh.id IS NULL  -- Only non-promo orders
+                """,
+                [route_number, store_id, sap],
+            )
+            row = cur.fetchone()
+            if row and row.get('avg_qty'):
+                return float(row['avg_qty'])
     except Exception as e:
         print(f"     ⚠️  Baseline lookup failed for {store_id}/{sap}: {e}")
     return None
@@ -1111,15 +1384,13 @@ def watch_all_orders(sa_path: str):
     """Watch all orders across all routes using real-time on_snapshot."""
     print(f"\n🎧 Order Sync Listener (Multi-User)")
     print(f"   Worker ID: {WORKER_ID}")
-    print(f"   Using: DB Manager (via dbRequests)")
-    print(f"   Watching: /orders (all routes)")
+    print(f"   Using: Direct PostgreSQL")
+    print(f"   Watching: /routes/*/orders (collection group)")
     print(f"\n   Press Ctrl+C to stop\n")
     
     fb_client = get_firestore_client(sa_path)
-    db_client = DBClient(fb_client, timeout=30)
-    
     # Watch all orders
-    orders_col = fb_client.collection('orders')
+    orders_col = fb_client.collection_group('orders')
     
     # Track seen orders to avoid reprocessing
     seen_orders = set()
@@ -1130,24 +1401,29 @@ def watch_all_orders(sa_path: str):
             doc = change.document
             order_id = doc.id
             data = doc.to_dict() or {}
+
+            # Guard: only process route-scoped orders
+            path_parts = doc.reference.path.split('/')
+            if len(path_parts) != 4 or path_parts[0] != 'routes' or path_parts[2] != 'orders':
+                continue
             
             status = data.get('status', '')
             
             if change.type.name == 'ADDED':
                 if order_id not in seen_orders:
                     seen_orders.add(order_id)
-                    handle_new_order(fb_client, db_client, order_id, data)
+                    handle_new_order(fb_client, order_id, data)
                     
                     # If it was already finalized, sync it
                     if status == 'finalized':
-                        handle_finalized_order(fb_client, db_client, order_id, data)
+                        handle_finalized_order(fb_client, order_id, data)
             
             elif change.type.name == 'MODIFIED':
                 # Check if status changed to finalized
                 if status == 'finalized':
                     if order_id not in seen_orders:
                         seen_orders.add(order_id)
-                    handle_finalized_order(fb_client, db_client, order_id, data)
+                    handle_finalized_order(fb_client, order_id, data)
     
     # Start real-time listener
     watcher = orders_col.on_snapshot(on_snapshot)
@@ -1166,11 +1442,11 @@ def watch_all_orders(sa_path: str):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Order sync listener - watches all orders, syncs new routes via DB Manager",
+        description="Order sync listener - watches all orders, syncs new routes via PostgreSQL",
     )
     parser.add_argument('--serviceAccount', required=True, help='Path to Firebase service account JSON')
-    # --duckdb is no longer needed since we use DBClient
-    parser.add_argument('--duckdb', help='(deprecated) Not used - DB Manager handles database')
+    # --duckdb is no longer needed since we use PostgreSQL directly
+    parser.add_argument('--duckdb', help='(deprecated) Not used - direct PostgreSQL writes')
     
     args = parser.parse_args()
     

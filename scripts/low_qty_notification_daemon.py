@@ -24,10 +24,10 @@ from google.cloud import firestore
 from google.cloud.firestore_v1.watch import Watch
 
 try:
-    from .db_client import DBClient
+    from .pg_utils import fetch_one, execute
     from .low_quantity_loader import get_items_for_order_date, get_user_timezone
 except ImportError:
-    from db_client import DBClient
+    from pg_utils import fetch_one, execute
     from low_quantity_loader import get_items_for_order_date, get_user_timezone
 
 WORKER_ID = f"low-qty-notif-{socket.gethostname()}-{__import__('os').getpid()}"
@@ -179,34 +179,31 @@ def get_fcm_tokens(db: firestore.Client, user_id: str) -> List[str]:
     return user_doc.to_dict().get("fcmTokens", [])
 
 
-def check_already_sent(db_client: DBClient, route_number: str, user_id: str, 
+def check_already_sent(route_number: str, user_id: str,
                        order_date: str, saps_hash: str) -> bool:
     """Check if this notification was already sent today for this user.
-    
+
     Dedup includes user_id to allow multiple users on same route to get notifications.
     """
-    result = db_client.query("""
+    row = fetch_one("""
         SELECT 1 FROM low_qty_notifications_sent
-        WHERE route_number = ? AND user_id = ? AND order_by_date = ? AND saps_hash = ?
+        WHERE route_number = %s AND user_id = %s AND order_by_date = %s AND saps_hash = %s
         LIMIT 1
     """, [route_number, user_id, order_date, saps_hash])
-    
-    rows = result.get("rows", [])
-    return len(rows) > 0
+
+    return row is not None
 
 
-def mark_as_sent(db_client: DBClient, route_number: str, user_id: str, 
+def mark_as_sent(route_number: str, user_id: str,
                  order_date: str, saps: List[str], saps_hash: str) -> None:
-    """Record that notification was sent.
-    
-    Uses db_client.write() for proper commit (not query which is read-only).
-    """
-    db_client.write("""
-        INSERT OR IGNORE INTO low_qty_notifications_sent
+    """Record that notification was sent."""
+    execute("""
+        INSERT INTO low_qty_notifications_sent
         (route_number, user_id, order_by_date, saps, saps_hash, items_count, sent_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        VALUES (%s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT (route_number, user_id, order_by_date, saps_hash) DO NOTHING
     """, [
-        route_number, user_id, order_date, 
+        route_number, user_id, order_date,
         json.dumps(saps), saps_hash, len(saps),
         datetime.utcnow().isoformat()
     ])
@@ -288,9 +285,9 @@ def send_push_notification(fcm_tokens: List[str], title: str, body: str, data: D
     return total_success > 0
 
 
-def check_and_notify(db: firestore.Client, db_client: DBClient) -> None:
+def check_and_notify(db: firestore.Client) -> None:
     """Check all users and send notifications if it's their reminder time.
-    
+
     Called every 60 seconds by the main loop.
     Only notifies route owners (userId field on route document).
     """
@@ -329,7 +326,7 @@ def check_and_notify(db: firestore.Client, db_client: DBClient) -> None:
             today = datetime.now(tz).strftime("%Y-%m-%d")
             
             # Get low-qty items for today
-            items = get_items_for_order_date(db, route_number, today, db_client)
+            items = get_items_for_order_date(db, route_number, today)
             
             if not items:
                 print(f"    No low-qty items for route {route_number}")
@@ -340,7 +337,7 @@ def check_and_notify(db: firestore.Client, db_client: DBClient) -> None:
             saps_hash = hashlib.md5(json.dumps(saps).encode()).hexdigest()
             
             # Check if already sent (per user to allow team members if added later)
-            if check_already_sent(db_client, route_number, user_id, today, saps_hash):
+            if check_already_sent(route_number, user_id, today, saps_hash):
                 print(f"    Already sent notification for route {route_number} today")
                 continue
             
@@ -362,7 +359,7 @@ def check_and_notify(db: firestore.Client, db_client: DBClient) -> None:
             }
             
             if send_push_notification(tokens, title, body, data):
-                mark_as_sent(db_client, route_number, user_id, today, saps, saps_hash)
+                mark_as_sent(route_number, user_id, today, saps, saps_hash)
                 print(f"    ✅ Sent notification: {item_count} items")
             else:
                 print(f"    ❌ Failed to send notification")
@@ -374,26 +371,26 @@ def check_and_notify(db: firestore.Client, db_client: DBClient) -> None:
 def run_daemon(sa_path: str) -> None:
     """Main daemon loop."""
     global _users_watcher
-    
+
     print(f"\n📦 Low-Quantity Notification Daemon")
     print(f"   Worker ID: {WORKER_ID}")
+    print(f"   Using: Direct PostgreSQL (pg_utils)")
     print(f"   Checking every 60 seconds")
     print(f"\n   Press Ctrl+C to stop\n")
-    
+
     db = get_firestore_client(sa_path)
-    db_client = DBClient(db, timeout=30)
-    
+
     # Set up snapshot listener for users with reminders
     # Keep reference to prevent garbage collection
     _users_watcher = setup_reminder_listener(db)
-    
+
     # Give listener time to populate cache
     time.sleep(3)
     print(f"  [cache] {len(reminder_cache)} users with reminders enabled")
-    
+
     try:
         while True:
-            check_and_notify(db, db_client)
+            check_and_notify(db)
             time.sleep(60)
     except KeyboardInterrupt:
         print("\n\n👋 Stopping daemon...")

@@ -3,13 +3,14 @@
 All endpoints use these dependencies for:
 - Firebase token verification
 - Firestore client access
-- DuckDB read-only queries
+- PostgreSQL queries (via direct connection pool)
 - Route access validation
 """
 
 from __future__ import annotations
 
 import os
+import time
 import logging
 from pathlib import Path
 from datetime import datetime
@@ -30,7 +31,13 @@ from firebase_admin import auth, credentials, firestore
 API_DIR = Path(__file__).parent
 ORDER_FORECAST_DIR = API_DIR.parent
 DATA_DIR = ORDER_FORECAST_DIR / "data"
-DUCKDB_PATH = DATA_DIR / "analytics.duckdb"
+
+# PostgreSQL connection settings (from environment)
+PG_HOST = os.environ.get('POSTGRES_HOST', 'localhost')
+PG_PORT = int(os.environ.get('POSTGRES_PORT', 5432))
+PG_DATABASE = os.environ.get('POSTGRES_DB', 'routespark')
+PG_USER = os.environ.get('POSTGRES_USER', 'routespark')
+PG_PASSWORD = os.environ.get('POSTGRES_PASSWORD', '')
 
 # Service account path (same as other scripts)
 SERVICE_ACCOUNT_PATH = os.environ.get(
@@ -39,9 +46,13 @@ SERVICE_ACCOUNT_PATH = os.environ.get(
 )
 
 # Security settings
+DEBUG_MODE = os.environ.get("DEBUG", "false").lower() == "true"
 MAX_TOKEN_AGE_SECONDS = int(os.environ.get("MAX_TOKEN_AGE_SECONDS", 3600))  # Default 1 hour
 CLOCK_SKEW_SECONDS = int(os.environ.get("CLOCK_SKEW_SECONDS", 300))  # Default 5 min
-SKIP_TOKEN_AGE_CHECK = os.environ.get("SKIP_TOKEN_AGE_CHECK", "").lower() in ("1", "true")
+SKIP_TOKEN_AGE_CHECK = (
+    DEBUG_MODE
+    and os.environ.get("SKIP_TOKEN_AGE_CHECK", "").lower() in ("1", "true")
+)
 
 # Logging
 logger = logging.getLogger("api.dependencies")
@@ -96,80 +107,139 @@ def get_firestore() -> firestore.Client:
 
 
 # =============================================================================
-# DUCKDB CONNECTION (via DBClient)
+# POSTGRESQL CONNECTION POOL
 # =============================================================================
 
-# Add scripts directory to path for DBClient import
+import psycopg2
+from psycopg2 import pool
+
+# Thread-safe connection pool (5-10 connections)
+_pg_pool: Optional[pool.ThreadedConnectionPool] = None
+
+
+def get_pg_pool() -> pool.ThreadedConnectionPool:
+    """Get or create the PostgreSQL connection pool.
+    
+    Uses a small pool (5-10 connections) suitable for web-api concurrency.
+    Pool is created lazily on first use and reused across requests.
+    """
+    global _pg_pool
+    
+    if _pg_pool is None:
+        _pg_pool = pool.ThreadedConnectionPool(
+            minconn=2,
+            maxconn=10,
+            host=PG_HOST,
+            port=PG_PORT,
+            database=PG_DATABASE,
+            user=PG_USER,
+            password=PG_PASSWORD,
+        )
+        logger.info(f"PostgreSQL connection pool created (2-10 connections to {PG_HOST}:{PG_PORT})")
+    
+    return _pg_pool
+
+
+def get_pg_connection():
+    """Get a PostgreSQL connection from the pool.
+    
+    Returns a connection from the pool. Caller must return it using:
+        get_pg_pool().putconn(conn)
+    
+    Or use as context manager for auto-return on close (psycopg2 2.9+).
+    For read-only queries and health checks.
+    """
+    return get_pg_pool().getconn()
+
+
+def return_pg_connection(conn):
+    """Return a connection to the pool."""
+    try:
+        get_pg_pool().putconn(conn)
+    except Exception as e:
+        logger.warning(f"Error returning connection to pool: {e}")
+
+
+# =============================================================================
+# DATABASE CLIENT (Direct PostgreSQL)
+# =============================================================================
+
+# Add scripts directory to path for pg_utils import
 import sys
 SCRIPTS_DIR = ORDER_FORECAST_DIR / "scripts"
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
+from psycopg2.extras import RealDictCursor
 
-class DuckDBConnection:
-    """Wrapper that provides DuckDB-like interface via DBClient.
-    
-    db_manager owns the DuckDB connection. We query through it via
-    Firestore request/response pattern.
+
+class DirectPGConnection:
+    """Wrapper that provides cursor-like interface via direct PostgreSQL.
+
+    Uses the connection pool for all queries (no more message bus).
     """
-    
-    def __init__(self, db_client):
-        self._db_client = db_client
-    
+
     def execute(self, sql: str, params: Optional[list] = None):
         """Execute SQL and return result object."""
-        result = self._db_client.query(sql, params)
-        if 'error' in result:
-            raise RuntimeError(f"DuckDB query error: {result['error']}")
-        return DBClientResult(result)
+        conn = get_pg_connection()
+        try:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                # Convert ? placeholders to %s for psycopg2
+                pg_sql = sql.replace('?', '%s')
+                cur.execute(pg_sql, params)
+
+                # Check if this is a SELECT query
+                if cur.description:
+                    columns = [desc[0] for desc in cur.description]
+                    rows = [dict(row) for row in cur.fetchall()]
+                    return DirectPGResult({'columns': columns, 'rows': rows})
+                else:
+                    conn.commit()
+                    return DirectPGResult({'affected_rows': cur.rowcount})
+        finally:
+            return_pg_connection(conn)
 
 
-class DBClientResult:
-    """Wrapper to make DBClient results look like DuckDB results."""
-    
+class DirectPGResult:
+    """Wrapper to make direct PG results look like cursor results."""
+
     def __init__(self, result: dict):
         self._result = result
         self._rows = result.get('rows', [])
         self._columns = result.get('columns', [])
-    
+
     def _row_to_tuple(self, row):
         """Convert row to tuple, preserving column order from query."""
         if isinstance(row, dict):
-            # Use columns list to get values in correct order
             if self._columns:
                 return tuple(row.get(col) for col in self._columns)
-            # Fallback to dict values (may not preserve order)
             return tuple(row.values())
         if isinstance(row, (list, tuple)):
             return tuple(row)
         return (row,)
-    
+
     def fetchone(self):
         if self._rows:
             return self._row_to_tuple(self._rows[0])
         return None
-    
+
     def fetchall(self):
         return [self._row_to_tuple(row) for row in self._rows]
 
 
-_db_client = None
+def get_db_client() -> DirectPGConnection:
+    """Get database connection via direct PostgreSQL.
 
-
-def get_duckdb() -> DuckDBConnection:
-    """Get DuckDB connection via DBClient.
-    
-    All queries go through db_manager which owns the DuckDB connection.
-    This avoids lock conflicts and ensures consistent data access.
+    Uses the connection pool for all queries.
     """
-    global _db_client
-    
-    if _db_client is None:
-        from db_client import DBClient
-        _db_client = DBClient(get_firestore())
-        logger.info("DBClient initialized for DuckDB queries via db_manager")
-    
-    return DuckDBConnection(_db_client)
+    return DirectPGConnection()
+
+
+# Legacy alias for compatibility
+def get_duckdb() -> DirectPGConnection:
+    """DEPRECATED: Use get_db_client() instead. This now uses PostgreSQL."""
+    logger.warning("get_duckdb() is deprecated, use get_db_client()")
+    return get_db_client()
 
 
 # =============================================================================
@@ -195,12 +265,15 @@ async def verify_firebase_token(
     Raises:
         HTTPException 401 on any auth failure
     """
-    # Check for Authorization header
+    # Check for Authorization header, fall back to ?token= query param
+    # (needed for <img src="..."> tags which can't send headers)
     if credentials is None:
-        _log_auth_failure(request, "missing_auth_header")
-        raise HTTPException(401, "Missing Authorization header")
-    
-    token = credentials.credentials
+        token = request.query_params.get("token")
+        if not token:
+            _log_auth_failure(request, "missing_auth_header")
+            raise HTTPException(401, "Missing Authorization header")
+    else:
+        token = credentials.credentials
     
     try:
         # Ensure Firebase is initialized
@@ -211,7 +284,8 @@ async def verify_firebase_token(
         
         # Additional security checks (can be disabled for testing with clock skew)
         if not SKIP_TOKEN_AGE_CHECK:
-            now = datetime.utcnow().timestamp()
+            # Use epoch seconds to avoid naive datetime timezone offsets.
+            now = time.time()
             issued_at = decoded.get('iat', 0)
             
             # Reject tokens issued too long ago

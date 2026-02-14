@@ -6,5 +6,21 @@ config/
 logs/
 __pycache__/
 *.pyc
+*.pyo
 
 data/historical/
+
+# Local workstation artifacts
+.DS_Store
+.widget_settings.json
+RouteSpark.app/
+data/ip_blocklist.json
+data/latest_forecast.json
+data/calendar_features.csv
+data_for_upload/
+parsed_orders_batch_no_catalog/
+forecast_monday_no_1215.csv
+generated_order_form_no_1215.csv
+*Weekly Executables*.pdf
+*Weekly Executables*.xlsx
+Copy of *Weekly Executables*.xlsx

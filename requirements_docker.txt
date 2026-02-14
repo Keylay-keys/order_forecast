@@ -1,0 +1,33 @@
+# Order Forecast Services - Python dependencies
+# For Docker deployment on Ubuntu server
+
+# Core
+pandas>=2.0
+numpy>=1.24
+scikit-learn>=1.3
+joblib>=1.3
+pytz>=2023.3
+
+# Database - PostgreSQL (replaced DuckDB for multi-writer support)
+psycopg2-binary>=2.9
+
+# Firebase
+firebase-admin>=6.0
+google-cloud-firestore>=2.0
+
+# Web API (FastAPI)
+fastapi>=0.109
+uvicorn[standard]>=0.27
+slowapi>=0.1.9
+pydantic>=2.0
+
+# Email parsing (promo listener)
+imapclient>=2.3.1
+email-validator>=2.0
+
+# PDF parsing (catalog upload)
+PyPDF2>=3.0
+pypdf>=3.0
+
+# Push notifications (exponent-server-sdk is the PyPI name)
+exponent-server-sdk>=2.0.0

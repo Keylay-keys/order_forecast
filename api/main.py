@@ -22,8 +22,8 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from .dependencies import get_firebase_app, get_duckdb, get_firestore
-from .routers import auth, history, health, orders, forecast, reference, low_quantity, settings, schedule
+from .dependencies import get_firebase_app, get_pg_pool, get_firestore
+from .routers import auth, history, health, orders, forecast, reference, low_quantity, settings, schedule, credits, pos, deliveries, transfers
 from .middleware.rate_limit import setup_rate_limiting
 from .middleware.honeypots import setup_honeypots
 from .middleware.brute_force import setup_brute_force_protection
@@ -38,11 +38,16 @@ DEBUG_MODE = os.environ.get("DEBUG", "false").lower() == "true"
 API_VERSION = "1.0.0"
 
 # CORS - strict origin allowlist
-ALLOWED_ORIGINS = [
+BASE_ALLOWED_ORIGINS = [
+    "https://routespark.pro",          # Production (main domain)
+    "https://www.routespark.pro",      # Production (www)
+]
+DEV_ALLOWED_ORIGINS = [
     "http://localhost:5173",           # Vite dev server
     "http://localhost:3000",           # Alternative dev port
-    "https://portal.routespark.pro",   # Production
 ]
+ALLOW_LOCALHOST_ORIGINS = os.environ.get("ALLOW_LOCALHOST_ORIGINS", "").lower() in ("1", "true")
+ALLOWED_ORIGINS = BASE_ALLOWED_ORIGINS + (DEV_ALLOWED_ORIGINS if DEBUG_MODE or ALLOW_LOCALHOST_ORIGINS else [])
 
 # Logging setup
 logging.basicConfig(
@@ -72,9 +77,9 @@ async def lifespan(app: FastAPI):
         get_firestore()
         logger.info("Firestore connected")
         
-        # Initialize DuckDB (read-only)
-        get_duckdb()
-        logger.info("DuckDB connected")
+        # Initialize PostgreSQL connection pool
+        get_pg_pool()
+        logger.info("PostgreSQL connection pool initialized")
         
     except Exception as e:
         logger.error(f"Startup failed: {e}")
@@ -213,12 +218,16 @@ async def generic_exception_handler(request: Request, exc: Exception):
 app.include_router(auth.router, prefix="/api/auth", tags=["Authentication"])
 app.include_router(history.router, prefix="/api", tags=["History"])
 app.include_router(health.router, prefix="/api", tags=["Health"])
+app.include_router(transfers.router, prefix="/api", tags=["Transfers"])
 app.include_router(orders.router, prefix="/api", tags=["Orders"])
 app.include_router(forecast.router, prefix="/api", tags=["Forecast"])
 app.include_router(reference.router, prefix="/api", tags=["Reference"])
 app.include_router(low_quantity.router, prefix="/api", tags=["Low Quantity"])
 app.include_router(settings.router, prefix="/api", tags=["Settings"])
 app.include_router(schedule.router, prefix="/api", tags=["Schedule"])
+app.include_router(credits.router, prefix="/api", tags=["Credits"])
+app.include_router(pos.router, prefix="/api", tags=["POS"])
+app.include_router(deliveries.router, prefix="/api", tags=["Deliveries"])
 
 
 # =============================================================================

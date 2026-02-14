@@ -22,6 +22,27 @@ SAP_PATTERN = re.compile(r'^[\w\-]{1,20}$')
 STORE_ID_PATTERN = re.compile(r'^[\w\-]{1,50}$')
 
 
+def _parse_firestore_timestamp(value: Any) -> Optional[datetime]:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value
+    if hasattr(value, "to_datetime"):
+        try:
+            return value.to_datetime()
+        except Exception:
+            return None
+    if isinstance(value, dict):
+        seconds = value.get("seconds") or value.get("_seconds")
+        nanos = value.get("nanoseconds") or value.get("_nanoseconds") or value.get("nanos")
+        if seconds is not None:
+            try:
+                return datetime.utcfromtimestamp(seconds + (nanos or 0) / 1_000_000_000)
+            except Exception:
+                return None
+    return None
+
+
 # =============================================================================
 # REQUEST MODELS (Input Validation)
 # =============================================================================
@@ -112,6 +133,35 @@ class ExpiryReplacement(BaseModel):
     reason: str  # 'low_qty_expiry'
 
 
+class WholeCaseAdjustment(BaseModel):
+    """Whole-case enforcement adjustment metadata."""
+    adjustedUnits: int
+    preEnforcementUnits: Optional[int] = None
+    trigger: str  # 'promo_history' | 'low_qty_expiry' | 'allocation_remainder'
+    targetStoreId: Optional[str] = None
+
+
+class InboundTransferUse(BaseModel):
+    """Inbound transfer consumption record (units drawn from shared pool)."""
+    transferKey: str
+    fromRouteNumber: str
+    sap: str
+    units: int = Field(..., ge=0)
+    casePack: int = Field(default=1, ge=1)
+    transferDate: Optional[str] = None
+    sourceOrderId: Optional[str] = None
+
+
+class RouteTransferAllocation(BaseModel):
+    """Outbound route transfer allocation (route splitting)."""
+    sap: str
+    toRouteNumber: str
+    units: int = Field(..., ge=0)
+    casePack: int = Field(default=1, ge=1)
+    transferDate: Optional[str] = None
+    sourceOrderId: Optional[str] = None
+
+
 class OrderItem(BaseModel):
     """Single product line item in an order."""
     sap: str
@@ -119,8 +169,8 @@ class OrderItem(BaseModel):
     enteredAt: Optional[datetime] = None
     
     # Forecast metadata
-    forecastSuggestedUnits: Optional[float] = None
-    forecastSuggestedCases: Optional[float] = None
+    forecastRecommendedUnits: Optional[float] = Field(None, alias="forecastSuggestedUnits")
+    forecastRecommendedCases: Optional[float] = Field(None, alias="forecastSuggestedCases")
     userAdjusted: Optional[bool] = None
     userDelta: Optional[int] = None
     forecastId: Optional[str] = None
@@ -138,15 +188,26 @@ class OrderItem(BaseModel):
     
     # Prior order context
     priorOrderContext: Optional[PriorOrderContext] = None
-    
+
+    @validator('enteredAt', pre=True)
+    def validate_entered_at(cls, v):
+        parsed = _parse_firestore_timestamp(v)
+        return parsed if parsed is not None else v
+
     # Expiry replacement
     expiryReplacement: Optional[ExpiryReplacement] = None
+
+    # Whole-case adjustment
+    wholeCaseAdjustment: Optional[WholeCaseAdjustment] = None
     
     @validator('sap')
     def validate_sap(cls, v):
         if not SAP_PATTERN.match(v):
             raise ValueError('Invalid SAP format')
         return v
+
+    class Config:
+        allow_population_by_field_name = True
 
 
 class StoreOrder(BaseModel):
@@ -162,6 +223,11 @@ class StoreOrder(BaseModel):
         if not STORE_ID_PATTERN.match(v):
             raise ValueError('Invalid store ID format')
         return v
+
+    @validator('enteredAt', pre=True)
+    def validate_store_entered_at(cls, v):
+        parsed = _parse_firestore_timestamp(v)
+        return parsed if parsed is not None else v
 
 
 class Order(BaseModel):
@@ -181,12 +247,36 @@ class Order(BaseModel):
     notes: Optional[str] = None
     isHolidaySchedule: Optional[bool] = None
 
+    # Transfer metadata (route splitting)
+    routeTransfers: Optional[List[RouteTransferAllocation]] = None
+    inboundTransfersUsed: Optional[List[InboundTransferUse]] = None
+    routeSplittingEnabled: Optional[bool] = None
+
+    # Some legacy writers have persisted Firestore timestamps as JSON-like maps:
+    #   {"seconds": ..., "nanoseconds": ...}
+    # instead of native Timestamp types. Accept and coerce these into datetimes
+    # so API reads don't 500 on old/bad data.
+    @validator('createdAt', 'updatedAt', 'submittedAt', pre=True)
+    def validate_order_timestamps(cls, v):
+        parsed = _parse_firestore_timestamp(v)
+        return parsed if parsed is not None else v
+
 
 class OrderUpdateRequest(BaseModel):
     """Request to update an existing order."""
     stores: List[StoreOrder]
     notes: Optional[str] = None
     updatedAt: Optional[datetime] = None
+
+    # Transfer metadata (web portal parity)
+    routeTransfers: Optional[List[RouteTransferAllocation]] = None
+    inboundTransfersUsed: Optional[List[InboundTransferUse]] = None
+    routeSplittingEnabled: Optional[bool] = None
+
+    @validator('updatedAt', pre=True)
+    def validate_updated_at(cls, v):
+        parsed = _parse_firestore_timestamp(v)
+        return parsed if parsed is not None else v
 
 
 # =============================================================================
@@ -206,18 +296,18 @@ class UserInfo(BaseModel):
 class HealthStatus(BaseModel):
     """Health check response."""
     status: str  # 'healthy', 'degraded', 'unhealthy'
-    duckdb: Dict[str, Any]
+    database: Dict[str, Any]
     firebase: Dict[str, Any]
     timestamp: datetime
 
 
-class DuckDBHealth(BaseModel):
-    """DuckDB-specific health info."""
+class DatabaseHealth(BaseModel):
+    """Database health info."""
     status: str
     lastSync: Optional[datetime] = None
     syncAgeMinutes: Optional[int] = None
-    fileSize: Optional[int] = None
     orderCount: Optional[int] = None
+    routesCount: Optional[int] = None
 
 
 class OrderHistoryItem(BaseModel):
@@ -257,6 +347,9 @@ class ForecastItem(BaseModel):
     productName: Optional[str] = None
     recommendedUnits: float
     recommendedCases: Optional[float] = None
+    p10Units: Optional[float] = None
+    p50Units: Optional[float] = None
+    p90Units: Optional[float] = None
     confidence: Optional[float] = None
     source: Optional[str] = None
     promoActive: Optional[bool] = None
@@ -281,3 +374,34 @@ class ForecastResponse(BaseModel):
     forecast: Optional[ForecastPayload] = None
     isStale: Optional[bool] = None
     staleReason: Optional[str] = None
+
+
+class ApplyForecastItem(BaseModel):
+    """Item to apply from forecast to order."""
+    storeId: str
+    storeName: Optional[str] = None
+    sap: str
+    recommendedUnits: float
+    recommendedCases: Optional[float] = None
+    p10Units: Optional[float] = None
+    p50Units: Optional[float] = None
+    p90Units: Optional[float] = None
+    confidence: Optional[float] = None
+    source: Optional[str] = None
+    promoActive: Optional[bool] = None
+    promoLiftPct: Optional[float] = None
+    isFirstWeekend: Optional[bool] = None
+    priorOrderContext: Optional[Dict[str, Any]] = None
+    expiryReplacement: Optional[Dict[str, Any]] = None
+
+    class Config:
+        extra = "forbid"  # Reject unknown fields
+
+
+class ApplyForecastRequest(BaseModel):
+    """Request to apply forecast items to an order."""
+    forecastId: str = ""
+    items: List[ApplyForecastItem] = []
+
+    class Config:
+        extra = "forbid"  # Reject unknown fields
