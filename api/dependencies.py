@@ -47,6 +47,9 @@ SERVICE_ACCOUNT_PATH = os.environ.get(
 
 # Security settings
 DEBUG_MODE = os.environ.get("DEBUG", "false").lower() == "true"
+ALLOW_QUERY_TOKEN_FALLBACK = (
+    os.environ.get("ALLOW_QUERY_TOKEN_FALLBACK", "").lower() in ("1", "true")
+)
 MAX_TOKEN_AGE_SECONDS = int(os.environ.get("MAX_TOKEN_AGE_SECONDS", 3600))  # Default 1 hour
 CLOCK_SKEW_SECONDS = int(os.environ.get("CLOCK_SKEW_SECONDS", 300))  # Default 5 min
 SKIP_TOKEN_AGE_CHECK = (
@@ -265,10 +268,17 @@ async def verify_firebase_token(
     Raises:
         HTTPException 401 on any auth failure
     """
-    # Check for Authorization header, fall back to ?token= query param
-    # (needed for <img src="..."> tags which can't send headers)
+    # Prefer Authorization header. A legacy ?token= query fallback is a footgun:
+    # URLs get logged, bookmarked, shared, and can leak through analytics/logging.
+    # Keep it disabled by default; allow only in debug/dev or when explicitly enabled.
     if credentials is None:
-        token = request.query_params.get("token")
+        token = None
+        if DEBUG_MODE or ALLOW_QUERY_TOKEN_FALLBACK:
+            token = request.query_params.get("token")
+        elif request.query_params.get("token"):
+            _log_auth_failure(request, "query_token_disabled")
+            raise HTTPException(401, "Missing Authorization header")
+
         if not token:
             _log_auth_failure(request, "missing_auth_header")
             raise HTTPException(401, "Missing Authorization header")
