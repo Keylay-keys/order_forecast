@@ -392,6 +392,51 @@ async def list_scanner_access_requests(
     return {"ok": True, "requests": requests_out}
 
 
+@router.get(
+    "/team/scanner-access/status",
+    responses={
+        401: {"model": ErrorResponse},
+        403: {"model": ErrorResponse},
+    },
+)
+@rate_limit_history
+async def get_scanner_access_status(
+    request: Request,
+    route: str = Query(..., pattern=r"^\d{1,10}$", description="Route number"),
+    decoded_token: dict = Depends(verify_firebase_token),
+    db: firestore.Client = Depends(get_firestore),
+) -> Dict[str, Any]:
+    """Get scanner-access request status for the authenticated team member on a route."""
+    requester_uid = decoded_token["uid"]
+    user_data = await require_route_access(route, decoded_token, db)
+    if not _is_team_member_for_route(user_data, route):
+        raise HTTPException(403, "Team-member route access required")
+
+    req_ref = (
+        db.collection("routes")
+        .document(route)
+        .collection("scannerAccessRequests")
+        .document(requester_uid)
+    )
+    snap = req_ref.get()
+    if not snap.exists:
+        return {"ok": True, "route": route, "teamMemberUid": requester_uid, "status": "none"}
+
+    data = snap.to_dict() or {}
+    status = str(data.get("status") or "").strip().lower()
+    if status not in ("pending", "approved", "denied"):
+        status = "unknown"
+
+    return {
+        "ok": True,
+        "route": route,
+        "teamMemberUid": requester_uid,
+        "status": status,
+        "requestedAt": _ts_to_millis(data.get("requestedAt")),
+        "resolvedAt": _ts_to_millis(data.get("resolvedAt")),
+    }
+
+
 @router.post(
     "/team/scanner-access/resolve",
     responses={

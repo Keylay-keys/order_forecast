@@ -14,6 +14,7 @@ from google.cloud import firestore
 from ..dependencies import (
     verify_firebase_token,
     require_route_access,
+    require_route_feature_access,
     get_firestore,
     get_pg_connection,
     return_pg_connection,
@@ -359,7 +360,7 @@ async def get_forecast(
     
     Performance: Direct PostgreSQL connection for staleness check.
     """
-    await require_route_access(route, decoded_token, db)
+    await require_route_feature_access(route, "forecasting", decoded_token, db)
 
     forecast_doc = _get_latest_forecast(db, route, deliveryDate, scheduleKey)
     if not forecast_doc:
@@ -414,7 +415,7 @@ async def get_forecast_learning(
     """Return route-level forecast learning summary for web Forecast UX."""
     if not route_number.isdigit():
         raise HTTPException(status_code=400, detail="invalid_route_number")
-    await require_route_access(route_number, decoded_token, db)
+    await require_route_feature_access(route_number, "forecasting", decoded_token, db)
     return _load_route_scorecard_summary(
         route_number=route_number,
         window_days=windowDays,
@@ -441,7 +442,7 @@ async def get_forecast_status(
     
     Performance: Direct PostgreSQL connection for lastFinalizedAt.
     """
-    await require_route_access(route, decoded_token, db)
+    await require_route_feature_access(route, "forecasting", decoded_token, db)
 
     status_doc = db.collection("forecasts").document(route).get()
     status_data = status_doc.to_dict() or {}
@@ -476,7 +477,7 @@ async def apply_forecast(
     db: firestore.Client = Depends(get_firestore),
 ) -> Dict[str, Any]:
     """Apply forecast items to a draft order."""
-    await require_route_access(route, decoded_token, db)
+    await require_route_feature_access(route, "forecasting", decoded_token, db)
 
     order_ref = db.collection("routes").document(route).collection("orders").document(order_id)
     order_doc = order_ref.get()
@@ -633,7 +634,7 @@ async def get_forecast_insights(
     
     Performance: Direct PostgreSQL connection (no Firestore round-trip).
     """
-    await require_route_access(route, decoded_token, db)
+    await require_route_feature_access(route, "forecasting", decoded_token, db)
 
     from datetime import timedelta
     cutoff_date = (datetime.utcnow() - timedelta(weeks=weeks)).strftime("%Y-%m-%d")

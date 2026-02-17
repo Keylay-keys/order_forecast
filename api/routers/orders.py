@@ -11,6 +11,7 @@ from google.cloud import firestore
 from ..dependencies import (
     verify_firebase_token,
     require_route_access,
+    require_route_feature_access,
     get_firestore,
     get_route_timezone,
 )
@@ -205,7 +206,7 @@ async def create_order(
     db: firestore.Client = Depends(get_firestore),
 ) -> Order:
     """Create a new draft order."""
-    await require_route_access(payload.routeNumber, decoded_token, db)
+    await require_route_feature_access(payload.routeNumber, "ordering", decoded_token, db)
 
     order_id = f"order-{payload.routeNumber}-{int(datetime.utcnow().timestamp() * 1000)}"
     now = datetime.utcnow()
@@ -261,7 +262,7 @@ async def update_order(
     db: firestore.Client = Depends(get_firestore),
 ) -> Order:
     """Update an order's stores/items with optimistic locking."""
-    await require_route_access(route, decoded_token, db)
+    await require_route_feature_access(route, "ordering", decoded_token, db)
 
     order_ref = _order_ref(db, route, order_id)
     order_doc = order_ref.get()
@@ -364,7 +365,7 @@ async def delete_order(
     db: firestore.Client = Depends(get_firestore),
 ) -> Dict[str, Any]:
     """Delete a draft order."""
-    requester_user_data = await require_route_access(route, decoded_token, db)
+    requester_user_data = await require_route_feature_access(route, "ordering", decoded_token, db)
 
     order_ref = _order_ref(db, route, order_id)
     order_doc = order_ref.get()
@@ -466,7 +467,7 @@ async def finalize_order(
     db: firestore.Client = Depends(get_firestore),
 ) -> Dict[str, Any]:
     """Finalize an order and trigger PostgreSQL sync."""
-    requester_user_data = await require_route_access(route, decoded_token, db)
+    requester_user_data = await require_route_feature_access(route, "ordering", decoded_token, db)
 
     order_ref = _order_ref(db, route, order_id)
     order_doc = order_ref.get()

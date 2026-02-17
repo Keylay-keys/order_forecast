@@ -13,8 +13,8 @@ import os
 import time
 import logging
 from pathlib import Path
-from datetime import datetime
-from typing import Optional, Dict, Any, List
+from datetime import datetime, timezone
+from typing import Optional, Dict, Any, List, Literal
 from functools import lru_cache
 
 from fastapi import HTTPException, Request, Depends
@@ -49,6 +49,7 @@ SERVICE_ACCOUNT_PATH = os.environ.get(
 DEBUG_MODE = os.environ.get("DEBUG", "false").lower() == "true"
 MAX_TOKEN_AGE_SECONDS = int(os.environ.get("MAX_TOKEN_AGE_SECONDS", 3600))  # Default 1 hour
 CLOCK_SKEW_SECONDS = int(os.environ.get("CLOCK_SKEW_SECONDS", 300))  # Default 5 min
+ENFORCE_ROUTE_ENTITLEMENTS = os.environ.get("ENFORCE_ROUTE_ENTITLEMENTS", "false").lower() == "true"
 SKIP_TOKEN_AGE_CHECK = (
     DEBUG_MODE
     and os.environ.get("SKIP_TOKEN_AGE_CHECK", "").lower() in ("1", "true")
@@ -391,6 +392,284 @@ def has_access_to_route(user_data: Dict[str, Any], route_number: str) -> bool:
         route_number in [str(r) for r in (profile.get('additionalRoutes') or [])] or
         route_number in [str(r) for r in assignments.keys()]
     )
+
+
+def _normalize_route_number(value: Any) -> str:
+    route = str(value or "").strip()
+    return route if route.isdigit() and len(route) <= 10 else ""
+
+
+def _to_epoch_millis(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    if hasattr(value, "timestamp"):
+        try:
+            return int(value.timestamp() * 1000)
+        except Exception:
+            return None
+    if isinstance(value, datetime):
+        return int(value.timestamp() * 1000)
+    if isinstance(value, dict):
+        seconds = value.get("seconds") or value.get("_seconds")
+        nanos = value.get("nanoseconds") or value.get("_nanoseconds") or value.get("nanos") or 0
+        if seconds is None:
+            return None
+        try:
+            return int((float(seconds) + float(nanos) / 1_000_000_000) * 1000)
+        except Exception:
+            return None
+    return None
+
+
+def _feature_payload_for_plan(plan: Optional[str]) -> Dict[str, bool]:
+    is_pro = str(plan or "").strip().lower() == "pro"
+    return {
+        "scanner": True,
+        "managementDashboard": True,
+        "multiRoute": is_pro,
+        "ordering": True,
+        "forecasting": True,
+        "pcfEmailImport": True,
+    }
+
+
+def _is_owner_for_route(user_data: Dict[str, Any], route_number: str) -> bool:
+    profile = user_data.get("profile", {}) or {}
+    if (
+        str(profile.get("role") or "").strip() == "owner"
+        and _normalize_route_number(profile.get("routeNumber")) == route_number
+    ):
+        return True
+    assignments = user_data.get("routeAssignments", {}) or {}
+    assignment = assignments.get(route_number, {}) if isinstance(assignments, dict) else {}
+    return isinstance(assignment, dict) and str(assignment.get("role") or "").strip() == "owner"
+
+
+def _resolve_owner_uid_for_route(
+    *,
+    db: firestore.Client,
+    route_number: str,
+    requester_uid: str,
+    requester_data: Dict[str, Any],
+) -> str:
+    route_doc = db.collection("routes").document(route_number).get()
+    if route_doc.exists:
+        route_data = route_doc.to_dict() or {}
+        owner_uid = str(route_data.get("ownerUid") or route_data.get("userId") or "").strip()
+        if owner_uid:
+            return owner_uid
+    if _is_owner_for_route(requester_data, route_number):
+        return requester_uid
+    assignments = requester_data.get("routeAssignments", {}) or {}
+    assignment = assignments.get(route_number, {}) if isinstance(assignments, dict) else {}
+    if isinstance(assignment, dict):
+        assigned_to = str(assignment.get("assignedTo") or "").strip()
+        if assigned_to:
+            return assigned_to
+    return ""
+
+
+def _has_route_entitlement_feature(
+    *,
+    db: firestore.Client,
+    route_number: str,
+    feature_key: str,
+) -> bool:
+    ent_doc = db.collection("routeEntitlements").document(route_number).get()
+    if not ent_doc.exists:
+        return False
+    data = ent_doc.to_dict() or {}
+    if not bool(data.get("active")):
+        return False
+    features = data.get("features") if isinstance(data.get("features"), dict) else {}
+    if feature_key in features:
+        return bool(features.get(feature_key))
+    return bool(_feature_payload_for_plan(data.get("plan")).get(feature_key))
+
+
+def _has_legacy_subscription_feature(
+    *,
+    route_number: str,
+    owner_data: Dict[str, Any],
+    feature_key: str,
+) -> bool:
+    route_sub = (
+        owner_data.get("subscriptions", {})
+        .get("routes", {})
+        .get(route_number)
+        if isinstance(owner_data.get("subscriptions", {}), dict)
+        else None
+    )
+    if not isinstance(route_sub, dict):
+        return False
+    if not bool(route_sub.get("active")):
+        return False
+    current_period_end_ms = _to_epoch_millis(route_sub.get("currentPeriodEnd"))
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    if current_period_end_ms is not None and current_period_end_ms <= now_ms:
+        return False
+    features = route_sub.get("features") if isinstance(route_sub.get("features"), dict) else {}
+    if not features:
+        features = _feature_payload_for_plan(route_sub.get("plan"))
+    return bool(features.get(feature_key))
+
+
+def _has_trial_feature(
+    *,
+    route_number: str,
+    owner_data: Dict[str, Any],
+    feature_key: str,
+) -> bool:
+    profile = owner_data.get("profile", {}) or {}
+    primary_route = _normalize_route_number(profile.get("routeNumber"))
+    if primary_route != route_number:
+        return False
+    trial_status = owner_data.get("trialStatus", {}) or {}
+    trial_features = trial_status.get("features", {}) if isinstance(trial_status.get("features"), dict) else {}
+    scanner_enabled = bool(trial_features.get("scanner"))
+    if not scanner_enabled:
+        return False
+    ends_ms = _to_epoch_millis(trial_status.get("endsAt"))
+    if not ends_ms:
+        return False
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    if ends_ms <= now_ms:
+        return False
+
+    # Trial grants baseline app capabilities even when not explicitly stored
+    # under trialStatus.features.
+    if feature_key in ("scanner", "ordering", "forecasting", "pcfEmailImport"):
+        return True
+    if feature_key == "multiRoute":
+        return bool(trial_features.get("multiRoute"))
+    if feature_key == "managementDashboard":
+        return bool(trial_features.get("managementDashboard"))
+    return bool(trial_features.get(feature_key))
+
+
+def _has_route_feature_entitlement(
+    *,
+    db: firestore.Client,
+    route_number: str,
+    feature_key: str,
+    requester_uid: str,
+    requester_data: Dict[str, Any],
+) -> bool:
+    # Priority chain: routeEntitlements -> legacy subscription -> trial.
+    if _has_route_entitlement_feature(db=db, route_number=route_number, feature_key=feature_key):
+        return True
+
+    owner_uid = _resolve_owner_uid_for_route(
+        db=db,
+        route_number=route_number,
+        requester_uid=requester_uid,
+        requester_data=requester_data,
+    )
+    owner_data: Dict[str, Any] = {}
+    if owner_uid:
+        owner_doc = db.collection("users").document(owner_uid).get()
+        if owner_doc.exists:
+            owner_data = owner_doc.to_dict() or {}
+    if not owner_data:
+        owner_data = requester_data
+
+    if _has_legacy_subscription_feature(
+        route_number=route_number,
+        owner_data=owner_data,
+        feature_key=feature_key,
+    ):
+        return True
+    if _has_trial_feature(
+        route_number=route_number,
+        owner_data=owner_data,
+        feature_key=feature_key,
+    ):
+        return True
+    return False
+
+
+def _is_non_primary_route_locked_by_plan_tier(
+    *,
+    db: firestore.Client,
+    route_number: str,
+    requester_uid: str,
+    requester_data: Dict[str, Any],
+    feature_key: str,
+) -> bool:
+    if feature_key not in ("ordering", "forecasting", "pcfEmailImport"):
+        return False
+
+    owner_uid = _resolve_owner_uid_for_route(
+        db=db,
+        route_number=route_number,
+        requester_uid=requester_uid,
+        requester_data=requester_data,
+    )
+    owner_data: Dict[str, Any] = {}
+    if owner_uid:
+        owner_doc = db.collection("users").document(owner_uid).get()
+        if owner_doc.exists:
+            owner_data = owner_doc.to_dict() or {}
+    if not owner_data:
+        owner_data = requester_data
+
+    primary_route = _normalize_route_number((owner_data.get("profile", {}) or {}).get("routeNumber"))
+    if not primary_route or primary_route == route_number:
+        return False
+
+    primary_has_base_access = (
+        _has_route_entitlement_feature(db=db, route_number=primary_route, feature_key=feature_key) or
+        _has_legacy_subscription_feature(route_number=primary_route, owner_data=owner_data, feature_key=feature_key) or
+        _has_trial_feature(route_number=primary_route, owner_data=owner_data, feature_key=feature_key)
+    )
+    if not primary_has_base_access:
+        return False
+
+    primary_has_multi_route = (
+        _has_route_entitlement_feature(db=db, route_number=primary_route, feature_key="multiRoute") or
+        _has_legacy_subscription_feature(route_number=primary_route, owner_data=owner_data, feature_key="multiRoute") or
+        _has_trial_feature(route_number=primary_route, owner_data=owner_data, feature_key="multiRoute")
+    )
+    return not primary_has_multi_route
+
+
+async def require_route_feature_access(
+    route_number: str,
+    feature_key: Literal["ordering", "forecasting", "scanner", "managementDashboard", "multiRoute", "pcfEmailImport"],
+    decoded_token: Dict[str, Any] = Depends(verify_firebase_token),
+    db: firestore.Client = Depends(get_firestore),
+) -> Dict[str, Any]:
+    """Verify route access + entitlement feature access.
+
+    Uses route-level entitlement source-of-truth with legacy/trial fallbacks.
+    """
+    user_data = await require_route_access(route_number, decoded_token, db)
+
+    # Safe rollout guard for beta/live compatibility.
+    # Keep legacy behavior until this flag is explicitly enabled in production.
+    if not ENFORCE_ROUTE_ENTITLEMENTS:
+        return user_data
+
+    if not _has_route_feature_entitlement(
+        db=db,
+        route_number=route_number,
+        feature_key=feature_key,
+        requester_uid=decoded_token["uid"],
+        requester_data=user_data,
+    ):
+        if _is_non_primary_route_locked_by_plan_tier(
+            db=db,
+            route_number=route_number,
+            requester_uid=decoded_token["uid"],
+            requester_data=user_data,
+            feature_key=feature_key,
+        ):
+            _log_access_failure(decoded_token["uid"], route_number, "plan_downgraded_route_locked")
+            raise HTTPException(403, "plan_downgraded_route_locked")
+        _log_access_failure(decoded_token["uid"], route_number, f"missing_feature_{feature_key}")
+        raise HTTPException(403, f"{feature_key}_entitlement_required")
+
+    return user_data
 
 
 def _log_access_failure(uid: str, route_number: str, reason: str):
