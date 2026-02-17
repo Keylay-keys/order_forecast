@@ -25,6 +25,52 @@ from ..models import (
 
 router = APIRouter()
 
+def _normalize_route_number(value: Any) -> str:
+    v = str(value or "").strip()
+    return v if v.isdigit() and len(v) <= 10 else ""
+
+
+def _resolve_route_group_id(
+    db: firestore.Client,
+    *,
+    requester_user_data: Dict[str, Any],
+    order_route_number: str,
+) -> str:
+    """Resolve the master routeGroupId for transfer ledger operations.
+
+    Transfers are grouped under the *owner's* primary route number (routeGroupId).
+    For owners, this is `users/{uid}.profile.routeNumber`.
+    For team members, resolve via `routes/{route}.ownerUid` then owner's profile.routeNumber.
+    """
+    profile = (requester_user_data or {}).get("profile", {}) or {}
+    role = str(profile.get("role") or "").strip()
+    if role == "owner":
+        master = _normalize_route_number(profile.get("routeNumber"))
+        if master:
+            return master
+
+    # Team member path: route doc -> owner uid -> owner's primary route number.
+    route = _normalize_route_number(order_route_number)
+    if not route:
+        return ""
+
+    try:
+        route_doc = db.collection("routes").document(route).get()
+        if not route_doc.exists:
+            return ""
+        route_data = route_doc.to_dict() or {}
+        owner_uid = str(route_data.get("ownerUid") or route_data.get("userId") or "").strip()
+        if not owner_uid:
+            return ""
+        owner_doc = db.collection("users").document(owner_uid).get()
+        if not owner_doc.exists:
+            return ""
+        owner_data = owner_doc.to_dict() or {}
+        owner_profile = owner_data.get("profile", {}) or {}
+        return _normalize_route_number(owner_profile.get("routeNumber"))
+    except Exception:
+        return ""
+
 
 def _get_local_order_date(db: firestore.Client, route_number: str) -> str:
     """Return local date (YYYY-MM-DD) using route owner's timezone when possible."""
@@ -318,7 +364,7 @@ async def delete_order(
     db: firestore.Client = Depends(get_firestore),
 ) -> Dict[str, Any]:
     """Delete a draft order."""
-    await require_route_access(route, decoded_token, db)
+    requester_user_data = await require_route_access(route, decoded_token, db)
 
     order_ref = _order_ref(db, route, order_id)
     order_doc = order_ref.get()
@@ -334,7 +380,11 @@ async def delete_order(
         raise HTTPException(409, "Only draft orders can be deleted")
 
     # Release transfer reservations before deleting (best-effort cleanup)
-    route_group_id = route_number  # Primary route acts as routeGroupId
+    route_group_id = _resolve_route_group_id(
+        db,
+        requester_user_data=requester_user_data,
+        order_route_number=route_number,
+    ) or route_number
 
     # 1. Release inbound transfer reservations
     inbound_transfers = order_data.get("inboundTransfersUsed") or []
@@ -416,7 +466,7 @@ async def finalize_order(
     db: firestore.Client = Depends(get_firestore),
 ) -> Dict[str, Any]:
     """Finalize an order and trigger PostgreSQL sync."""
-    await require_route_access(route, decoded_token, db)
+    requester_user_data = await require_route_access(route, decoded_token, db)
 
     order_ref = _order_ref(db, route, order_id)
     order_doc = order_ref.get()
@@ -436,7 +486,11 @@ async def finalize_order(
     })
 
     # Commit outbound transfers (change status from 'planned' to 'committed')
-    route_group_id = route_number
+    route_group_id = _resolve_route_group_id(
+        db,
+        requester_user_data=requester_user_data,
+        order_route_number=route_number,
+    ) or route_number
     route_transfers = order_data.get("routeTransfers") or []
     uid = decoded_token["uid"]
 

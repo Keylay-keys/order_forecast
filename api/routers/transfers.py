@@ -24,6 +24,7 @@ from google.cloud import firestore
 from ..dependencies import (
     verify_firebase_token,
     require_route_access,
+    has_access_to_route,
     get_pg_connection,
     return_pg_connection,
     get_firestore,
@@ -31,6 +32,48 @@ from ..dependencies import (
 from ..middleware.rate_limit import rate_limit_history, rate_limit_write
 
 router = APIRouter()
+
+def _normalize_route_number(value: Any) -> str:
+    v = str(value or "").strip()
+    return v if v.isdigit() and len(v) <= 10 else ""
+
+
+def _require_owner_master_route(user_data: Dict[str, Any]) -> str:
+    profile = (user_data or {}).get("profile", {}) or {}
+    if str(profile.get("role") or "").strip() != "owner":
+        raise HTTPException(403, "Owner access required")
+    master = _normalize_route_number(profile.get("routeNumber"))
+    if not master:
+        raise HTTPException(403, "Owner primary route not set")
+    return master
+
+
+def _extract_owned_routes_for_owner(user_data: Dict[str, Any]) -> set[str]:
+    """Mirror functions/src/route-transfers.ts extractOwnedRoutes semantics."""
+    profile = (user_data or {}).get("profile", {}) or {}
+    owned: set[str] = set()
+
+    master = _normalize_route_number(profile.get("routeNumber"))
+    if master:
+        owned.add(master)
+
+    additional = profile.get("additionalRoutes") or []
+    if isinstance(additional, list):
+        for r in additional:
+            nr = _normalize_route_number(r)
+            if nr:
+                owned.add(nr)
+
+    assignments = user_data.get("routeAssignments") or {}
+    if isinstance(assignments, dict):
+        for route, assignment in assignments.items():
+            nr = _normalize_route_number(route)
+            if not nr:
+                continue
+            if isinstance(assignment, dict) and str(assignment.get("role") or "").strip() == "owner":
+                owned.add(nr)
+
+    return owned
 
 
 def _row_to_dict(row: Any, columns: List[str]) -> Dict[str, Any]:
@@ -58,7 +101,10 @@ async def list_transfers(
     - Requires Firebase token
     - Requires route access to the master route (routeGroupId)
     """
-    await require_route_access(route_group_id, decoded_token, db)
+    user_data = await require_route_access(route_group_id, decoded_token, db)
+    master_route = _require_owner_master_route(user_data)
+    if route_group_id != master_route:
+        raise HTTPException(403, "routeGroupId must be the owner's primary route number")
 
     cutoff = (datetime.utcnow() - timedelta(days=days)).date().isoformat()
 
@@ -196,7 +242,10 @@ async def get_transfer_ledger(
     - reservedTotal (sum of all reservations)
     - availableUnits (units - reservedTotal)
     """
-    await require_route_access(route_group_id, decoded_token, db)
+    user_data = await require_route_access(route_group_id, decoded_token, db)
+    master_route = _require_owner_master_route(user_data)
+    if route_group_id != master_route:
+        raise HTTPException(403, "routeGroupId must be the owner's primary route number")
 
     try:
         snap = (
@@ -252,7 +301,10 @@ async def reserve_transfer(
 
     Mirrors Firebase callable reserveRouteTransfer (route-transfers.ts:190-262).
     """
-    await require_route_access(payload.routeGroupId, decoded_token, db)
+    user_data = await require_route_access(payload.routeGroupId, decoded_token, db)
+    master_route = _require_owner_master_route(user_data)
+    if payload.routeGroupId != master_route:
+        raise HTTPException(403, "routeGroupId must be the owner's primary route number")
 
     transfer_ref = (
         db.collection("routeTransfers")
@@ -272,6 +324,10 @@ async def reserve_transfer(
         status = data.get("status")
         if status == "canceled":
             raise HTTPException(409, "Transfer canceled")
+
+        to_route_number = _normalize_route_number(data.get("toRouteNumber"))
+        if not to_route_number or not has_access_to_route(user_data, to_route_number):
+            raise HTTPException(403, "Access denied")
 
         reserved_by = data.get("reservedBy", {})
         current = reserved_by.get(payload.consumerOrderId, 0)
@@ -322,29 +378,20 @@ async def create_transfer(
 
     Mirrors Firebase callable createRouteTransfer (route-transfers.ts:94-188).
     """
-    await require_route_access(payload.routeGroupId, decoded_token, db)
+    user_data = await require_route_access(payload.routeGroupId, decoded_token, db)
+    master_route = _require_owner_master_route(user_data)
+    if payload.routeGroupId != master_route:
+        raise HTTPException(403, "routeGroupId must be the owner's primary route number")
 
     # Validate both routes are owned by caller
     uid = decoded_token["uid"]
-    user_ref = db.collection("users").document(uid)
-    user_doc = user_ref.get()
-    if not user_doc.exists:
-        raise HTTPException(403, "User document not found")
-
-    user_data = user_doc.to_dict()
-    profile = user_data.get("profile", {})
-    route_assignments = user_data.get("routeAssignments", {})
-
-    owned_routes = set()
-    if profile.get("routeNumber"):
-        owned_routes.add(str(profile["routeNumber"]))
-    for r in (profile.get("additionalRoutes") or []):
-        owned_routes.add(str(r))
-    for r in route_assignments.keys():
-        owned_routes.add(str(r))
+    owned_routes = _extract_owned_routes_for_owner(user_data)
 
     if payload.fromRouteNumber not in owned_routes or payload.toRouteNumber not in owned_routes:
         raise HTTPException(403, "Must own both fromRoute and toRoute")
+
+    if payload.fromRouteNumber != master_route:
+        raise HTTPException(403, "Outbound transfers can only be created from the primary (master) route")
 
     if payload.fromRouteNumber == payload.toRouteNumber:
         raise HTTPException(400, "fromRoute and toRoute must differ")
@@ -413,4 +460,3 @@ async def create_transfer(
         raise
     except Exception as exc:
         raise HTTPException(500, f"Transfer create failed: {str(exc)}")
-

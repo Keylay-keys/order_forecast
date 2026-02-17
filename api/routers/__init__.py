@@ -11,5 +11,7 @@ from . import credits
 from . import pos
 from . import deliveries
 from . import transfers
+from . import team
+from . import billing
 
-__all__ = ['auth', 'history', 'health', 'orders', 'forecast', 'reference', 'low_quantity', 'credits', 'pos', 'deliveries', 'transfers']
+__all__ = ['auth', 'history', 'health', 'orders', 'forecast', 'reference', 'low_quantity', 'credits', 'pos', 'deliveries', 'transfers', 'team', 'billing']
