@@ -198,6 +198,10 @@ class BillingEntitlement(BaseModel):
     interval: Optional[Literal["monthly", "yearly"]] = None
     currentPeriodEndMs: Optional[int] = None
     source: Literal["route_entitlements", "legacy_user_subscription", "trial", "none"]
+    resolvedFrom: Literal["route_entitlements", "legacy_subscription", "trial", "none"] = "none"
+    isTrial: bool = False
+    isPaidSubscription: bool = False
+    displayState: Literal["trial_active", "subscribed", "none"] = "none"
     updatedAtMs: Optional[int] = None
     features: Dict[str, bool]
 
@@ -224,6 +228,61 @@ class AppleRestoreRequest(BaseModel):
     originalTransactionId: Optional[str] = Field(default=None, max_length=255)
 
 
+def _normalize_provider(value: Any) -> Optional[str]:
+    normalized = str(value or "").strip().lower()
+    if not normalized:
+        return None
+    provider_aliases = {
+        "stripe_webhook": "stripe",
+        "legacy_backfill": "stripe",
+        "web_stripe": "stripe",
+        "web": "stripe",
+        "app_store": "apple",
+        "appstore": "apple",
+        "ios": "apple",
+        "google_play": "google",
+        "play_store": "google",
+        "play": "google",
+        "android": "google",
+    }
+    return provider_aliases.get(normalized, normalized)
+
+
+def _finalize_entitlement(
+    entitlement: BillingEntitlement,
+    *,
+    resolved_from: Literal["route_entitlements", "legacy_subscription", "trial", "none"],
+) -> BillingEntitlement:
+    provider = _normalize_provider(entitlement.provider)
+    source = entitlement.source
+    is_trial = bool(entitlement.active and (source == "trial" or provider == "trial"))
+    is_paid_subscription = bool(
+        entitlement.active
+        and not is_trial
+        and (
+            source in ("route_entitlements", "legacy_user_subscription")
+            or provider in ("stripe", "apple", "google")
+        )
+    )
+
+    entitlement.provider = provider
+    entitlement.resolvedFrom = resolved_from
+    entitlement.isTrial = is_trial
+    entitlement.isPaidSubscription = is_paid_subscription
+    entitlement.displayState = (
+        "trial_active" if is_trial else "subscribed" if is_paid_subscription else "none"
+    )
+    logger.debug(
+        "Resolved entitlement route=%s source=%s resolvedFrom=%s provider=%s displayState=%s",
+        entitlement.routeNumber,
+        entitlement.source,
+        entitlement.resolvedFrom,
+        entitlement.provider,
+        entitlement.displayState,
+    )
+    return entitlement
+
+
 def _coerce_entitlement_from_route_doc(
     route_number: str,
     doc_data: Dict[str, Any],
@@ -231,7 +290,7 @@ def _coerce_entitlement_from_route_doc(
     plan = _normalize_plan(doc_data.get("plan"))
     interval = _normalize_interval(doc_data.get("interval"))
     active = bool(doc_data.get("active"))
-    provider = str(doc_data.get("provider") or "").strip() or None
+    provider = _normalize_provider(doc_data.get("provider")) or _normalize_provider(doc_data.get("source"))
     features = doc_data.get("features") if isinstance(doc_data.get("features"), dict) else {}
     if not features and plan:
         features = _feature_payload_for_plan(plan)
@@ -266,8 +325,14 @@ def _coerce_legacy_subscription_entitlement(
         "pro" if bool((owner_data.get("trialStatus", {}).get("features", {}) or {}).get("multiRoute")) else "solo"
     )
     interval = _normalize_interval(route_sub.get("interval"))
-    provider = str(route_sub.get("provider") or "stripe").strip() or "stripe"
+    provider = _normalize_provider(route_sub.get("provider")) or "stripe"
+    current_period_end_ms = _to_epoch_millis(route_sub.get("currentPeriodEnd"))
     active = bool(route_sub.get("active"))
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    if active and current_period_end_ms is not None and current_period_end_ms <= now_ms:
+        active = False
+    if not active:
+        return None
     features = _feature_payload_for_plan(plan)
 
     return BillingEntitlement(
@@ -276,7 +341,7 @@ def _coerce_legacy_subscription_entitlement(
         plan=plan,
         provider=provider,
         interval=interval,
-        currentPeriodEndMs=_to_epoch_millis(route_sub.get("currentPeriodEnd")),
+        currentPeriodEndMs=current_period_end_ms,
         source="legacy_user_subscription",
         updatedAtMs=_to_epoch_millis(owner_data.get("timestamps", {}).get("updatedAt")),
         features=features,
@@ -346,7 +411,7 @@ def _write_route_entitlement_from_legacy(
             ),
             "features": entitlement.features,
             "ownerUid": owner_uid,
-            "source": "legacy_backfill",
+            "source": _normalize_provider(entitlement.provider) or "legacy",
             "updatedAt": firestore.SERVER_TIMESTAMP,
         },
         merge=True,
@@ -411,15 +476,20 @@ async def get_billing_entitlement(
     db: firestore.Client = Depends(get_firestore),
 ) -> BillingEntitlementResponse:
     """Resolve effective entitlement state for a route."""
+    # Priority chain (explicit): active routeEntitlements -> active legacy subscription -> active trial -> none.
     user_data = await require_route_access(route, decoded_token, db)
 
     # Route-level source of truth when available.
     ent_doc = db.collection("routeEntitlements").document(route).get()
+    route_doc_entitlement: Optional[BillingEntitlement] = None
     if ent_doc.exists:
         ent_data = ent_doc.to_dict() or {}
-        entitlement = _coerce_entitlement_from_route_doc(route, ent_data)
-        if entitlement:
-            return BillingEntitlementResponse(ok=True, entitlement=entitlement)
+        route_doc_entitlement = _coerce_entitlement_from_route_doc(route, ent_data)
+        if route_doc_entitlement and route_doc_entitlement.active:
+            return BillingEntitlementResponse(
+                ok=True,
+                entitlement=_finalize_entitlement(route_doc_entitlement, resolved_from="route_entitlements"),
+            )
 
     owner_uid = _resolve_owner_uid_for_route(
         db=db,
@@ -439,41 +509,55 @@ async def get_billing_entitlement(
 
     legacy_entitlement = _coerce_legacy_subscription_entitlement(route, owner_data)
     if legacy_entitlement:
-        if legacy_entitlement.active:
-            try:
-                _write_route_entitlement_from_legacy(
-                    db=db,
-                    route_number=route,
-                    entitlement=legacy_entitlement,
-                    owner_uid=owner_uid,
-                )
-            except Exception as exc:
-                logger.warning("Legacy entitlement backfill failed for route=%s: %s", route, exc)
-        return BillingEntitlementResponse(ok=True, entitlement=legacy_entitlement)
+        try:
+            _write_route_entitlement_from_legacy(
+                db=db,
+                route_number=route,
+                entitlement=legacy_entitlement,
+                owner_uid=owner_uid,
+            )
+        except Exception as exc:
+            logger.warning("Legacy entitlement backfill failed for route=%s: %s", route, exc)
+        return BillingEntitlementResponse(
+            ok=True,
+            entitlement=_finalize_entitlement(legacy_entitlement, resolved_from="legacy_subscription"),
+        )
 
     trial_entitlement = _coerce_trial_entitlement(route, owner_data)
     if trial_entitlement:
-        return BillingEntitlementResponse(ok=True, entitlement=trial_entitlement)
+        return BillingEntitlementResponse(
+            ok=True,
+            entitlement=_finalize_entitlement(trial_entitlement, resolved_from="trial"),
+        )
+
+    if route_doc_entitlement:
+        return BillingEntitlementResponse(
+            ok=True,
+            entitlement=_finalize_entitlement(route_doc_entitlement, resolved_from="route_entitlements"),
+        )
 
     return BillingEntitlementResponse(
         ok=True,
-        entitlement=BillingEntitlement(
-            routeNumber=route,
-            active=False,
-            plan=None,
-            provider=None,
-            interval=None,
-            currentPeriodEndMs=None,
-            source="none",
-            updatedAtMs=None,
-            features={
-                "scanner": False,
-                "managementDashboard": False,
-                "multiRoute": False,
-                "ordering": False,
-                "forecasting": False,
-                "pcfEmailImport": False,
-            },
+        entitlement=_finalize_entitlement(
+            BillingEntitlement(
+                routeNumber=route,
+                active=False,
+                plan=None,
+                provider=None,
+                interval=None,
+                currentPeriodEndMs=None,
+                source="none",
+                updatedAtMs=None,
+                features={
+                    "scanner": False,
+                    "managementDashboard": False,
+                    "multiRoute": False,
+                    "ordering": False,
+                    "forecasting": False,
+                    "pcfEmailImport": False,
+                },
+            ),
+            resolved_from="none",
         ),
     )
 
