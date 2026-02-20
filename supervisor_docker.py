@@ -7,6 +7,8 @@ Unlike the macOS supervisor, this doesn't use caffeinate.
 Services managed:
 - Order Sync Listener
 - Archive Listener
+- Archive Export Worker
+- Archive Purge Worker
 - Retrain Daemon
 - Delivery Manifest Listener
 - Low-Qty Notification Daemon
@@ -187,6 +189,26 @@ def create_services() -> List[Service]:
                 '--serviceAccount', SA_PATH,
             ],
             log_file=LOG_DIR / 'archive_listener.log',
+        ),
+        # Archive export worker (owner-requested PCF export zips)
+        Service(
+            name="Archive Export Worker",
+            cmd=[
+                python,
+                str(SCRIPTS_DIR / 'archive_export_worker.py'),
+                '--serviceAccount', SA_PATH,
+            ],
+            log_file=LOG_DIR / 'archive_export_worker.log',
+        ),
+        # Archive purge + artifact cleanup worker (guarded by ARCHIVE_PURGE_ENABLED)
+        Service(
+            name="Archive Purge Worker",
+            cmd=[
+                python,
+                str(SCRIPTS_DIR / 'archive_purge_worker.py'),
+                '--serviceAccount', SA_PATH,
+            ],
+            log_file=LOG_DIR / 'archive_purge_worker.log',
         ),
         # Periodic retraining check
         Service(

@@ -4,6 +4,8 @@
 Manages:
 - Order Sync Listener (watches /orders, auto-syncs new routes)
 - Order Archive Listener (handles app requests for old orders)
+- Archive Export Worker (builds queued archived-PCF export artifacts)
+- Archive Purge Worker (retention purge + artifact expiry cleanup)
 - Retrain Daemon (auto-retrains after order cycles complete)
 - PCF OCR Listener (processes PCF images)
 
@@ -182,6 +184,26 @@ def create_services(route: str, sa_path: str, db_path: str) -> List[Service]:
                 '--serviceAccount', sa_path,
             ],
             log_file=LOG_DIR / 'archive_listener.log',
+        ),
+        # Processes /api/archive/exports queued jobs into downloadable zip artifacts
+        Service(
+            name="Archive Export Worker",
+            cmd=[
+                python,
+                str(SCRIPTS_DIR / 'archive_export_worker.py'),
+                '--serviceAccount', sa_path,
+            ],
+            log_file=LOG_DIR / 'archive_export_worker.log',
+        ),
+        # Purges aged archive data and expires artifacts (guarded by ARCHIVE_PURGE_ENABLED)
+        Service(
+            name="Archive Purge Worker",
+            cmd=[
+                python,
+                str(SCRIPTS_DIR / 'archive_purge_worker.py'),
+                '--serviceAccount', sa_path,
+            ],
+            log_file=LOG_DIR / 'archive_purge_worker.log',
         ),
         # Periodic retraining check (uses DBClient)
         Service(
@@ -363,7 +385,7 @@ def cmd_stop(args):
     time.sleep(0.5)
     
     # Now stop individual services
-    patterns = ['db_manager.py', 'order_sync_listener.py', 'order_archive_listener.py', 'retrain_daemon.py', 'delivery_manifest_listener.py', 'promo_email_listener.py', 'catalog_upload_listener.py', 'low_qty_notification_daemon.py', 'api.main:app', 'pcf_core.runner']
+    patterns = ['db_manager.py', 'order_sync_listener.py', 'order_archive_listener.py', 'archive_export_worker.py', 'archive_purge_worker.py', 'retrain_daemon.py', 'delivery_manifest_listener.py', 'promo_email_listener.py', 'catalog_upload_listener.py', 'low_qty_notification_daemon.py', 'api.main:app', 'pcf_core.runner']
     
     for pattern in patterns:
         try:
@@ -402,6 +424,8 @@ def cmd_status(args):
         ('DB Manager', 'db_manager.py'),
         ('Order Sync Listener', 'order_sync_listener.py'),
         ('Archive Listener', 'order_archive_listener.py'),
+        ('Archive Export Worker', 'archive_export_worker.py'),
+        ('Archive Purge Worker', 'archive_purge_worker.py'),
         ('Retrain Daemon', 'retrain_daemon.py'),
         ('Delivery Manifest', 'delivery_manifest_listener.py'),
         ('Promo Email', 'promo_email_listener.py'),

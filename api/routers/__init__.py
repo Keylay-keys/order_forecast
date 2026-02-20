@@ -13,5 +13,6 @@ from . import deliveries
 from . import transfers
 from . import team
 from . import billing
+from . import archive_exports
 
-__all__ = ['auth', 'history', 'health', 'orders', 'forecast', 'reference', 'low_quantity', 'credits', 'pos', 'deliveries', 'transfers', 'team', 'billing']
+__all__ = ['auth', 'history', 'health', 'orders', 'forecast', 'reference', 'low_quantity', 'credits', 'pos', 'deliveries', 'transfers', 'team', 'billing', 'archive_exports']

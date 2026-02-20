@@ -6,8 +6,10 @@ requests.
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
+import os
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 from urllib import error as urllib_error
@@ -26,6 +28,10 @@ logger = logging.getLogger("api.team")
 
 EXPO_PUSH_URL = "https://exp.host/--/api/v2/push/send"
 SCANNER_REQUEST_NOTIFY_COOLDOWN_SECONDS = 10 * 60
+MAILJET_API_KEY = str(os.environ.get("MAILJET_API_KEY") or "").strip()
+MAILJET_SECRET_KEY = str(os.environ.get("MAILJET_SECRET_KEY") or "").strip()
+MAILJET_FROM = str(os.environ.get("MAILJET_FROM") or "RouteSpark <no-reply@routespark.pro>").strip()
+ISSUE_REPORT_ALERT_EMAIL = str(os.environ.get("ISSUE_REPORT_ALERT_EMAIL") or "").strip()
 
 
 class ScannerAccessRequestCreate(BaseModel):
@@ -37,6 +43,22 @@ class ScannerAccessResolveRequest(BaseModel):
     teamMemberUid: str = Field(..., min_length=1, max_length=128)
     action: str = Field(..., pattern=r"^(approve|deny)$")
     denyReason: Optional[str] = Field(default=None, max_length=300)
+
+
+class IssueReportCreate(BaseModel):
+    route: str = Field(..., pattern=r"^\d{1,10}$")
+    category: str = Field(
+        default="other",
+        pattern=r"^(account_access|billing_subscription|scanner_camera|team_permissions|data_issue|app_bug|performance_sync|other|harassment|hate|sexual_content|violence|illegal_activity|impersonation|privacy_doxxing|spam)$",
+    )
+    targetType: str = Field(default="other", pattern=r"^(user|route|content|other)$")
+    targetRoute: Optional[str] = Field(default=None, pattern=r"^\d{1,10}$")
+    targetContentRef: Optional[str] = Field(default=None, max_length=256)
+    allowFollowUp: bool = Field(default=True)
+    contactEmail: Optional[str] = Field(default=None, max_length=256)
+    details: str = Field(default="", max_length=3000)
+    targetUid: Optional[str] = Field(default=None, max_length=128)
+    clientMeta: Dict[str, Any] = Field(default_factory=dict)
 
 
 def _is_owner_for_route(user_data: Dict[str, Any], route_number: str) -> bool:
@@ -115,6 +137,50 @@ def _send_expo_push(tokens: List[str], *, title: str, body: str, data: Dict[str,
     return {"sent": sent, "failed": failed}
 
 
+def _parse_mailjet_from() -> Dict[str, str]:
+    from_email = MAILJET_FROM
+    from_name = "RouteSpark"
+    if "<" in MAILJET_FROM and ">" in MAILJET_FROM:
+        before, after = MAILJET_FROM.split("<", 1)
+        from_name = before.strip() or "RouteSpark"
+        from_email = after.split(">", 1)[0].strip() or from_email
+    return {"email": from_email, "name": from_name}
+
+
+def _send_mailjet_email(to_email: str, subject: str, html_part: str) -> bool:
+    if not to_email or not MAILJET_API_KEY or not MAILJET_SECRET_KEY:
+        return False
+
+    sender = _parse_mailjet_from()
+    payload = {
+        "Messages": [
+            {
+                "From": {"Email": sender["email"], "Name": sender["name"]},
+                "To": [{"Email": to_email}],
+                "Subject": subject,
+                "HTMLPart": html_part,
+            }
+        ]
+    }
+    creds = f"{MAILJET_API_KEY}:{MAILJET_SECRET_KEY}".encode("utf-8")
+    auth_header = "Basic " + base64.b64encode(creds).decode("utf-8")
+    req = urllib_request.Request(
+        "https://api.mailjet.com/v3.1/send",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": auth_header,
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib_request.urlopen(req, timeout=10) as resp:
+            return 200 <= int(resp.status) < 300
+    except Exception as exc:
+        logger.warning("Issue report email send failed: %s", exc)
+        return False
+
+
 def _resolve_owner_uid_for_route(
     *,
     db: firestore.Client,
@@ -139,6 +205,14 @@ def _resolve_owner_uid_for_route(
     if _is_owner_for_route(requester_data, route_number):
         return requester_uid
     return ""
+
+
+def _safe_text(value: Any, max_len: int) -> str:
+    return str(value or "").strip()[:max_len]
+
+
+def _normalize_report_category(payload: IssueReportCreate) -> str:
+    return payload.category or "other"
 
 
 @router.get(
@@ -198,6 +272,174 @@ async def list_team_members_for_route(
     pending = [m for m in members if m.get("needsApproval")]
     approved = [m for m in members if not m.get("needsApproval")]
     return {"ok": True, "approved": approved, "pending": pending}
+
+
+@router.post(
+    "/team/report-issue",
+    responses={
+        400: {"model": ErrorResponse},
+        401: {"model": ErrorResponse},
+        403: {"model": ErrorResponse},
+        409: {"model": ErrorResponse},
+    },
+)
+@rate_limit_write
+async def submit_issue_report(
+    request: Request,
+    payload: IssueReportCreate,
+    decoded_token: dict = Depends(verify_firebase_token),
+    db: firestore.Client = Depends(get_firestore),
+) -> Dict[str, Any]:
+    """Submit an in-app issue report for review.
+
+    This endpoint is intentionally available to any authenticated user
+    with access to the specified route.
+    """
+    route = payload.route
+    reporter_uid = decoded_token["uid"]
+    reporter_data = await require_route_access(route, decoded_token, db)
+    details = _safe_text(payload.details, 3000)
+    if len(details) < 10:
+        raise HTTPException(400, "Please provide at least 10 characters in report details")
+    category = _normalize_report_category(payload)
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    duplicate_window_ms = 90 * 1000
+
+    # Duplicate guard: block accidental rapid repeat submissions for same route/user/details.
+    # Keep this query simple to avoid requiring additional Firestore composite indexes.
+    prior_reports = (
+        db.collection("issueReports")
+        .where("reporterUid", "==", reporter_uid)
+        .limit(25)
+        .stream()
+    )
+    normalized_details = details.lower()
+    for prior in prior_reports:
+        prior_data = prior.to_dict() or {}
+        if str(prior_data.get("routeNumber") or "") != route:
+            continue
+        prior_ms = prior_data.get("submittedAtMs")
+        if not isinstance(prior_ms, int):
+            continue
+        if now_ms - prior_ms > duplicate_window_ms:
+            continue
+        prior_details = _safe_text(prior_data.get("details"), 3000).lower()
+        if prior_details == normalized_details:
+            raise HTTPException(409, "Duplicate report submitted too recently")
+
+    reporter_profile = reporter_data.get("profile", {}) or {}
+    client_meta = payload.clientMeta if isinstance(payload.clientMeta, dict) else {}
+    client_meta_sanitized = {
+        "platform": _safe_text(client_meta.get("platform"), 32),
+        "appVersion": _safe_text(client_meta.get("appVersion"), 64),
+        "buildNumber": _safe_text(client_meta.get("buildNumber"), 64),
+    }
+    report_doc = {
+        "routeNumber": route,
+        "reporterUid": reporter_uid,
+        "reporterEmail": _safe_text(reporter_profile.get("email"), 256),
+        "reporterRole": _safe_text(reporter_profile.get("role"), 64),
+        "category": category,
+        "targetType": _safe_text(payload.targetType, 32) or "other",
+        "details": details,
+        "targetUid": _safe_text(payload.targetUid, 128),
+        "targetRoute": _safe_text(payload.targetRoute, 32),
+        "targetContentRef": _safe_text(payload.targetContentRef, 256),
+        "allowFollowUp": bool(payload.allowFollowUp),
+        "contactEmail": _safe_text(payload.contactEmail, 256),
+        "clientMeta": client_meta_sanitized,
+        "status": "open",
+        "source": "mobile_app",
+        "submittedAtMs": now_ms,
+        "createdAt": firestore.SERVER_TIMESTAMP,
+        "updatedAt": firestore.SERVER_TIMESTAMP,
+    }
+    report_ref = db.collection("issueReports").document()
+    report_ref.set(report_doc, merge=False)
+
+    owner_uid = _resolve_owner_uid_for_route(
+        db=db,
+        route_number=route,
+        requester_uid=reporter_uid,
+        requester_data=reporter_data,
+    )
+
+    owner_email = ""
+    owner_tokens: List[str] = []
+    if owner_uid:
+        owner_doc = db.collection("users").document(owner_uid).get()
+        owner_data = owner_doc.to_dict() or {}
+        owner_email = _safe_text((owner_data.get("profile") or {}).get("email"), 256)
+        raw_tokens = owner_data.get("fcmTokens") or []
+        if isinstance(raw_tokens, list):
+            owner_tokens = [str(t) for t in raw_tokens if isinstance(t, str)]
+
+    push_stats = {"sent": 0, "failed": 0}
+    in_app_notification_written = False
+    if owner_uid and owner_uid != reporter_uid and owner_tokens:
+        push_stats = _send_expo_push(
+            owner_tokens,
+            title="New issue report submitted",
+            body=f"{report_doc.get('category') or 'An issue'} was submitted for route {route}",
+            data={
+                "type": "issue_report_submitted",
+                "routeNumber": route,
+                "reportId": report_ref.id,
+            },
+        )
+    if owner_uid and owner_uid != reporter_uid:
+        db.collection("users").document(owner_uid).collection("notifications").add(
+            {
+                "title": "New issue report submitted",
+                "body": f"{report_doc.get('category') or 'An issue'} was submitted for route {route}",
+                "type": "issue_report_submitted",
+                "read": False,
+                "data": {
+                    "routeNumber": route,
+                    "reportId": report_ref.id,
+                    "category": report_doc.get("category") or "other",
+                },
+                "createdAt": firestore.SERVER_TIMESTAMP,
+            }
+        )
+        in_app_notification_written = True
+
+    email_recipients: List[str] = []
+    if ISSUE_REPORT_ALERT_EMAIL:
+        email_recipients.append(ISSUE_REPORT_ALERT_EMAIL)
+    if owner_email and owner_email not in email_recipients:
+        email_recipients.append(owner_email)
+
+    email_sent = False
+    if email_recipients:
+        subject = f"RouteSpark issue report · Route {route}"
+        html = (
+            "<div style='font-family:Arial,sans-serif'>"
+            "<h3>New issue report submitted</h3>"
+            f"<p><strong>Report ID:</strong> {report_ref.id}</p>"
+            f"<p><strong>Route:</strong> {route}</p>"
+            f"<p><strong>Reporter:</strong> {report_doc.get('reporterEmail') or reporter_uid}</p>"
+            f"<p><strong>Category:</strong> {report_doc.get('category') or 'other'}</p>"
+            f"<p><strong>Target Type:</strong> {report_doc.get('targetType') or 'other'}</p>"
+            f"<p><strong>Target UID:</strong> {report_doc.get('targetUid') or '-'}</p>"
+            f"<p><strong>Target Route:</strong> {report_doc.get('targetRoute') or '-'}</p>"
+            f"<p><strong>Target Content Ref:</strong> {report_doc.get('targetContentRef') or '-'}</p>"
+            f"<p><strong>Details:</strong><br/>{(report_doc.get('details') or '').replace('<', '&lt;').replace('>', '&gt;')}</p>"
+            "</div>"
+        )
+        for recipient in email_recipients:
+            email_sent = _send_mailjet_email(recipient, subject, html) or email_sent
+
+    return {
+        "ok": True,
+        "reportId": report_ref.id,
+        "status": "open",
+        "submittedAtMs": now_ms,
+        "ownerUid": owner_uid or None,
+        "pushNotification": push_stats,
+        "inAppNotificationWritten": in_app_notification_written,
+        "emailSent": email_sent,
+    }
 
 
 @router.post(
