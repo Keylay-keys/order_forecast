@@ -795,6 +795,10 @@ def _create_indexes(conn: duckdb.DuckDBPyConnection) -> None:
         ON orders_historical(route_number, schedule_key)
     """)
     conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_orders_route_delivery
+        ON orders_historical(route_number, delivery_date)
+    """)
+    conn.execute("""
         CREATE INDEX IF NOT EXISTS idx_orders_delivery_date 
         ON orders_historical(delivery_date)
     """)
@@ -825,6 +829,10 @@ def _create_indexes(conn: duckdb.DuckDBPyConnection) -> None:
     conn.execute("""
         CREATE INDEX IF NOT EXISTS idx_corrections_route_schedule 
         ON forecast_corrections(route_number, schedule_key)
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_corrections_route_delivery
+        ON forecast_corrections(route_number, delivery_date)
     """)
     
     # Store alias indexes
@@ -1005,4 +1013,3 @@ if __name__ == '__main__':
         print_schema_summary(conn)
     
     conn.close()
-

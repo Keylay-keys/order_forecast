@@ -140,6 +140,24 @@ def _build_key_source_map(preds_df: pd.DataFrame) -> Dict[LineKey, str]:
     return out
 
 
+def _build_key_meta_map(preds_df: pd.DataFrame) -> Dict[LineKey, Dict[str, float]]:
+    out: Dict[LineKey, Dict[str, float]] = {}
+    if preds_df.empty:
+        return out
+    for _, row in preds_df.iterrows():
+        sid = str(row.get("store_id") or "")
+        sap = str(row.get("sap") or "")
+        if not sid or not sap:
+            continue
+        out[(sid, sap)] = {
+            "is_slow_mover": float(row.get("is_slow_mover", 0.0) or 0.0),
+            "days_since_last_order": float(row.get("days_since_last_order", 0.0) or 0.0),
+            "corr_removal_rate": float(row.get("corr_removal_rate", 0.0) or 0.0),
+            "corr_samples": float(row.get("corr_samples", 0.0) or 0.0),
+        }
+    return out
+
+
 def _apply_band_scale_and_center(
     p10_units: float,
     p50_units: float,
@@ -523,6 +541,8 @@ def _compute_fold_metrics(
     train_orders_count: int,
     pred_line_map: Dict[LineKey, int],
     pred_band_map: Dict[LineKey, BandTuple],
+    key_source_map: Optional[Dict[LineKey, str]],
+    key_meta_map: Optional[Dict[LineKey, Dict[str, float]]],
     naive_line_map: Dict[LineKey, int],
     actual_line_map: Dict[LineKey, int],
     case_pack_by_sap: Dict[str, int],
@@ -615,6 +635,41 @@ def _compute_fold_metrics(
     order_wape_model = (order_abs_err_model / order_actual_total) if order_actual_total > 0 else 0.0
     order_wape_naive = (order_abs_err_naive / order_actual_total) if order_actual_total > 0 else 0.0
 
+    key_source_map = key_source_map or {}
+    key_meta_map = key_meta_map or {}
+
+    def _segment_stats(selector) -> Dict[str, float]:
+        seg_keys = [k for k in keys if selector(k)]
+        if not seg_keys:
+            return {
+                "line_count": 0.0,
+                "wape": 0.0,
+                "over_rate": 0.0,
+            }
+        a = np.array([actual_line_map.get(k, 0) for k in seg_keys], dtype=float)
+        p = np.array([pred_line_map.get(k, 0) for k in seg_keys], dtype=float)
+        denom = float(np.sum(np.abs(a)))
+        over = float(np.mean(p > a)) if len(seg_keys) else 0.0
+        return {
+            "line_count": float(len(seg_keys)),
+            "wape": float(np.sum(np.abs(p - a)) / denom) if denom > 0 else 0.0,
+            "over_rate": over,
+        }
+
+    slow_stats = _segment_stats(
+        lambda k: key_source_map.get(k) == "slow_intermittent"
+        or float((key_meta_map.get(k, {}) or {}).get("is_slow_mover", 0.0)) >= 1.0
+    )
+    stale14_stats = _segment_stats(
+        lambda k: float((key_meta_map.get(k, {}) or {}).get("days_since_last_order", 0.0)) >= 14.0
+    )
+    stale21_stats = _segment_stats(
+        lambda k: float((key_meta_map.get(k, {}) or {}).get("days_since_last_order", 0.0)) >= 21.0
+    )
+    high_removal_stats = _segment_stats(
+        lambda k: float((key_meta_map.get(k, {}) or {}).get("corr_removal_rate", 0.0)) >= 0.50
+    )
+
     return {
         "route_number": route_number,
         "schedule_key": schedule_key,
@@ -655,6 +710,18 @@ def _compute_fold_metrics(
         "order_total_abs_error_naive": float(order_abs_err_naive),
         "order_total_wape_model": float(order_wape_model),
         "order_total_wape_naive": float(order_wape_naive),
+        "segment_slow_line_count": int(slow_stats["line_count"]),
+        "segment_slow_line_wape_model": float(slow_stats["wape"]),
+        "segment_slow_over_rate_model": float(slow_stats["over_rate"]),
+        "segment_stale14_line_count": int(stale14_stats["line_count"]),
+        "segment_stale14_line_wape_model": float(stale14_stats["wape"]),
+        "segment_stale14_over_rate_model": float(stale14_stats["over_rate"]),
+        "segment_stale21_line_count": int(stale21_stats["line_count"]),
+        "segment_stale21_line_wape_model": float(stale21_stats["wape"]),
+        "segment_stale21_over_rate_model": float(stale21_stats["over_rate"]),
+        "segment_high_removal_line_count": int(high_removal_stats["line_count"]),
+        "segment_high_removal_line_wape_model": float(high_removal_stats["wape"]),
+        "segment_high_removal_over_rate_model": float(high_removal_stats["over_rate"]),
     }
 
 
@@ -759,6 +826,14 @@ def _summarize_scorecard(folds_df: pd.DataFrame, since_days: int) -> pd.DataFram
                 "mean_line_band_median_width_units_10_90": float(g["line_band_median_width_units_10_90"].mean()),
                 "order_zero_touch_rate_model": float(g["order_zero_touch_model"].mean()),
                 "order_zero_touch_rate_naive": float(g["order_zero_touch_naive"].mean()),
+                "mean_segment_slow_line_wape_model": float(g["segment_slow_line_wape_model"].mean()),
+                "mean_segment_slow_over_rate_model": float(g["segment_slow_over_rate_model"].mean()),
+                "mean_segment_stale14_line_wape_model": float(g["segment_stale14_line_wape_model"].mean()),
+                "mean_segment_stale14_over_rate_model": float(g["segment_stale14_over_rate_model"].mean()),
+                "mean_segment_stale21_line_wape_model": float(g["segment_stale21_line_wape_model"].mean()),
+                "mean_segment_stale21_over_rate_model": float(g["segment_stale21_over_rate_model"].mean()),
+                "mean_segment_high_removal_line_wape_model": float(g["segment_high_removal_line_wape_model"].mean()),
+                "mean_segment_high_removal_over_rate_model": float(g["segment_high_removal_over_rate_model"].mean()),
                 "observed_correction_line_rate_proxy": float(obs.get("observed_correction_line_rate_proxy", 0.0)),
                 "observed_corrected_order_rate_proxy": float(obs.get("observed_corrected_order_rate_proxy", 0.0)),
                 "observed_avg_abs_correction_delta": float(obs.get("observed_avg_abs_correction_delta", 0.0)),
@@ -1035,6 +1110,7 @@ def run_backtest(
                     )
                     pred_line_map = _order_to_line_map(last_same_schedule)
                     key_source_map = {k: "last_order_anchor" for k in pred_line_map.keys()}
+                    key_meta_map: Dict[LineKey, Dict[str, float]] = {}
                     pred_band_map = {
                         k: (
                             max(0.0, float(v) * 0.7),
@@ -1062,6 +1138,7 @@ def run_backtest(
 
                     pred_line_map = _build_pred_line_map(preds_df)
                     key_source_map = _build_key_source_map(preds_df)
+                    key_meta_map = _build_key_meta_map(preds_df)
                     pred_band_map = _build_pred_band_map(
                         preds_df,
                         center_offset_units=band_center_offset,
@@ -1076,6 +1153,8 @@ def run_backtest(
                     train_orders_count=len(train_orders),
                     pred_line_map=pred_line_map,
                     pred_band_map=pred_band_map,
+                    key_source_map=key_source_map,
+                    key_meta_map=key_meta_map,
                     naive_line_map=naive_line_map,
                     actual_line_map=actual_line_map,
                     case_pack_by_sap=case_pack_by_sap,

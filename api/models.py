@@ -330,6 +330,7 @@ class OrderHistoryResponse(BaseModel):
     total: int
     offset: int
     limit: int
+    nextCursor: Optional[str] = None
 
 
 class ErrorResponse(BaseModel):

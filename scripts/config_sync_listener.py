@@ -47,7 +47,8 @@ def get_pg_connection() -> psycopg2.extensions.connection:
             user=os.environ.get('POSTGRES_USER', 'routespark'),
             password=os.environ.get('POSTGRES_PASSWORD', ''),
         )
-        _pg_conn.autocommit = True
+        # Keep autocommit disabled so each sync unit can commit/rollback atomically.
+        _pg_conn.autocommit = False
     return _pg_conn
 
 
@@ -64,9 +65,10 @@ def get_known_routes() -> Set[str]:
     """Get all known route numbers from routes_synced table."""
     try:
         conn = get_pg_connection()
-        with conn.cursor() as cur:
-            cur.execute("SELECT route_number FROM routes_synced")
-            return {row[0] for row in cur.fetchall()}
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT route_number FROM routes_synced")
+                return {row[0] for row in cur.fetchall()}
     except Exception as e:
         print(f"  [!] Error fetching known routes: {e}")
         return set()
@@ -89,64 +91,130 @@ def sync_store_to_pg(route_number: str, store_id: str, data: dict, deleted: bool
     conn = get_pg_connection()
 
     try:
-        with conn.cursor() as cur:
-            if deleted:
-                # Mark store as inactive
+        with conn:
+            with conn.cursor() as cur:
+                if deleted:
+                    # Mark store as inactive
+                    cur.execute("""
+                        UPDATE stores SET is_active = FALSE, synced_at = %s
+                        WHERE store_id = %s
+                    """, [now, store_id])
+
+                    # Mark all store items as inactive
+                    cur.execute("""
+                        UPDATE store_items SET is_active = FALSE, removed_at = %s, synced_at = %s
+                        WHERE store_id = %s
+                    """, [now, now, store_id])
+
+                    print(f"  [Store] Marked inactive: {store_id}")
+                    return
+
+                # Extract delivery_days - can be array or string
+                delivery_days = data.get('deliveryDays', [])
+                if isinstance(delivery_days, list):
+                    delivery_days_str = json.dumps(delivery_days)
+                else:
+                    delivery_days_str = str(delivery_days) if delivery_days else '[]'
+
+                # Upsert store
                 cur.execute("""
-                    UPDATE stores SET is_active = FALSE, synced_at = %s
-                    WHERE store_id = %s
-                """, [now, store_id])
+                    INSERT INTO stores (store_id, route_number, store_name, store_number, address, delivery_days, is_active, synced_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (store_id) DO UPDATE SET
+                        store_name = EXCLUDED.store_name,
+                        store_number = EXCLUDED.store_number,
+                        address = EXCLUDED.address,
+                        delivery_days = EXCLUDED.delivery_days,
+                        is_active = EXCLUDED.is_active,
+                        synced_at = EXCLUDED.synced_at
+                """, [
+                    store_id,
+                    route_number,
+                    data.get('name', ''),
+                    data.get('number', ''),
+                    data.get('address', ''),
+                    delivery_days_str,
+                    data.get('isActive', True),
+                    now,
+                ])
 
-                # Mark all store items as inactive
-                cur.execute("""
-                    UPDATE store_items SET is_active = FALSE, removed_at = %s, synced_at = %s
-                    WHERE store_id = %s
-                """, [now, now, store_id])
+                # Sync store items (items is an array field on the store doc, not a subcollection)
+                items = data.get('items', [])
+                if items:
+                    sync_store_items(route_number, store_id, items, conn=conn)
 
-                print(f"  [Store] Marked inactive: {store_id}")
-                return
-
-            # Extract delivery_days - can be array or string
-            delivery_days = data.get('deliveryDays', [])
-            if isinstance(delivery_days, list):
-                delivery_days_str = json.dumps(delivery_days)
-            else:
-                delivery_days_str = str(delivery_days) if delivery_days else '[]'
-
-            # Upsert store
-            cur.execute("""
-                INSERT INTO stores (store_id, route_number, store_name, store_number, address, delivery_days, is_active, synced_at)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT (store_id) DO UPDATE SET
-                    store_name = EXCLUDED.store_name,
-                    store_number = EXCLUDED.store_number,
-                    address = EXCLUDED.address,
-                    delivery_days = EXCLUDED.delivery_days,
-                    is_active = EXCLUDED.is_active,
-                    synced_at = EXCLUDED.synced_at
-            """, [
-                store_id,
-                route_number,
-                data.get('name', ''),
-                data.get('number', ''),
-                data.get('address', ''),
-                delivery_days_str,
-                data.get('isActive', True),
-                now,
-            ])
-
-            # Sync store items (items is an array field on the store doc, not a subcollection)
-            items = data.get('items', [])
-            if items:
-                sync_store_items(route_number, store_id, items)
-
-            print(f"  [Store] Synced: {store_id} ({data.get('name', 'unnamed')}) - {len(items)} items")
+                print(f"  [Store] Synced: {store_id} ({data.get('name', 'unnamed')}) - {len(items)} items")
 
     except Exception as e:
         print(f"  [!] Error syncing store {store_id}: {e}")
 
 
-def sync_store_items(route_number: str, store_id: str, items: List[dict]) -> None:
+def _sync_store_items_inner(
+    conn: psycopg2.extensions.connection,
+    route_number: str,
+    store_id: str,
+    items: List[dict],
+    now: str,
+) -> None:
+    # Get current SAPs from the items array
+    current_saps = set()
+    for item in items:
+        sap = item.get('sap') if isinstance(item, dict) else str(item)
+        if sap:
+            current_saps.add(sap)
+
+    with conn.cursor() as cur:
+        # Get existing SAPs for this store
+        cur.execute("""
+            SELECT sap FROM store_items
+            WHERE store_id = %s AND is_active = TRUE
+        """, [store_id])
+        existing_saps = {row[0] for row in cur.fetchall()}
+
+        # Find new items (in current but not in existing)
+        new_saps = current_saps - existing_saps
+
+        # Find removed items (in existing but not in current)
+        removed_saps = existing_saps - current_saps
+
+        # Insert new items
+        if new_saps:
+            rows = []
+            for sap in new_saps:
+                item_id = f"{store_id}-{sap}"
+                rows.append((item_id, store_id, route_number, sap, True, now, now))
+
+            execute_values(
+                cur,
+                """
+                INSERT INTO store_items (id, store_id, route_number, sap, is_active, added_at, synced_at)
+                VALUES %s
+                ON CONFLICT (store_id, sap) DO UPDATE SET
+                    is_active = TRUE,
+                    removed_at = NULL,
+                    synced_at = EXCLUDED.synced_at
+                """,
+                rows,
+            )
+
+        # Mark removed items as inactive
+        if removed_saps:
+            cur.execute("""
+                UPDATE store_items
+                SET is_active = FALSE, removed_at = %s, synced_at = %s
+                WHERE store_id = %s AND sap = ANY(%s)
+            """, [now, now, store_id, list(removed_saps)])
+
+        if new_saps or removed_saps:
+            print(f"    [Items] +{len(new_saps)} -{len(removed_saps)} items for {store_id}")
+
+
+def sync_store_items(
+    route_number: str,
+    store_id: str,
+    items: List[dict],
+    conn: Optional[psycopg2.extensions.connection] = None,
+) -> None:
     """Sync store items array to store_items table.
 
     The items array contains objects with 'sap' field.
@@ -155,60 +223,14 @@ def sync_store_items(route_number: str, store_id: str, items: List[dict]) -> Non
     2. Mark removed items as inactive
     """
     now = datetime.now(timezone.utc).isoformat()
-    conn = get_pg_connection()
+    active_conn = conn or get_pg_connection()
 
     try:
-        # Get current SAPs from the items array
-        current_saps = set()
-        for item in items:
-            sap = item.get('sap') if isinstance(item, dict) else str(item)
-            if sap:
-                current_saps.add(sap)
-
-        with conn.cursor() as cur:
-            # Get existing SAPs for this store
-            cur.execute("""
-                SELECT sap FROM store_items
-                WHERE store_id = %s AND is_active = TRUE
-            """, [store_id])
-            existing_saps = {row[0] for row in cur.fetchall()}
-
-            # Find new items (in current but not in existing)
-            new_saps = current_saps - existing_saps
-
-            # Find removed items (in existing but not in current)
-            removed_saps = existing_saps - current_saps
-
-            # Insert new items
-            if new_saps:
-                rows = []
-                for sap in new_saps:
-                    item_id = f"{store_id}-{sap}"
-                    rows.append((item_id, store_id, route_number, sap, True, now, now))
-
-                execute_values(
-                    cur,
-                    """
-                    INSERT INTO store_items (id, store_id, route_number, sap, is_active, added_at, synced_at)
-                    VALUES %s
-                    ON CONFLICT (store_id, sap) DO UPDATE SET
-                        is_active = TRUE,
-                        removed_at = NULL,
-                        synced_at = EXCLUDED.synced_at
-                    """,
-                    rows,
-                )
-
-            # Mark removed items as inactive
-            if removed_saps:
-                cur.execute("""
-                    UPDATE store_items
-                    SET is_active = FALSE, removed_at = %s, synced_at = %s
-                    WHERE store_id = %s AND sap = ANY(%s)
-                """, [now, now, store_id, list(removed_saps)])
-
-            if new_saps or removed_saps:
-                print(f"    [Items] +{len(new_saps)} -{len(removed_saps)} items for {store_id}")
+        if conn is None:
+            with active_conn:
+                _sync_store_items_inner(active_conn, route_number, store_id, items, now)
+        else:
+            _sync_store_items_inner(active_conn, route_number, store_id, items, now)
 
     except Exception as e:
         print(f"  [!] Error syncing store items for {store_id}: {e}")
@@ -231,49 +253,50 @@ def sync_product_to_pg(route_number: str, sap: str, data: dict, deleted: bool = 
     conn = get_pg_connection()
 
     try:
-        with conn.cursor() as cur:
-            if deleted:
+        with conn:
+            with conn.cursor() as cur:
+                if deleted:
+                    cur.execute("""
+                        UPDATE product_catalog SET is_active = FALSE, synced_at = %s
+                        WHERE sap = %s AND route_number = %s
+                    """, [now, sap, route_number])
+                    print(f"  [Product] Marked inactive: {sap}")
+                    return
+
+                # Get SAP from data if available (some docs use doc ID, some have sap field)
+                actual_sap = data.get('sap', sap)
+
                 cur.execute("""
-                    UPDATE product_catalog SET is_active = FALSE, synced_at = %s
-                    WHERE sap = %s AND route_number = %s
-                """, [now, sap, route_number])
-                print(f"  [Product] Marked inactive: {sap}")
-                return
+                    INSERT INTO product_catalog (
+                        sap, route_number, full_name, short_name, brand, category,
+                        sub_category, case_pack, tray, is_active, synced_at
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (sap, route_number) DO UPDATE SET
+                        full_name = EXCLUDED.full_name,
+                        short_name = EXCLUDED.short_name,
+                        brand = EXCLUDED.brand,
+                        category = EXCLUDED.category,
+                        sub_category = EXCLUDED.sub_category,
+                        case_pack = EXCLUDED.case_pack,
+                        tray = EXCLUDED.tray,
+                        is_active = EXCLUDED.is_active,
+                        synced_at = EXCLUDED.synced_at
+                """, [
+                    actual_sap,
+                    route_number,
+                    data.get('fullName', data.get('name', '')),
+                    data.get('shortName', ''),
+                    data.get('brand', ''),
+                    data.get('category', ''),
+                    data.get('subCategory', ''),
+                    data.get('casePack', 1),
+                    data.get('tray'),  # Can be None
+                    data.get('isActive', True),
+                    now,
+                ])
 
-            # Get SAP from data if available (some docs use doc ID, some have sap field)
-            actual_sap = data.get('sap', sap)
-
-            cur.execute("""
-                INSERT INTO product_catalog (
-                    sap, route_number, full_name, short_name, brand, category,
-                    sub_category, case_pack, tray, is_active, synced_at
-                )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT (sap, route_number) DO UPDATE SET
-                    full_name = EXCLUDED.full_name,
-                    short_name = EXCLUDED.short_name,
-                    brand = EXCLUDED.brand,
-                    category = EXCLUDED.category,
-                    sub_category = EXCLUDED.sub_category,
-                    case_pack = EXCLUDED.case_pack,
-                    tray = EXCLUDED.tray,
-                    is_active = EXCLUDED.is_active,
-                    synced_at = EXCLUDED.synced_at
-            """, [
-                actual_sap,
-                route_number,
-                data.get('fullName', data.get('name', '')),
-                data.get('shortName', ''),
-                data.get('brand', ''),
-                data.get('category', ''),
-                data.get('subCategory', ''),
-                data.get('casePack', 1),
-                data.get('tray'),  # Can be None
-                data.get('isActive', True),
-                now,
-            ])
-
-            print(f"  [Product] Synced: {actual_sap} ({data.get('fullName', data.get('name', 'unnamed'))})")
+                print(f"  [Product] Synced: {actual_sap} ({data.get('fullName', data.get('name', 'unnamed'))})")
 
     except Exception as e:
         print(f"  [!] Error syncing product {sap}: {e}")
@@ -300,48 +323,49 @@ def sync_user_schedules_to_pg(route_number: str, user_id: str, order_cycles: Lis
     }
 
     try:
-        with conn.cursor() as cur:
-            # First mark all existing schedules for this route as inactive
-            cur.execute("""
-                UPDATE user_schedules SET is_active = FALSE, synced_at = %s
-                WHERE route_number = %s
-            """, [now, route_number])
-
-            # Insert/update each cycle
-            for i, cycle in enumerate(order_cycles):
-                order_day = cycle.get('orderDay', 1)
-                load_day = cycle.get('loadDay', 3)
-                delivery_day = cycle.get('deliveryDay', 4)
-                schedule_key = day_names.get(order_day, 'unknown')
-
-                schedule_id = f"{route_number}-cycle-{i}"
-
+        with conn:
+            with conn.cursor() as cur:
+                # First mark all existing schedules for this route as inactive
                 cur.execute("""
-                    INSERT INTO user_schedules (
-                        id, route_number, user_id, order_day, load_day, delivery_day,
-                        schedule_key, is_active, synced_at
-                    )
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-                    ON CONFLICT (id) DO UPDATE SET
-                        order_day = EXCLUDED.order_day,
-                        load_day = EXCLUDED.load_day,
-                        delivery_day = EXCLUDED.delivery_day,
-                        schedule_key = EXCLUDED.schedule_key,
-                        is_active = EXCLUDED.is_active,
-                        synced_at = EXCLUDED.synced_at
-                """, [
-                    schedule_id,
-                    route_number,
-                    user_id,
-                    order_day,
-                    load_day,
-                    delivery_day,
-                    schedule_key,
-                    True,
-                    now,
-                ])
+                    UPDATE user_schedules SET is_active = FALSE, synced_at = %s
+                    WHERE route_number = %s
+                """, [now, route_number])
 
-            print(f"  [Schedule] Synced {len(order_cycles)} cycles for route {route_number}")
+                # Insert/update each cycle
+                for i, cycle in enumerate(order_cycles):
+                    order_day = cycle.get('orderDay', 1)
+                    load_day = cycle.get('loadDay', 3)
+                    delivery_day = cycle.get('deliveryDay', 4)
+                    schedule_key = day_names.get(order_day, 'unknown')
+
+                    schedule_id = f"{route_number}-cycle-{i}"
+
+                    cur.execute("""
+                        INSERT INTO user_schedules (
+                            id, route_number, user_id, order_day, load_day, delivery_day,
+                            schedule_key, is_active, synced_at
+                        )
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (id) DO UPDATE SET
+                            order_day = EXCLUDED.order_day,
+                            load_day = EXCLUDED.load_day,
+                            delivery_day = EXCLUDED.delivery_day,
+                            schedule_key = EXCLUDED.schedule_key,
+                            is_active = EXCLUDED.is_active,
+                            synced_at = EXCLUDED.synced_at
+                    """, [
+                        schedule_id,
+                        route_number,
+                        user_id,
+                        order_day,
+                        load_day,
+                        delivery_day,
+                        schedule_key,
+                        True,
+                        now,
+                    ])
+
+                print(f"  [Schedule] Synced {len(order_cycles)} cycles for route {route_number}")
 
     except Exception as e:
         print(f"  [!] Error syncing schedules for route {route_number}: {e}")
@@ -474,13 +498,14 @@ class ConfigSyncManager:
 
         try:
             conn = get_pg_connection()
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute("""
-                    SELECT route_number, user_id
-                    FROM routes_synced
-                    WHERE sync_status = 'ready'
-                """)
-                routes = cur.fetchall()
+            with conn:
+                with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                    cur.execute("""
+                        SELECT route_number, user_id
+                        FROM routes_synced
+                        WHERE sync_status = 'ready'
+                    """)
+                    routes = cur.fetchall()
 
             if not routes:
                 print("  [!] No synced routes found. Listeners will start when first order arrives.")
@@ -539,8 +564,9 @@ def main(sa_path: str):
     # Test PostgreSQL connection
     try:
         conn = get_pg_connection()
-        with conn.cursor() as cur:
-            cur.execute("SELECT 1")
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1")
         print("  [OK] PostgreSQL connection verified")
     except Exception as e:
         print(f"  [!] PostgreSQL connection failed: {e}")
@@ -570,13 +596,14 @@ def main(sa_path: str):
                 # Check for newly synced routes
                 try:
                     conn = get_pg_connection()
-                    with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                        cur.execute("""
-                            SELECT route_number, user_id
-                            FROM routes_synced
-                            WHERE sync_status = 'ready'
-                        """)
-                        routes = cur.fetchall()
+                    with conn:
+                        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                            cur.execute("""
+                                SELECT route_number, user_id
+                                FROM routes_synced
+                                WHERE sync_status = 'ready'
+                            """)
+                            routes = cur.fetchall()
 
                     for row in routes:
                         route_number = row['route_number']

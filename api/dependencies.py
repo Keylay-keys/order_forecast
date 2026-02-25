@@ -112,7 +112,7 @@ def get_firestore() -> firestore.Client:
 # =============================================================================
 
 import psycopg2
-from psycopg2 import pool
+from psycopg2 import pool, extensions
 
 # Thread-safe connection pool (5-10 connections)
 _pg_pool: Optional[pool.ThreadedConnectionPool] = None
@@ -155,8 +155,20 @@ def get_pg_connection():
 
 def return_pg_connection(conn):
     """Return a connection to the pool."""
+    if conn is None:
+        return
+
+    discard = False
     try:
-        get_pg_pool().putconn(conn)
+        # Reset transaction state before returning pooled connection.
+        if not conn.closed and conn.get_transaction_status() != extensions.TRANSACTION_STATUS_IDLE:
+            conn.rollback()
+    except Exception as e:
+        discard = True
+        logger.warning(f"Error resetting pooled connection: {e}")
+
+    try:
+        get_pg_pool().putconn(conn, close=discard)
     except Exception as e:
         logger.warning(f"Error returning connection to pool: {e}")
 

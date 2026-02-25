@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from collections import defaultdict
 from datetime import datetime, timezone
 from typing import Optional, Tuple
 
@@ -299,35 +300,48 @@ def compute_item_allocation_cache(
     schedule_filter = ""
     params: list = [route_number]
     if schedule_key:
-        schedule_filter = "AND schedule_key = %s"
+        schedule_filter = "AND sis.schedule_key = %s"
         params.append(schedule_key)
 
-    items_query = f"""
-    SELECT DISTINCT sap, schedule_key
-    FROM store_item_shares
-    WHERE route_number = %s
+    share_rows = _fetch_all(
+        conn,
+        f"""
+    SELECT
+        sis.sap,
+        sis.schedule_key,
+        sis.store_id,
+        sis.share,
+        sis.total_quantity,
+        sis.order_count,
+        sis.avg_quantity,
+        COALESCE(pc.case_pack, 1) as case_pack
+    FROM store_item_shares sis
+    LEFT JOIN product_catalog pc
+        ON pc.route_number = sis.route_number
+        AND pc.sap = sis.sap
+    WHERE sis.route_number = %s
       {schedule_filter}
-    """
-    items = _fetch_all(conn, items_query, params)
+    ORDER BY sis.sap, sis.schedule_key, sis.share DESC
+    """,
+        params,
+    )
+    if not share_rows:
+        return 0
+
+    grouped_shares: dict[tuple[str, Optional[str]], list[dict]] = defaultdict(list)
+    case_pack_by_item: dict[tuple[str, Optional[str]], float] = {}
+    for row in share_rows:
+        sap = row.get('sap')
+        sched = row.get('schedule_key')
+        key = (sap, sched)
+        grouped_shares[key].append(row)
+        if key not in case_pack_by_item:
+            case_pack_by_item[key] = row.get('case_pack') or 1
 
     inserted = 0
     now = datetime.now(timezone.utc)
     with conn.cursor() as cur:
-        for item in items:
-            sap = item.get('sap')
-            sched = item.get('schedule_key')
-
-            shares = _fetch_all(
-                conn,
-                """
-                SELECT store_id, share, total_quantity, order_count, avg_quantity
-                FROM store_item_shares
-                WHERE route_number = %s AND sap = %s AND schedule_key = %s
-                ORDER BY share DESC
-                """,
-                [route_number, sap, sched],
-            )
-
+        for (sap, sched), shares in grouped_shares.items():
             if not shares:
                 continue
 
@@ -337,12 +351,7 @@ def compute_item_allocation_cache(
             avg_total_qty = total_qty / total_orders if total_orders > 0 else 0
             avg_stores = len([s for s in shares if (s.get('share') or 0) > 0])
 
-            case_pack_row = _fetch_all(
-                conn,
-                "SELECT case_pack FROM product_catalog WHERE sap = %s AND route_number = %s LIMIT 1",
-                [sap, route_number],
-            )
-            case_pack = case_pack_row[0]['case_pack'] if case_pack_row else 1
+            case_pack = case_pack_by_item.get((sap, sched), 1)
             typical_cases = avg_total_qty / case_pack if case_pack and case_pack > 0 else avg_total_qty
 
             top_share = shares[0].get('share') if shares else 0

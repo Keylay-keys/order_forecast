@@ -9,7 +9,10 @@ Performance: Uses direct PostgreSQL connections from pool (no Firestore round-tr
 
 from __future__ import annotations
 
-from typing import Optional, List
+import base64
+import binascii
+import json
+from typing import Optional, List, Tuple
 from datetime import datetime, timedelta
 from fastapi import APIRouter, Depends, Query, HTTPException, Request
 
@@ -30,6 +33,29 @@ from ..middleware.rate_limit import rate_limit_history
 router = APIRouter()
 
 
+def _encode_history_cursor(delivery_date: str, order_id: str) -> str:
+    payload = json.dumps(
+        {"deliveryDate": delivery_date, "orderId": order_id},
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return base64.urlsafe_b64encode(payload).decode("ascii")
+
+
+def _decode_history_cursor(cursor: str) -> Tuple[str, str]:
+    try:
+        payload = base64.urlsafe_b64decode(cursor.encode("ascii")).decode("utf-8")
+        decoded = json.loads(payload)
+        delivery_date = str(decoded.get("deliveryDate") or "")
+        order_id = str(decoded.get("orderId") or "")
+        if not delivery_date or not order_id:
+            raise ValueError("missing fields")
+        # Validate date format to prevent malformed cursor input.
+        datetime.strptime(delivery_date, "%Y-%m-%d")
+        return delivery_date, order_id
+    except (ValueError, json.JSONDecodeError, binascii.Error):
+        raise HTTPException(400, "Invalid history cursor")
+
+
 @router.get(
     "/history",
     response_model=OrderHistoryResponse,
@@ -44,6 +70,7 @@ async def get_order_history(
     request: Request,  # Required for slowapi rate limiting
     route: str = Query(..., pattern=r'^\d{1,10}$', description="Route number"),
     weeks: int = Query(default=12, ge=1, le=52, description="Weeks of history"),
+    cursor: Optional[str] = Query(default=None, description="Keyset cursor from prior response"),
     offset: int = Query(default=0, ge=0, description="Pagination offset"),
     limit: int = Query(default=50, ge=1, le=200, description="Results per page"),
     decoded_token: dict = Depends(verify_firebase_token),
@@ -52,6 +79,7 @@ async def get_order_history(
     """Get paginated order history for a route.
     
     Returns orders from the last N weeks, sorted by delivery date descending.
+    Supports keyset pagination via cursor. OFFSET remains for compatibility.
     
     Security:
     - Requires valid Firebase token
@@ -80,9 +108,22 @@ async def get_order_history(
         """, [route, cutoff_date])
         count_result = cur.fetchone()
         total = count_result[0] if count_result else 0
-        
+
+        cursor_clause = ""
+        query_params = [route, cutoff_date, route, cutoff_date]
+        if cursor:
+            cursor_date, cursor_order_id = _decode_history_cursor(cursor)
+            cursor_clause = "AND (o.delivery_date, o.order_id) < (%s::date, %s)"
+            query_params.extend([cursor_date, cursor_order_id])
+
+        pagination_clause = "LIMIT %s"
+        query_params.append(limit)
+        if not cursor and offset > 0:
+            pagination_clause += " OFFSET %s"
+            query_params.append(offset)
+
         # Fetch orders with pagination (derive total_cases when missing)
-        cur.execute("""
+        cur.execute(f"""
             WITH cases_by_order AS (
                 SELECT
                     li.order_id,
@@ -115,10 +156,10 @@ async def get_order_history(
                 ON c.order_id = o.order_id
             WHERE o.route_number = %s
               AND o.delivery_date >= %s
-            ORDER BY o.delivery_date DESC
-            LIMIT %s
-            OFFSET %s
-        """, [route, cutoff_date, route, cutoff_date, limit, offset])
+              {cursor_clause}
+            ORDER BY o.delivery_date DESC, o.order_id DESC
+            {pagination_clause}
+        """, query_params)
         rows = cur.fetchall()
         
         cur.close()
@@ -141,13 +182,23 @@ async def get_order_history(
                 status=row[9] or 'finalized'
             ))
         
+        next_cursor = None
+        if rows and len(rows) == limit:
+            last_row = rows[-1]
+            next_cursor = _encode_history_cursor(str(last_row[3]), str(last_row[0]))
+
         return OrderHistoryResponse(
             items=items,
             total=total,
-            offset=offset,
-            limit=limit
+            offset=offset if not cursor else 0,
+            limit=limit,
+            nextCursor=next_cursor,
         )
         
+    except HTTPException:
+        if conn is not None:
+            return_pg_connection(conn)
+        raise
     except Exception as e:
         if conn is not None:
             return_pg_connection(conn)

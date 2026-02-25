@@ -786,6 +786,7 @@ def _create_indexes(cur) -> None:
     indexes = [
         # Order indexes
         ("idx_orders_route_schedule", "orders_historical", "route_number, schedule_key"),
+        ("idx_orders_route_delivery", "orders_historical", "route_number, delivery_date"),
         ("idx_orders_delivery_date", "orders_historical", "delivery_date"),
         
         # Line item indexes
@@ -797,6 +798,7 @@ def _create_indexes(cur) -> None:
         # Correction indexes
         ("idx_corrections_store_sap", "forecast_corrections", "store_id, sap"),
         ("idx_corrections_route_schedule", "forecast_corrections", "route_number, schedule_key"),
+        ("idx_corrections_route_delivery", "forecast_corrections", "route_number, delivery_date"),
         
         # Store alias indexes
         ("idx_store_aliases_lookup", "store_id_aliases", "route_number, alias_id"),

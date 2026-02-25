@@ -1083,26 +1083,57 @@ def _load_corrections_from_postgres(route_number: str, schedule_key: str) -> Opt
     """
     
     try:
-        # Aggregate corrections by store/sap/schedule
-        # Only use non-holiday corrections for training features
-        rows = fetch_all("""
-            SELECT 
+        # Aggregate corrections by store/sap/schedule using recency weighting.
+        # Added-line behavior (predicted=0, final>0) is tracked explicitly via add_rate/avg_add_units.
+        half_life_days = float(os.environ.get("FORECAST_CORR_RECENCY_HALF_LIFE_DAYS", "42"))
+        rows = fetch_all(
+            """
+            WITH base AS (
+                SELECT
+                    store_id,
+                    sap,
+                    schedule_key,
+                    correction_delta,
+                    correction_ratio,
+                    was_removed,
+                    promo_active,
+                    predicted_units,
+                    final_units,
+                    POWER(
+                        0.5,
+                        GREATEST(
+                            0.0,
+                            (CURRENT_DATE - COALESCE(delivery_date::date, submitted_at::date, CURRENT_DATE))::float
+                        ) / %s
+                    ) AS recency_w
+                FROM forecast_corrections
+                WHERE route_number = %s
+                  AND schedule_key = %s
+                  AND is_holiday_week = FALSE
+            )
+            SELECT
                 store_id,
                 sap,
                 schedule_key,
                 COUNT(*) as samples,
-                AVG(correction_delta) as avg_delta,
-                AVG(correction_ratio) as avg_ratio,
+                SUM(correction_delta * recency_w) / NULLIF(SUM(recency_w), 0) as avg_delta,
+                SUM(correction_ratio * recency_w) / NULLIF(SUM(recency_w), 0) as avg_ratio,
                 STDDEV(correction_ratio) as ratio_stddev,
-                SUM(CASE WHEN was_removed THEN 1 ELSE 0 END)::FLOAT / COUNT(*) as removal_rate,
-                SUM(CASE WHEN promo_active THEN 1 ELSE 0 END)::FLOAT / COUNT(*) as promo_rate
-            FROM forecast_corrections
-            WHERE route_number = %s
-              AND schedule_key = %s
-              AND is_holiday_week = FALSE
+                SUM((CASE WHEN was_removed THEN 1 ELSE 0 END) * recency_w) / NULLIF(SUM(recency_w), 0) as removal_rate,
+                SUM((CASE WHEN promo_active THEN 1 ELSE 0 END) * recency_w) / NULLIF(SUM(recency_w), 0) as promo_rate,
+                SUM((CASE WHEN predicted_units = 0 AND final_units > 0 THEN 1 ELSE 0 END) * recency_w)
+                    / NULLIF(SUM(recency_w), 0) as add_rate,
+                SUM((CASE WHEN predicted_units = 0 AND final_units > 0 THEN final_units ELSE 0 END) * recency_w)
+                    / NULLIF(
+                        SUM(CASE WHEN predicted_units = 0 AND final_units > 0 THEN recency_w ELSE 0 END),
+                        0
+                    ) as avg_add_units
+            FROM base
             GROUP BY store_id, sap, schedule_key
             HAVING COUNT(*) >= 1
-        """, [route_number, schedule_key])
+            """,
+            [half_life_days, route_number, schedule_key],
+        )
         if not rows:
             print(f"[forecast] No corrections found for route {route_number}, schedule {schedule_key}")
             return None
@@ -1583,6 +1614,10 @@ def _build_features(df: pd.DataFrame, corrections_df: Optional[pd.DataFrame] = N
     out_frames = []
     for (store_id, sap), grp in df.groupby(["store_id", "sap"]):
         g = grp.sort_values("delivery_date").copy()
+        g["prev_delivery_date"] = g["delivery_date"].shift(1)
+        g["days_since_last_order"] = (
+            g["delivery_date"] - g["prev_delivery_date"]
+        ).dt.days
         g["lag_1"] = g["units"].shift(1)
         g["lag_2"] = g["units"].shift(2)
         g["rolling_mean_4"] = g["units"].rolling(window=4, min_periods=1).mean().shift(1)
@@ -1595,6 +1630,7 @@ def _build_features(df: pd.DataFrame, corrections_df: Optional[pd.DataFrame] = N
     feat["lag_2"] = feat["lag_2"].fillna(0.0)
     feat["rolling_mean_4"] = feat["rolling_mean_4"].fillna(feat["lag_1"])
     feat["rolling_mean_13"] = feat["rolling_mean_13"].fillna(feat["rolling_mean_4"])
+    feat["days_since_last_order"] = feat["days_since_last_order"].fillna(999.0)
     feat["trend_delta_4_13"] = feat["rolling_mean_4"] - feat["rolling_mean_13"]
     feat["trend_ratio_4_13"] = (
         feat["rolling_mean_4"]
@@ -1658,6 +1694,8 @@ def _build_features(df: pd.DataFrame, corrections_df: Optional[pd.DataFrame] = N
             "ratio_stddev": "corr_ratio_stddev",
             "removal_rate": "corr_removal_rate",
             "promo_rate": "corr_promo_rate",
+            "add_rate": "corr_add_rate",
+            "avg_add_units": "corr_avg_add_units",
         }
         corr = corr.rename(columns=rename)
         # Drop schedule_key before merge since it was used for filtering, not joining
@@ -1674,6 +1712,8 @@ def _build_features(df: pd.DataFrame, corrections_df: Optional[pd.DataFrame] = N
             "corr_ratio_stddev",
             "corr_removal_rate",
             "corr_promo_rate",
+            "corr_add_rate",
+            "corr_avg_add_units",
         ]:
             feat[col] = feat.get(col, 0.0).fillna(0.0)
     else:
@@ -1684,6 +1724,8 @@ def _build_features(df: pd.DataFrame, corrections_df: Optional[pd.DataFrame] = N
             "corr_ratio_stddev",
             "corr_removal_rate",
             "corr_promo_rate",
+            "corr_add_rate",
+            "corr_avg_add_units",
         ]:
             feat[col] = 0.0
 
@@ -1724,6 +1766,106 @@ def _predict_slow_intermittent_units(row: pd.Series) -> float:
         expected_size = max(lag_1, rolling_mean_4, lag_2, 0.0)
 
     return max(0.0, order_prob * expected_size)
+
+
+def _compute_slow_suppression_days(order_frequency: float) -> int:
+    """Dynamic suppression window for slow-mover repeat recommendations."""
+    min_days = int(os.environ.get("SLOW_MOVER_SUPPRESSION_MIN_DAYS", "14"))
+    max_days = int(os.environ.get("SLOW_MOVER_SUPPRESSION_MAX_DAYS", "42"))
+    base_cycle_days = float(os.environ.get("SLOW_MOVER_BASE_CYCLE_DAYS", "7.0"))
+    factor = float(os.environ.get("SLOW_MOVER_SUPPRESSION_FACTOR", "0.80"))
+    freq_floor = float(os.environ.get("SLOW_MOVER_SUPPRESSION_FREQ_FLOOR", "0.05"))
+
+    freq = max(freq_floor, float(order_frequency or 0.0))
+    expected_gap = base_cycle_days / freq
+    dynamic_days = int(round(expected_gap * factor))
+    return max(min_days, min(max_days, dynamic_days))
+
+
+def _apply_correction_damping(row: pd.Series, pred_units: float) -> float:
+    """Apply deterministic correction feedback to the point estimate.
+
+    Captures both sides of feedback:
+      - predicted>0 then user zeroed (removals): damp down aggressively
+      - predicted=0 then user added lines: modest upward nudge
+    """
+    pred = max(0.0, float(pred_units or 0.0))
+    if pred <= 0:
+        return 0.0
+
+    corr_samples = float(row.get("corr_samples", 0.0) or 0.0)
+    if corr_samples <= 0:
+        return pred
+
+    corr_avg_ratio = float(row.get("corr_avg_ratio", 1.0) or 1.0)
+    corr_avg_delta = float(row.get("corr_avg_delta", 0.0) or 0.0)
+    corr_removal_rate = max(0.0, min(1.0, float(row.get("corr_removal_rate", 0.0) or 0.0)))
+    corr_add_rate = max(0.0, min(1.0, float(row.get("corr_add_rate", 0.0) or 0.0)))
+    corr_avg_add_units = max(0.0, float(row.get("corr_avg_add_units", 0.0) or 0.0))
+    days_since_last = float(row.get("days_since_last_order", 999.0) or 999.0)
+
+    full_effect_samples = float(os.environ.get("FORECAST_CORR_FULL_EFFECT_SAMPLES", "6"))
+    sample_strength = max(0.0, min(1.0, corr_samples / max(1.0, full_effect_samples)))
+
+    removal_mult = 1.0 - min(
+        0.92,
+        corr_removal_rate * float(os.environ.get("FORECAST_CORR_REMOVAL_MULT_SCALE", "0.95")),
+    )
+    ratio_mult = min(1.0, max(0.10, corr_avg_ratio))
+    downward_target = min(removal_mult, ratio_mult)
+
+    adjusted = pred * ((1.0 - sample_strength) + sample_strength * downward_target)
+
+    # If user frequently adds after zero forecast, nudge up cautiously.
+    if corr_add_rate > 0.0 and corr_avg_add_units > 0.0:
+        add_weight = float(os.environ.get("FORECAST_CORR_ADD_DELTA_WEIGHT", "0.25"))
+        add_strength = sample_strength * max(0.0, 1.0 - corr_removal_rate) * corr_add_rate
+        add_cap = min(corr_avg_add_units, max(2.0, pred * 0.60))
+        adjusted += add_cap * add_strength * add_weight
+
+    # Hard-zero guardrail for repeated removals on stale lines.
+    hard_zero_min_samples = float(os.environ.get("FORECAST_CORR_HARD_ZERO_MIN_SAMPLES", "3"))
+    hard_zero_removal = float(os.environ.get("FORECAST_CORR_HARD_ZERO_REMOVAL_RATE", "0.80"))
+    hard_zero_stale_days = float(os.environ.get("FORECAST_CORR_HARD_ZERO_MIN_STALE_DAYS", "14"))
+    if (
+        corr_samples >= hard_zero_min_samples
+        and corr_removal_rate >= hard_zero_removal
+        and days_since_last >= hard_zero_stale_days
+    ):
+        return 0.0
+
+    # Small negative correction bias should still reduce output slightly.
+    if corr_avg_delta < 0:
+        adjusted += max(corr_avg_delta * 0.15, -max(2.0, pred * 0.35))
+
+    return max(0.0, adjusted)
+
+
+def _should_zero_low_signal_slow_line(row: pd.Series, case_pack: Optional[int]) -> bool:
+    """Pre-allocation gate to prevent tiny slow-mover predictions from becoming full cases."""
+    if not case_pack or case_pack <= 0:
+        return False
+
+    pred_units = float(row.get("pred_units", 0.0) or 0.0)
+    confidence = float(row.get("confidence", 0.0) or 0.0)
+    corr_removal_rate = float(row.get("corr_removal_rate", 0.0) or 0.0)
+    corr_samples = float(row.get("corr_samples", 0.0) or 0.0)
+    days_since_last = float(row.get("days_since_last_order", 999.0) or 999.0)
+
+    min_case_fraction = float(os.environ.get("SLOW_MOVER_MIN_CASE_FRACTION_GATE", "0.60"))
+    low_conf_threshold = float(os.environ.get("SLOW_MOVER_LOW_CONFIDENCE_GATE", "0.55"))
+    removal_threshold = float(os.environ.get("SLOW_MOVER_REMOVAL_RATE_GATE", "0.50"))
+    min_samples = float(os.environ.get("SLOW_MOVER_REMOVAL_MIN_SAMPLES_GATE", "2"))
+    stale_days = float(os.environ.get("SLOW_MOVER_STALE_DAYS_GATE", "14"))
+
+    return (
+        pred_units > 0.0
+        and pred_units < (float(case_pack) * min_case_fraction)
+        and confidence < low_conf_threshold
+        and corr_samples >= min_samples
+        and corr_removal_rate >= removal_threshold
+        and days_since_last >= stale_days
+    )
 
 
 def _compute_prediction_confidence(row: pd.Series, branch: str) -> float:
@@ -1937,6 +2079,7 @@ def _train_and_predict(
         "rolling_mean_13",
         "trend_delta_4_13",
         "trend_ratio_4_13",
+        "days_since_last_order",
         # Calendar features
         "delivery_dow",
         "delivery_month",
@@ -1963,6 +2106,8 @@ def _train_and_predict(
         "corr_ratio_stddev",
         "corr_removal_rate",
         "corr_promo_rate",
+        "corr_add_rate",
+        "corr_avg_add_units",
     ]
 
     # Training data: all rows with lag_1 available
@@ -2000,6 +2145,11 @@ def _train_and_predict(
         row["delivery_quarter"] = (target_date.month - 1) // 3 + 1
         row["is_monday_delivery"] = 1 if target_date.weekday() == 0 else 0
         row["is_first_weekend_of_month"] = 1 if (target_date.day <= 7 and target_date.weekday() >= 5) else 0
+        try:
+            last_delivery_dt = pd.to_datetime(last.get("delivery_date"))
+            row["days_since_last_order"] = float(max(0, (target_date - last_delivery_dt.to_pydatetime()).days))
+        except Exception:
+            row["days_since_last_order"] = float(row.get("days_since_last_order", 999.0) or 999.0)
         
         # NEW: Schedule-aware features for target date
         row["days_until_first_weekend"] = target_schedule_feats["days_until_first_weekend"]
@@ -2021,7 +2171,8 @@ def _train_and_predict(
         use_slow_branch = slow_branch_enabled and (is_slow_flag or order_frequency <= slow_threshold)
 
         if use_slow_branch:
-            pred_units = _predict_slow_intermittent_units(row)
+            raw_pred_units = _predict_slow_intermittent_units(row)
+            pred_units = _apply_correction_damping(row, raw_pred_units)
             confidence = _compute_prediction_confidence(row, branch="slow_intermittent")
             p10_units, p50_units, p90_units = _compute_prediction_bands(
                 row=row,
@@ -2033,7 +2184,8 @@ def _train_and_predict(
             slow_branch_count += 1
         else:
             model_input = pd.DataFrame([row], columns=feature_cols)
-            pred_units = float(model.predict(model_input)[0])
+            raw_pred_units = float(model.predict(model_input)[0])
+            pred_units = _apply_correction_damping(row, raw_pred_units)
             confidence = _compute_prediction_confidence(row, branch="gbr")
             p10_units, p50_units, p90_units = _compute_prediction_bands(
                 row=row,
@@ -2056,6 +2208,15 @@ def _train_and_predict(
                 "model_branch": "slow_intermittent" if use_slow_branch else "gbr",
                 "confidence": confidence,
                 "confidence_bucket": _confidence_bucket(confidence),
+                "order_frequency": float(row.get("order_frequency", 0.0) or 0.0),
+                "is_slow_mover": int(row.get("is_slow_mover", 0) or 0),
+                "days_since_last_order": float(row.get("days_since_last_order", 999.0) or 999.0),
+                "corr_samples": float(row.get("corr_samples", 0.0) or 0.0),
+                "corr_removal_rate": float(row.get("corr_removal_rate", 0.0) or 0.0),
+                "corr_avg_ratio": float(row.get("corr_avg_ratio", 1.0) or 1.0),
+                "corr_avg_delta": float(row.get("corr_avg_delta", 0.0) or 0.0),
+                "corr_add_rate": float(row.get("corr_add_rate", 0.0) or 0.0),
+                "corr_avg_add_units": float(row.get("corr_avg_add_units", 0.0) or 0.0),
             }
         )
 
@@ -2208,32 +2369,40 @@ def generate_forecast(config: ForecastConfig) -> ForecastPayload:
     
     # Cross-cycle suppression: find items ordered in OTHER schedules recently
     # This prevents double-ordering slow movers (e.g., ordered Tuesday, now Monday forecast)
+    cross_cycle_lookback_days = int(os.environ.get("SLOW_MOVER_CROSS_CYCLE_LOOKBACK_DAYS", "7"))
     cross_cycle_orders = _get_cross_cycle_orders(
         route_number=config.route_number,
         current_schedule=schedule_key,
         target_delivery_date=delivery_iso,
-        lookback_days=7,  # Suppress if ordered within 7 days in another cycle
+        lookback_days=cross_cycle_lookback_days,
     )
     
     # Same-cycle recent orders: find slow movers ordered in THIS schedule recently
     # Prevents recommending a slow mover that was just ordered 7 days ago in the same cycle
+    same_cycle_lookback_days = int(os.environ.get("SLOW_MOVER_SAME_CYCLE_LOOKBACK_DAYS", "42"))
     same_cycle_recent = _get_same_cycle_recent_orders(
         route_number=config.route_number,
         current_schedule=schedule_key,
         target_delivery_date=delivery_iso,
-        lookback_days=21,  # Slow movers: suppress if ordered within 21 days in same cycle
+        lookback_days=same_cycle_lookback_days,
     )
     if same_cycle_recent:
-        print(f"[forecast] Found {len(same_cycle_recent)} SAPs ordered in same cycle within 21 days")
+        print(
+            f"[forecast] Found {len(same_cycle_recent)} SAPs ordered in same cycle "
+            f"within {same_cycle_lookback_days} days"
+        )
     
     same_cycle_recent_by_store = _get_same_cycle_recent_orders_by_store(
         route_number=config.route_number,
         current_schedule=schedule_key,
         target_delivery_date=delivery_iso,
-        lookback_days=21,
+        lookback_days=same_cycle_lookback_days,
     )
     if same_cycle_recent_by_store:
-        print(f"[forecast] Found {len(same_cycle_recent_by_store)} store/SAPs ordered in same cycle within 21 days")
+        print(
+            f"[forecast] Found {len(same_cycle_recent_by_store)} store/SAPs ordered in same cycle "
+            f"within {same_cycle_lookback_days} days"
+        )
     
     # SAP velocity tiers: SLOW (≤25%), MEDIUM (25-60%), FAST (>60%)
     # Used for tiered suppression logic - slow movers get rule-based handling
@@ -2460,6 +2629,39 @@ def generate_forecast(config: ForecastConfig) -> ForecastPayload:
         band_scale=band_scale,
     )
 
+    # Segment observability: surface cohorts that were previously masked in route-level aggregates.
+    try:
+        if not preds.empty:
+            slow_mask = (
+                (preds.get("model_branch", "") == "slow_intermittent")
+                | (preds.get("is_slow_mover", 0).astype(float) >= 1.0)
+            )
+            stale14_mask = preds.get("days_since_last_order", 0).astype(float) >= 14.0
+            stale21_mask = preds.get("days_since_last_order", 0).astype(float) >= 21.0
+            high_removal_mask = preds.get("corr_removal_rate", 0).astype(float) >= 0.50
+
+            def _seg(mask: pd.Series, label: str):
+                subset = preds[mask] if label else preds
+                count = int(len(subset))
+                units = float(subset.get("pred_units", pd.Series(dtype=float)).sum()) if count else 0.0
+                positive = int((subset.get("pred_units", pd.Series(dtype=float)) > 0).sum()) if count else 0
+                return count, units, positive
+
+            slow_count, slow_units, slow_positive = _seg(slow_mask, "slow")
+            stale14_count, stale14_units, stale14_positive = _seg(stale14_mask, "stale14")
+            stale21_count, stale21_units, stale21_positive = _seg(stale21_mask, "stale21")
+            hi_rm_count, hi_rm_units, hi_rm_positive = _seg(high_removal_mask, "hi_rm")
+
+            print(
+                "[forecast] Segment snapshot: "
+                f"slow(lines={slow_count}, units={slow_units:.1f}, positive={slow_positive}) "
+                f"stale14(lines={stale14_count}, units={stale14_units:.1f}, positive={stale14_positive}) "
+                f"stale21(lines={stale21_count}, units={stale21_units:.1f}, positive={stale21_positive}) "
+                f"high_removal(lines={hi_rm_count}, units={hi_rm_units:.1f}, positive={hi_rm_positive})"
+            )
+    except Exception as e:
+        print(f"[forecast] Warning: segment observability failed: {e}")
+
     # Allocate per SAP using total-case rounding + share distribution
     items: List[ForecastItem] = []
     suppressed_slow_movers: List[str] = []  # Track what we suppressed
@@ -2491,6 +2693,9 @@ def generate_forecast(config: ForecastConfig) -> ForecastPayload:
         if is_slow and is_shared_case:
             # Shared-case slow movers: route-level home cycle suppression (single restock event)
             home_cycle = tier_info.home_cycle if tier_info else None
+            slow_suppression_days = _compute_slow_suppression_days(
+                float(tier_info.order_frequency if tier_info else 0.25)
+            )
             
             if home_cycle:
                 if schedule_key != home_cycle:
@@ -2511,9 +2716,10 @@ def generate_forecast(config: ForecastConfig) -> ForecastPayload:
                     continue
                 else:
                     days_ago = same_cycle_recent.get(sap_str)
-                    if days_ago is not None and days_ago < 14:
+                    if days_ago is not None and days_ago < slow_suppression_days:
                         suppressed_slow_movers.append(
-                            f"{sap_str} (SLOW shared, home={home_cycle}, same-cycle {days_ago}d ago)"
+                            f"{sap_str} (SLOW shared, home={home_cycle}, same-cycle {days_ago}d ago, "
+                            f"window={slow_suppression_days}d)"
                         )
                         continue
             else:
@@ -2530,9 +2736,10 @@ def generate_forecast(config: ForecastConfig) -> ForecastPayload:
                     continue
                 
                 days_ago = same_cycle_recent.get(sap_str)
-                if days_ago is not None and days_ago < 14:
+                if days_ago is not None and days_ago < slow_suppression_days:
                     suppressed_slow_movers.append(
-                        f"{sap_str} (SLOW shared, no home, same-cycle {days_ago}d ago)"
+                        f"{sap_str} (SLOW shared, no home, same-cycle {days_ago}d ago, "
+                        f"window={slow_suppression_days}d)"
                     )
                     continue
         
@@ -2561,6 +2768,8 @@ def generate_forecast(config: ForecastConfig) -> ForecastPayload:
 
             # Store-specific slow-mover suppression (non-shared case)
             if is_slow and not is_shared_case:
+                store_order_freq = float(row.get("order_frequency", 0.0) or 0.0)
+                slow_suppression_days = _compute_slow_suppression_days(store_order_freq)
                 store_home = store_sap_home_cycles.get((store_id, sap_str))
                 if store_home:
                     home_cycle = store_home[0]
@@ -2570,9 +2779,10 @@ def generate_forecast(config: ForecastConfig) -> ForecastPayload:
                         )
                         continue
                     days_ago = same_cycle_recent_by_store.get((store_id, sap_str))
-                    if days_ago is not None and days_ago < 14:
+                    if days_ago is not None and days_ago < slow_suppression_days:
                         suppressed_slow_movers.append(
-                            f"{sap_str} (SLOW store={store_id}, home={home_cycle}, same-cycle {days_ago}d ago)"
+                            f"{sap_str} (SLOW store={store_id}, home={home_cycle}, same-cycle {days_ago}d ago, "
+                            f"window={slow_suppression_days}d)"
                         )
                         continue
                 else:
@@ -2583,11 +2793,21 @@ def generate_forecast(config: ForecastConfig) -> ForecastPayload:
                         )
                         continue
                     days_ago = same_cycle_recent_by_store.get((store_id, sap_str))
-                    if days_ago is not None and days_ago < 14:
+                    if days_ago is not None and days_ago < slow_suppression_days:
                         suppressed_slow_movers.append(
-                            f"{sap_str} (SLOW store={store_id}, no home, same-cycle {days_ago}d ago)"
+                            f"{sap_str} (SLOW store={store_id}, no home, same-cycle {days_ago}d ago, "
+                            f"window={slow_suppression_days}d)"
                         )
                         continue
+
+            # Prevent tiny low-signal slow-mover recommendations from being promoted to full cases.
+            if is_slow and _should_zero_low_signal_slow_line(row, case_pack):
+                suppressed_slow_movers.append(
+                    f"{sap_str} (SLOW gate, store={store_id}, pred={float(row.get('pred_units', 0.0) or 0.0):.2f}, "
+                    f"conf={float(row.get('confidence', 0.0) or 0.0):.2f}, "
+                    f"removal={float(row.get('corr_removal_rate', 0.0) or 0.0):.2f})"
+                )
+                continue
             store_pred_map[store_id] = float(row["pred_units"])
             p50_units = float(row.get("p50_units", row.get("pred_units", 0.0)) or 0.0)
             store_p10_map[store_id] = float(row.get("p10_units", p50_units) or p50_units)
