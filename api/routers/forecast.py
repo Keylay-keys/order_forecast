@@ -500,7 +500,8 @@ async def apply_forecast(
     now = datetime.utcnow()
 
     for item in items:
-        if item.get("recommendedUnits", 0) <= 0:
+        has_prior = bool(item.get("priorOrderContext"))
+        if item.get("recommendedUnits", 0) <= 0 and not has_prior:
             continue
         store_id = item.get("storeId")
         sap = item.get("sap")

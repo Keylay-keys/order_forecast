@@ -421,7 +421,7 @@ def handle_sync_order(conn: psycopg2.extensions.connection, db: firestore.Client
         # Collect line items and corrections for batch insert
         line_item_rows = []
         correction_rows = []
-        ordered_map: Dict[str, int] = {}  # "{storeId}::{sap}" -> final units (only >0 appear in order docs)
+        ordered_map: Dict[str, int] = {}  # "{storeId}::{sap}" -> final units synced to Postgres (>0 only)
         
         for store in stores:
             raw_store_id = store.get('id', store.get('storeId', ''))
