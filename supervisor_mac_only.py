@@ -41,6 +41,7 @@ LOG_DIR = BASE_DIR / 'logs'
 PCF_DIR = Path('/Users/kylemacmini/projects/pcf_pipeline')
 PCF_VENV_PYTHON = PCF_DIR / '.venv' / 'bin' / 'python'
 PCF_SA_PATH = PCF_DIR / 'config' / 'serviceAccountKey.json'
+PCF_START_SCRIPT = PCF_DIR / 'scripts' / 'start_listener.sh'
 
 # Service account
 DEFAULT_SA_PATH = '/Users/kylemacmini/Desktop/dev/firebase-tools/routespark-1f47d-firebase-adminsdk-tnv5k-b259331cbc.json'
@@ -53,12 +54,21 @@ PCF_ARCHIVE_SYNC_ON_WRITE = '0'  # Don't sync on each OCR run, use nightly sync
 class Service:
     """Represents a managed background service."""
     
-    def __init__(self, name: str, cmd: List[str], log_file: Path, cwd: Optional[Path] = None, env: Optional[dict] = None):
+    def __init__(
+        self,
+        name: str,
+        cmd: List[str],
+        log_file: Path,
+        cwd: Optional[Path] = None,
+        env: Optional[dict] = None,
+        use_caffeinate: bool = True,
+    ):
         self.name = name
         self.cmd = cmd
         self.log_file = log_file
         self.cwd = cwd or BASE_DIR
         self.env = env  # Additional environment variables
+        self.use_caffeinate = use_caffeinate
         self.process: Optional[subprocess.Popen] = None
     
     def start(self) -> bool:
@@ -76,8 +86,10 @@ class Service:
             log_handle.write(f"{'='*60}\n")
             log_handle.flush()
             
-            # Wrap in caffeinate to prevent Mac sleep
-            actual_cmd = ['caffeinate', '-is'] + self.cmd
+            actual_cmd = self.cmd
+            if self.use_caffeinate:
+                # Wrap in caffeinate to prevent Mac sleep
+                actual_cmd = ['caffeinate', '-is'] + self.cmd
             
             # Merge environment variables
             proc_env = os.environ.copy()
@@ -154,7 +166,7 @@ def create_services() -> List[Service]:
     )
     
     # PCF OCR Listener (macOS Vision)
-    if PCF_DIR.exists() and PCF_VENV_PYTHON.exists():
+    if PCF_DIR.exists() and PCF_START_SCRIPT.exists():
         # Environment for PCF archive - keep local during day, sync at night
         pcf_env = {
             'PCF_ARCHIVE_REMOTE': PCF_ARCHIVE_REMOTE,
@@ -164,15 +176,13 @@ def create_services() -> List[Service]:
             Service(
                 name="PCF OCR Listener",
                 cmd=[
-                    str(PCF_VENV_PYTHON),
-                    '-m', 'pcf_core.runner',
-                    '--watch-all',
-                    '--credential', str(PCF_SA_PATH),
-                    '--bucket', 'routespark-1f47d.firebasestorage.app',
+                    '/bin/bash',
+                    str(PCF_START_SCRIPT),
                 ],
                 log_file=LOG_DIR / 'pcf_listener.log',
                 cwd=PCF_DIR,
                 env=pcf_env,
+                use_caffeinate=False,  # Wrapper script handles caffeinate + restart behavior
             )
         )
     else:

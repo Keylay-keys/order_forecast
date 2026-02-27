@@ -413,9 +413,10 @@ def _resolve_apple_transaction(
     environment_hint: Optional[Literal["Sandbox", "Production"]],
 ) -> Dict[str, Any]:
     bearer = _build_apple_server_api_jwt()
+    env_order = _apple_environment_order(environment_hint)
     attempts: List[Dict[str, Any]] = []
     terminal_error: Optional[AppleVerificationError] = None
-    for env in _apple_environment_order(environment_hint):
+    for idx, env in enumerate(env_order):
         try:
             response = _apple_request_json(
                 path=f"/inApps/v1/transactions/{url_parse.quote(transaction_id, safe='')}",
@@ -432,11 +433,32 @@ def _resolve_apple_transaction(
                     "details": exc.details,
                 }
             )
-            # Keep trying cross-environment only for lookup misses.
-            if exc.status_code != 404:
-                terminal_error = exc
-                break
+            # Keep trying cross-environment for lookup misses. Also retry 401
+            # across environments when caller did not provide an explicit
+            # environment hint. Apple often returns 401 in the wrong
+            # environment for sandbox transactions.
+            can_retry_cross_env = (
+                idx < len(env_order) - 1
+                and (
+                    exc.status_code == 404
+                    or (environment_hint is None and exc.status_code == 401)
+                )
+            )
+            if can_retry_cross_env:
+                continue
+            terminal_error = exc
+            break
     if terminal_error:
+        status_codes = {int(a.get("statusCode") or 0) for a in attempts}
+        # Mixed 401/404 across environments is treated as "not found" from the
+        # caller perspective (credentials worked in at least one environment).
+        if 404 in status_codes and status_codes.issubset({401, 404}):
+            _raise_apple_error(
+                status_code=422,
+                error="Unable to resolve Apple transaction",
+                code="APPLE_TRANSACTION_NOT_FOUND",
+                details={"transactionId": transaction_id, "attempts": attempts},
+            )
         _raise_apple_error(
             status_code=terminal_error.status_code,
             error=terminal_error.error,

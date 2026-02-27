@@ -49,6 +49,7 @@ LOG_DIR = BASE_DIR / 'logs'
 PCF_DIR = Path('/Users/kylemacmini/projects/pcf_pipeline')
 PCF_VENV_PYTHON = PCF_DIR / '.venv' / 'bin' / 'python'
 PCF_SA_PATH = PCF_DIR / 'config' / 'serviceAccountKey.json'
+PCF_START_SCRIPT = PCF_DIR / 'scripts' / 'start_listener.sh'
 
 # Default config
 DEFAULT_ROUTE = '989262'
@@ -59,12 +60,21 @@ DEFAULT_DB_PATH = BASE_DIR / 'data' / 'analytics.duckdb'
 class Service:
     """Represents a managed background service."""
     
-    def __init__(self, name: str, cmd: List[str], log_file: Path, cwd: Optional[Path] = None, use_caffeinate: bool = True):
+    def __init__(
+        self,
+        name: str,
+        cmd: List[str],
+        log_file: Path,
+        cwd: Optional[Path] = None,
+        use_caffeinate: bool = True,
+        env: Optional[Dict[str, str]] = None,
+    ):
         self.name = name
         self.cmd = cmd
         self.log_file = log_file
         self.cwd = cwd or BASE_DIR
         self.use_caffeinate = use_caffeinate
+        self.env = env
         self.process: Optional[subprocess.Popen] = None
     
     def start(self) -> bool:
@@ -88,12 +98,17 @@ class Service:
             actual_cmd = self.cmd
             if self.use_caffeinate:
                 actual_cmd = ['caffeinate', '-is'] + self.cmd
+
+            proc_env = os.environ.copy()
+            if self.env:
+                proc_env.update(self.env)
             
             self.process = subprocess.Popen(
                 actual_cmd,
                 stdout=log_handle,
                 stderr=subprocess.STDOUT,
                 cwd=str(self.cwd),
+                env=proc_env,
             )
             
             # Give it a moment to start
@@ -287,19 +302,17 @@ def create_services(route: str, sa_path: str, db_path: str) -> List[Service]:
     )
     
     # Add PCF OCR Listener if the project exists
-    if PCF_DIR.exists() and PCF_VENV_PYTHON.exists():
+    if PCF_DIR.exists() and PCF_START_SCRIPT.exists():
         services.append(
             Service(
                 name="PCF OCR Listener",
                 cmd=[
-                    str(PCF_VENV_PYTHON),
-                    '-m', 'pcf_core.runner',
-                    '--watch-all',
-                    '--credential', str(PCF_SA_PATH),
-                    '--bucket', 'routespark-1f47d.firebasestorage.app',
+                    '/bin/bash',
+                    str(PCF_START_SCRIPT),
                 ],
                 log_file=LOG_DIR / 'pcf_listener.log',
                 cwd=PCF_DIR,  # Run from PCF project directory
+                use_caffeinate=False,  # Wrapper script already applies caffeinate + restart loop
             )
         )
     
