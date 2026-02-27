@@ -3211,6 +3211,40 @@ def generate_forecast(config: ForecastConfig) -> ForecastPayload:
         # Continue - do not block forecast generation on logging/filtering issues
 
     # ==========================================================================
+    # PRIOR-OVERLAP SUPPRESSION (CROSS-CYCLE ONLY)
+    # ==========================================================================
+    # If forecast item carries prior_order_context, it came from overlapping
+    # delivery logic across a different schedule. Keep the line visible for
+    # "Prior" warning UX, but suppress ordering quantity to zero.
+    prior_suppressed = 0
+    prior_suppressed_samples: List[str] = []
+    for it in items:
+        prior_ctx = getattr(it, "prior_order_context", None)
+        if not prior_ctx:
+            continue
+        current_units = float(getattr(it, "recommended_units", 0.0) or 0.0)
+        if current_units <= 0:
+            continue
+
+        if len(prior_suppressed_samples) < 10:
+            prior_suppressed_samples.append(
+                f"store_id={getattr(it, 'store_id', '')} sap={getattr(it, 'sap', '')} "
+                f"was={current_units:.2f}"
+            )
+
+        it.recommended_units = 0.0
+        it.recommended_cases = 0.0
+        it.p10_units = 0.0
+        it.p50_units = 0.0
+        it.p90_units = 0.0
+        prior_suppressed += 1
+
+    if prior_suppressed:
+        print(f"[forecast] Prior-overlap suppression: zeroed {prior_suppressed} line(s)")
+        for msg in prior_suppressed_samples:
+            print(f"  - {msg}")
+
+    # ==========================================================================
     # WHOLE-CASE ENFORCEMENT (ORDER-LEVEL)
     # ==========================================================================
     # Invariant: each SAP must be ordered in full cases at the ORDER level
