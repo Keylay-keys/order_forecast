@@ -17,6 +17,8 @@ RouteSpark.app/
 data/ip_blocklist.json
 data/latest_forecast.json
 data/calendar_features.csv
+data/*.duckdb
+data/*.duckdb-*
 data_for_upload/
 parsed_orders_batch_no_catalog/
 forecast_monday_no_1215.csv
