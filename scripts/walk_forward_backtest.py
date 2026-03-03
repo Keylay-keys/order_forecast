@@ -369,27 +369,121 @@ def _inject_training_schedule_features(df_orders: pd.DataFrame) -> Tuple[pd.Data
 
 def _load_temporal_corrections(route_number: str, schedule_key: str, cutoff_dt: datetime) -> Optional[pd.DataFrame]:
     """Load correction aggregates only from history strictly before test cutoff."""
+    half_life_days = float(os.environ.get("FORECAST_CORR_RECENCY_HALF_LIFE_DAYS", "42"))
+    cutoff_date = cutoff_dt.date()
     rows = fetch_all(
         """
+        WITH ranked AS (
+            SELECT
+                correction_id,
+                order_id,
+                store_id,
+                sap,
+                schedule_key,
+                correction_delta,
+                correction_ratio,
+                was_removed,
+                promo_active,
+                predicted_units,
+                final_units,
+                delivery_date,
+                submitted_at,
+                ROW_NUMBER() OVER (
+                    PARTITION BY route_number, schedule_key, order_id, store_id, sap
+                    ORDER BY submitted_at DESC, correction_id DESC
+                ) AS dedupe_rn
+            FROM forecast_corrections
+            WHERE route_number = %s
+              AND schedule_key = %s
+              AND is_holiday_week = FALSE
+              AND submitted_at < %s
+        ),
+        base AS (
+            SELECT
+                store_id,
+                sap,
+                schedule_key,
+                correction_delta,
+                correction_ratio,
+                was_removed,
+                promo_active,
+                predicted_units,
+                final_units,
+                delivery_date,
+                submitted_at,
+                POWER(
+                    0.5,
+                    GREATEST(
+                        0.0,
+                        (%s::date - COALESCE(delivery_date::date, submitted_at::date, %s::date))::float
+                    ) / %s
+                ) AS recency_w
+            FROM ranked
+            WHERE dedupe_rn = 1
+        ),
+        recent_streak AS (
+            SELECT
+                store_id,
+                sap,
+                schedule_key,
+                CASE
+                    WHEN MIN(CASE WHEN was_removed THEN NULL ELSE rn END) IS NULL THEN MAX(rn)
+                    ELSE GREATEST(MIN(CASE WHEN was_removed THEN NULL ELSE rn END) - 1, 0)
+                END AS recent_removal_streak
+            FROM (
+                SELECT
+                    store_id,
+                    sap,
+                    schedule_key,
+                    was_removed,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY store_id, sap, schedule_key
+                        ORDER BY COALESCE(delivery_date::date, submitted_at::date, %s::date) DESC, submitted_at DESC
+                    ) AS rn
+                FROM base
+            ) ordered
+            GROUP BY store_id, sap, schedule_key
+        ),
+        agg AS (
+            SELECT
+                store_id,
+                sap,
+                schedule_key,
+                COUNT(*) AS samples,
+                SUM(correction_delta * recency_w) / NULLIF(SUM(recency_w), 0) AS avg_delta,
+                SUM(correction_ratio * recency_w) / NULLIF(SUM(recency_w), 0) AS avg_ratio,
+                STDDEV(correction_ratio) AS ratio_stddev,
+                SUM((CASE WHEN was_removed THEN 1 ELSE 0 END) * recency_w) / NULLIF(SUM(recency_w), 0) AS removal_rate,
+                SUM((CASE WHEN promo_active THEN 1 ELSE 0 END) * recency_w) / NULLIF(SUM(recency_w), 0) AS promo_rate,
+                SUM((CASE WHEN predicted_units = 0 AND final_units > 0 THEN 1 ELSE 0 END) * recency_w)
+                    / NULLIF(SUM(recency_w), 0) AS add_rate,
+                SUM((CASE WHEN predicted_units = 0 AND final_units > 0 THEN final_units ELSE 0 END) * recency_w)
+                    / NULLIF(
+                        SUM(CASE WHEN predicted_units = 0 AND final_units > 0 THEN recency_w ELSE 0 END),
+                        0
+                    ) AS avg_add_units
+            FROM base
+            GROUP BY store_id, sap, schedule_key
+            HAVING COUNT(*) >= 1
+        )
         SELECT
-            store_id,
-            sap,
-            schedule_key,
-            COUNT(*) AS samples,
-            AVG(correction_delta) AS avg_delta,
-            AVG(correction_ratio) AS avg_ratio,
-            STDDEV(correction_ratio) AS ratio_stddev,
-            SUM(CASE WHEN was_removed THEN 1 ELSE 0 END)::FLOAT / COUNT(*) AS removal_rate,
-            SUM(CASE WHEN promo_active THEN 1 ELSE 0 END)::FLOAT / COUNT(*) AS promo_rate
-        FROM forecast_corrections
-        WHERE route_number = %s
-          AND schedule_key = %s
-          AND is_holiday_week = FALSE
-          AND submitted_at < %s
-        GROUP BY store_id, sap, schedule_key
-        HAVING COUNT(*) >= 1
+            agg.*,
+            COALESCE(rs.recent_removal_streak, 0) AS recent_removal_streak
+        FROM agg
+        LEFT JOIN recent_streak rs
+            ON rs.store_id = agg.store_id
+           AND rs.sap = agg.sap
+           AND rs.schedule_key = agg.schedule_key
         """,
-        [route_number, schedule_key, cutoff_dt],
+        [
+            route_number,
+            schedule_key,
+            cutoff_dt,
+            cutoff_date,
+            cutoff_date,
+            half_life_days,
+            cutoff_date,
+        ],
     )
     if not rows:
         return None
@@ -1131,6 +1225,7 @@ def run_backtest(
                     preds_df = _train_and_predict(
                         feat=feat,
                         target_date=target_dt,
+                        schedule_key=schedule_key,
                         days_until_next=default_gap,
                         active_promos=None,
                         band_scale=band_scale,

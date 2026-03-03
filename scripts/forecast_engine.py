@@ -1077,8 +1077,8 @@ def _load_corrections_from_postgres(route_number: str, schedule_key: str) -> Opt
         schedule_key: Order schedule (e.g., 'monday', 'tuesday')
     
     Returns:
-        DataFrame with columns: store_id, sap, schedule_key, samples, avg_delta, 
-        avg_ratio, ratio_stddev, removal_rate, promo_rate
+        DataFrame with columns: store_id, sap, schedule_key, samples, avg_delta,
+        avg_ratio, ratio_stddev, removal_rate, promo_rate, recent_removal_streak
         Returns None if query fails.
     """
     
@@ -1088,7 +1088,31 @@ def _load_corrections_from_postgres(route_number: str, schedule_key: str) -> Opt
         half_life_days = float(os.environ.get("FORECAST_CORR_RECENCY_HALF_LIFE_DAYS", "42"))
         rows = fetch_all(
             """
-            WITH base AS (
+            WITH ranked AS (
+                SELECT
+                    correction_id,
+                    order_id,
+                    store_id,
+                    sap,
+                    schedule_key,
+                    correction_delta,
+                    correction_ratio,
+                    was_removed,
+                    promo_active,
+                    predicted_units,
+                    final_units,
+                    delivery_date,
+                    submitted_at,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY route_number, schedule_key, order_id, store_id, sap
+                        ORDER BY submitted_at DESC, correction_id DESC
+                    ) AS dedupe_rn
+                FROM forecast_corrections
+                WHERE route_number = %s
+                  AND schedule_key = %s
+                  AND is_holiday_week = FALSE
+            ),
+            base AS (
                 SELECT
                     store_id,
                     sap,
@@ -1099,6 +1123,8 @@ def _load_corrections_from_postgres(route_number: str, schedule_key: str) -> Opt
                     promo_active,
                     predicted_units,
                     final_units,
+                    delivery_date,
+                    submitted_at,
                     POWER(
                         0.5,
                         GREATEST(
@@ -1106,33 +1132,64 @@ def _load_corrections_from_postgres(route_number: str, schedule_key: str) -> Opt
                             (CURRENT_DATE - COALESCE(delivery_date::date, submitted_at::date, CURRENT_DATE))::float
                         ) / %s
                     ) AS recency_w
-                FROM forecast_corrections
-                WHERE route_number = %s
-                  AND schedule_key = %s
-                  AND is_holiday_week = FALSE
+                FROM ranked
+                WHERE dedupe_rn = 1
+            ),
+            recent_streak AS (
+                SELECT
+                    store_id,
+                    sap,
+                    schedule_key,
+                    CASE
+                        WHEN MIN(CASE WHEN was_removed THEN NULL ELSE rn END) IS NULL THEN MAX(rn)
+                        ELSE GREATEST(MIN(CASE WHEN was_removed THEN NULL ELSE rn END) - 1, 0)
+                    END AS recent_removal_streak
+                FROM (
+                    SELECT
+                        store_id,
+                        sap,
+                        schedule_key,
+                        was_removed,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY store_id, sap, schedule_key
+                            ORDER BY COALESCE(delivery_date::date, submitted_at::date, CURRENT_DATE) DESC, submitted_at DESC
+                        ) AS rn
+                    FROM base
+                ) ordered
+                GROUP BY store_id, sap, schedule_key
+            ),
+            agg AS (
+                SELECT
+                    store_id,
+                    sap,
+                    schedule_key,
+                    COUNT(*) as samples,
+                    SUM(correction_delta * recency_w) / NULLIF(SUM(recency_w), 0) as avg_delta,
+                    SUM(correction_ratio * recency_w) / NULLIF(SUM(recency_w), 0) as avg_ratio,
+                    STDDEV(correction_ratio) as ratio_stddev,
+                    SUM((CASE WHEN was_removed THEN 1 ELSE 0 END) * recency_w) / NULLIF(SUM(recency_w), 0) as removal_rate,
+                    SUM((CASE WHEN promo_active THEN 1 ELSE 0 END) * recency_w) / NULLIF(SUM(recency_w), 0) as promo_rate,
+                    SUM((CASE WHEN predicted_units = 0 AND final_units > 0 THEN 1 ELSE 0 END) * recency_w)
+                        / NULLIF(SUM(recency_w), 0) as add_rate,
+                    SUM((CASE WHEN predicted_units = 0 AND final_units > 0 THEN final_units ELSE 0 END) * recency_w)
+                        / NULLIF(
+                            SUM(CASE WHEN predicted_units = 0 AND final_units > 0 THEN recency_w ELSE 0 END),
+                            0
+                        ) as avg_add_units
+                FROM base
+                GROUP BY store_id, sap, schedule_key
+                HAVING COUNT(*) >= 1
             )
             SELECT
-                store_id,
-                sap,
-                schedule_key,
-                COUNT(*) as samples,
-                SUM(correction_delta * recency_w) / NULLIF(SUM(recency_w), 0) as avg_delta,
-                SUM(correction_ratio * recency_w) / NULLIF(SUM(recency_w), 0) as avg_ratio,
-                STDDEV(correction_ratio) as ratio_stddev,
-                SUM((CASE WHEN was_removed THEN 1 ELSE 0 END) * recency_w) / NULLIF(SUM(recency_w), 0) as removal_rate,
-                SUM((CASE WHEN promo_active THEN 1 ELSE 0 END) * recency_w) / NULLIF(SUM(recency_w), 0) as promo_rate,
-                SUM((CASE WHEN predicted_units = 0 AND final_units > 0 THEN 1 ELSE 0 END) * recency_w)
-                    / NULLIF(SUM(recency_w), 0) as add_rate,
-                SUM((CASE WHEN predicted_units = 0 AND final_units > 0 THEN final_units ELSE 0 END) * recency_w)
-                    / NULLIF(
-                        SUM(CASE WHEN predicted_units = 0 AND final_units > 0 THEN recency_w ELSE 0 END),
-                        0
-                    ) as avg_add_units
-            FROM base
-            GROUP BY store_id, sap, schedule_key
-            HAVING COUNT(*) >= 1
+                agg.*,
+                COALESCE(rs.recent_removal_streak, 0) AS recent_removal_streak
+            FROM agg
+            LEFT JOIN recent_streak rs
+                ON rs.store_id = agg.store_id
+               AND rs.sap = agg.sap
+               AND rs.schedule_key = agg.schedule_key
             """,
-            [half_life_days, route_number, schedule_key],
+            [route_number, schedule_key, half_life_days],
         )
         if not rows:
             print(f"[forecast] No corrections found for route {route_number}, schedule {schedule_key}")
@@ -1696,6 +1753,7 @@ def _build_features(df: pd.DataFrame, corrections_df: Optional[pd.DataFrame] = N
             "promo_rate": "corr_promo_rate",
             "add_rate": "corr_add_rate",
             "avg_add_units": "corr_avg_add_units",
+            "recent_removal_streak": "corr_recent_removal_streak",
         }
         corr = corr.rename(columns=rename)
         # Drop schedule_key before merge since it was used for filtering, not joining
@@ -1714,8 +1772,12 @@ def _build_features(df: pd.DataFrame, corrections_df: Optional[pd.DataFrame] = N
             "corr_promo_rate",
             "corr_add_rate",
             "corr_avg_add_units",
+            "corr_recent_removal_streak",
         ]:
-            feat[col] = feat.get(col, 0.0).fillna(0.0)
+            if col in feat.columns:
+                feat[col] = feat[col].fillna(0.0)
+            else:
+                feat[col] = 0.0
     else:
         for col in [
             "corr_samples",
@@ -1726,6 +1788,7 @@ def _build_features(df: pd.DataFrame, corrections_df: Optional[pd.DataFrame] = N
             "corr_promo_rate",
             "corr_add_rate",
             "corr_avg_add_units",
+            "corr_recent_removal_streak",
         ]:
             feat[col] = 0.0
 
@@ -1802,7 +1865,11 @@ def _apply_correction_damping(row: pd.Series, pred_units: float) -> float:
     corr_removal_rate = max(0.0, min(1.0, float(row.get("corr_removal_rate", 0.0) or 0.0)))
     corr_add_rate = max(0.0, min(1.0, float(row.get("corr_add_rate", 0.0) or 0.0)))
     corr_avg_add_units = max(0.0, float(row.get("corr_avg_add_units", 0.0) or 0.0))
+    corr_recent_removal_streak = float(row.get("corr_recent_removal_streak", 0.0) or 0.0)
     days_since_last = float(row.get("days_since_last_order", 999.0) or 999.0)
+    days_since_last_same_schedule = float(
+        row.get("days_since_last_order_same_schedule", days_since_last) or days_since_last
+    )
 
     full_effect_samples = float(os.environ.get("FORECAST_CORR_FULL_EFFECT_SAMPLES", "6"))
     sample_strength = max(0.0, min(1.0, corr_samples / max(1.0, full_effect_samples)))
@@ -1823,14 +1890,29 @@ def _apply_correction_damping(row: pd.Series, pred_units: float) -> float:
         add_cap = min(corr_avg_add_units, max(2.0, pred * 0.60))
         adjusted += add_cap * add_strength * add_weight
 
+    # Repeated same-schedule removals should override optimistic baseline patterns.
+    repeat_min_streak = float(os.environ.get("FORECAST_CORR_REPEAT_REMOVAL_STREAK_MIN", "2"))
+    repeat_min_samples = float(os.environ.get("FORECAST_CORR_REPEAT_REMOVAL_MIN_SAMPLES", "2"))
+    repeat_min_rate = float(os.environ.get("FORECAST_CORR_REPEAT_REMOVAL_MIN_RATE", "0.50"))
+    repeat_min_stale_days = float(os.environ.get("FORECAST_CORR_REPEAT_REMOVAL_MIN_SAME_SCHEDULE_DAYS", "7"))
+    if (
+        corr_samples >= repeat_min_samples
+        and corr_recent_removal_streak >= repeat_min_streak
+        and corr_removal_rate >= repeat_min_rate
+        and days_since_last_same_schedule >= repeat_min_stale_days
+    ):
+        return 0.0
+
     # Hard-zero guardrail for repeated removals on stale lines.
     hard_zero_min_samples = float(os.environ.get("FORECAST_CORR_HARD_ZERO_MIN_SAMPLES", "3"))
     hard_zero_removal = float(os.environ.get("FORECAST_CORR_HARD_ZERO_REMOVAL_RATE", "0.80"))
-    hard_zero_stale_days = float(os.environ.get("FORECAST_CORR_HARD_ZERO_MIN_STALE_DAYS", "14"))
+    hard_zero_stale_days = float(
+        os.environ.get("FORECAST_CORR_HARD_ZERO_MIN_SAME_SCHEDULE_DAYS", "14")
+    )
     if (
         corr_samples >= hard_zero_min_samples
         and corr_removal_rate >= hard_zero_removal
-        and days_since_last >= hard_zero_stale_days
+        and days_since_last_same_schedule >= hard_zero_stale_days
     ):
         return 0.0
 
@@ -2052,6 +2134,7 @@ def _confidence_bucket(confidence: Optional[float]) -> str:
 def _train_and_predict(
     feat: pd.DataFrame,
     target_date: datetime,
+    schedule_key: str,
     days_until_next: int = 4,
     active_promos: Optional[Dict[Tuple[str, str], bool]] = None,
     band_scale: float = 1.0,
@@ -2108,6 +2191,7 @@ def _train_and_predict(
         "corr_promo_rate",
         "corr_add_rate",
         "corr_avg_add_units",
+        "corr_recent_removal_streak",
     ]
 
     # Training data: all rows with lag_1 available
@@ -2132,6 +2216,7 @@ def _train_and_predict(
     
     slow_branch_enabled = os.environ.get("FORECAST_ENABLE_INTERMITTENT_SLOW", "1").lower() in ("1", "true", "yes")
     slow_threshold = float(os.environ.get("SLOW_MOVER_ORDER_FREQ_THRESHOLD", "0.25"))
+    target_schedule_key = str(schedule_key or "").strip().lower()
     slow_branch_count = 0
     gbr_branch_count = 0
 
@@ -2150,6 +2235,26 @@ def _train_and_predict(
             row["days_since_last_order"] = float(max(0, (target_date - last_delivery_dt.to_pydatetime()).days))
         except Exception:
             row["days_since_last_order"] = float(row.get("days_since_last_order", 999.0) or 999.0)
+
+        # Keep same-schedule recency separate from cross-schedule recency so corrections
+        # for one cycle are not muted by demand in another cycle.
+        try:
+            same_sched_grp = grp[
+                grp["schedule_key"].astype(str).str.lower() == target_schedule_key
+            ]
+            if not same_sched_grp.empty:
+                same_sched_last_dt = pd.to_datetime(same_sched_grp["delivery_date"]).max()
+                row["days_since_last_order_same_schedule"] = float(
+                    max(0, (target_date - same_sched_last_dt.to_pydatetime()).days)
+                )
+            else:
+                row["days_since_last_order_same_schedule"] = float(
+                    row.get("days_since_last_order", 999.0) or 999.0
+                )
+        except Exception:
+            row["days_since_last_order_same_schedule"] = float(
+                row.get("days_since_last_order", 999.0) or 999.0
+            )
         
         # NEW: Schedule-aware features for target date
         row["days_until_first_weekend"] = target_schedule_feats["days_until_first_weekend"]
@@ -2211,12 +2316,16 @@ def _train_and_predict(
                 "order_frequency": float(row.get("order_frequency", 0.0) or 0.0),
                 "is_slow_mover": int(row.get("is_slow_mover", 0) or 0),
                 "days_since_last_order": float(row.get("days_since_last_order", 999.0) or 999.0),
+                "days_since_last_order_same_schedule": float(
+                    row.get("days_since_last_order_same_schedule", row.get("days_since_last_order", 999.0)) or 999.0
+                ),
                 "corr_samples": float(row.get("corr_samples", 0.0) or 0.0),
                 "corr_removal_rate": float(row.get("corr_removal_rate", 0.0) or 0.0),
                 "corr_avg_ratio": float(row.get("corr_avg_ratio", 1.0) or 1.0),
                 "corr_avg_delta": float(row.get("corr_avg_delta", 0.0) or 0.0),
                 "corr_add_rate": float(row.get("corr_add_rate", 0.0) or 0.0),
                 "corr_avg_add_units": float(row.get("corr_avg_add_units", 0.0) or 0.0),
+                "corr_recent_removal_streak": float(row.get("corr_recent_removal_streak", 0.0) or 0.0),
             }
         )
 
@@ -2624,6 +2733,7 @@ def generate_forecast(config: ForecastConfig) -> ForecastPayload:
     preds = _train_and_predict(
         feat=feat,
         target_date=target_dt,
+        schedule_key=schedule_key,
         days_until_next=target_days_until_next,
         active_promos=active_promos,
         band_scale=band_scale,

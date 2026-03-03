@@ -94,6 +94,7 @@ def create_schema(conn: psycopg2.extensions.connection) -> None:
     _create_delivery_allocation_tables(cur)
     _create_route_transfer_tables(cur)
     _create_route_sync_tables(cur)
+    _create_forecast_queue_tables(cur)
     _create_notification_tables(cur)
     _create_indexes(cur)
     
@@ -752,6 +753,58 @@ def _create_route_sync_tables(cur) -> None:
 
 
 # =============================================================================
+# FORECAST QUEUE TABLES
+# =============================================================================
+
+def _create_forecast_queue_tables(cur) -> None:
+    """Create durable finalize-event + forecast generation queue tables."""
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS forecast_finalize_events (
+            finalize_key TEXT PRIMARY KEY,
+            route_number VARCHAR(20) NOT NULL,
+            order_id VARCHAR(255) NOT NULL,
+            schedule_key VARCHAR(20),
+            finalized_at TIMESTAMP WITH TIME ZONE NOT NULL,
+            status VARCHAR(20) NOT NULL DEFAULT 'pending',
+            job_keys JSONB NOT NULL DEFAULT '[]'::jsonb,
+            last_error TEXT,
+            source_worker_id VARCHAR(100),
+            created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            processed_at TIMESTAMP WITH TIME ZONE
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS forecast_generation_jobs (
+            job_key TEXT PRIMARY KEY,
+            route_number VARCHAR(20) NOT NULL,
+            schedule_key VARCHAR(20) NOT NULL,
+            delivery_date DATE NOT NULL,
+            source VARCHAR(32) NOT NULL,
+            finalize_key TEXT REFERENCES forecast_finalize_events(finalize_key) ON DELETE SET NULL,
+            status VARCHAR(20) NOT NULL DEFAULT 'queued',
+            attempts INTEGER NOT NULL DEFAULT 0,
+            max_attempts INTEGER NOT NULL DEFAULT 5,
+            trigger_count INTEGER NOT NULL DEFAULT 1,
+            available_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            claimed_by VARCHAR(100),
+            claimed_at TIMESTAMP WITH TIME ZONE,
+            started_at TIMESTAMP WITH TIME ZONE,
+            finished_at TIMESTAMP WITH TIME ZONE,
+            skipped_reason TEXT,
+            last_error TEXT,
+            created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            last_triggered_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    print("  ✓ Forecast queue tables created")
+
+
+# =============================================================================
 # NOTIFICATION TABLES
 # =============================================================================
 
@@ -832,6 +885,11 @@ def _create_indexes(cur) -> None:
         ("idx_route_transfers_from", "route_transfers", "from_route_number"),
         ("idx_route_transfers_to", "route_transfers", "to_route_number"),
         ("idx_route_transfers_sap_date", "route_transfers", "sap, transfer_date"),
+
+        # Forecast queue indexes
+        ("idx_forecast_finalize_route_status", "forecast_finalize_events", "route_number, status"),
+        ("idx_forecast_jobs_route_status_available", "forecast_generation_jobs", "route_number, status, available_at"),
+        ("idx_forecast_jobs_status_available", "forecast_generation_jobs", "status, available_at"),
     ]
     
     for name, table, columns in indexes:
@@ -861,6 +919,7 @@ def get_table_counts(conn: psycopg2.extensions.connection) -> dict:
         'delivery_allocations',
         'route_transfers',
         'routes_synced', 'sync_log',
+        'forecast_finalize_events', 'forecast_generation_jobs',
         'low_qty_notifications_sent'
     ]
     
@@ -892,6 +951,7 @@ def print_schema_summary(conn: psycopg2.extensions.connection) -> None:
         "Case Allocation": ['item_allocation_cache', 'store_item_shares'],
         "Delivery": ['delivery_allocations'],
         "Route Sync": ['routes_synced', 'sync_log'],
+        "Forecast Queue": ['forecast_finalize_events', 'forecast_generation_jobs'],
         "Notifications": ['low_qty_notifications_sent']
     }
     

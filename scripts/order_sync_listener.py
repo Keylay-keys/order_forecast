@@ -37,6 +37,27 @@ except ImportError:
     from forecast_engine import ForecastConfig, generate_forecast
 
 try:
+    from .forecast_generation_queue import (
+        coerce_finalized_at,
+        enqueue_finalize_jobs,
+        ensure_forecast_queue_tables,
+        mark_finalize_event_error,
+        process_generation_jobs_for_route,
+        reconcile_finalize_event,
+        register_finalize_event,
+    )
+except ImportError:
+    from forecast_generation_queue import (
+        coerce_finalized_at,
+        enqueue_finalize_jobs,
+        ensure_forecast_queue_tables,
+        mark_finalize_event_error,
+        process_generation_jobs_for_route,
+        reconcile_finalize_event,
+        register_finalize_event,
+    )
+
+try:
     from google.cloud.firestore_v1.base_query import FieldFilter
 except Exception:
     FieldFilter = None  # type: ignore
@@ -264,6 +285,27 @@ def _maybe_generate_next_forecast_after_finalization(fb_client: firestore.Client
         # Whole-case invariant or other hard gate: skip emission and keep listener running.
         print(f"     ❌ Forecast skipped (hard gate): {e}")
         return
+
+
+def _forecast_on_finalize_enabled() -> bool:
+    return os.environ.get('FORECAST_ON_FINALIZE', '0').lower() in ('1', 'true', 'yes')
+
+
+def _extract_finalized_at(data: dict) -> datetime:
+    timestamps = data.get('timestamps') if isinstance(data.get('timestamps'), dict) else {}
+    candidates = [
+        data.get('finalizedAt'),
+        data.get('statusFinalizedAt'),
+        data.get('statusUpdatedAt'),
+        timestamps.get('finalizedAt'),
+        data.get('updatedAt'),
+        data.get('createdAt'),
+    ]
+    for value in candidates:
+        parsed = coerce_finalized_at(value, fallback_now=False)
+        if parsed is not None:
+            return parsed
+    return datetime.now(timezone.utc)
 
 
 # =============================================================================
@@ -656,11 +698,28 @@ def handle_finalized_order(fb_client: firestore.Client, order_id: str, data: dic
     route_number = data.get('routeNumber')
     user_id = data.get('userId')
     schedule_key = data.get('scheduleKey')
+    finalized_at = _extract_finalized_at(data)
+    finalize_event_key = None
     
     if not route_number:
         return
     
     print(f"  ✅ Order finalized: {order_id}")
+
+    if _forecast_on_finalize_enabled():
+        try:
+            event_row = register_finalize_event(
+                route_number=str(route_number),
+                order_id=str(order_id),
+                schedule_key=schedule_key,
+                finalized_at_raw=finalized_at,
+                worker_id=WORKER_ID,
+            )
+            finalize_event_key = event_row.get('finalize_key')
+            if event_row.get('status') == 'processed':
+                print(f"     ⏭️  Finalize event already processed: {finalize_event_key}")
+        except Exception as e:
+            print(f"     ⚠️  Failed to register finalize event: {e}")
     
     # Use db_manager_pg's sync_order handler
     try:
@@ -670,6 +729,11 @@ def handle_finalized_order(fb_client: firestore.Client, order_id: str, data: dic
         })
         if 'error' in result:
             print(f"     ⚠️  Sync error: {result['error']}")
+            if finalize_event_key:
+                try:
+                    mark_finalize_event_error(str(finalize_event_key), f"sync_error:{result['error']}")
+                except Exception as e:
+                    print(f"     ⚠️  Failed to mark finalize event error: {e}")
         else:
             print(f"     Synced {result.get('totalUnits', 0)} units across {result.get('storeCount', 0)} stores")
             corrections_count = result.get('correctionsExtracted', 0)
@@ -687,9 +751,45 @@ def handle_finalized_order(fb_client: firestore.Client, order_id: str, data: dic
             #   2. Manually via run_forecast.py when needed
             # The daemon already incorporates corrections when generating forecasts.
             # regenerate_forecasts_after_finalization(fb_client, route_number, user_id)
-            _maybe_generate_next_forecast_after_finalization(fb_client, route_number)
+            if _forecast_on_finalize_enabled():
+                queue_result = enqueue_finalize_jobs(
+                    route_number=str(route_number),
+                    order_id=str(order_id),
+                    schedule_key=schedule_key,
+                    finalized_at_raw=finalized_at,
+                    worker_id=WORKER_ID,
+                )
+                queue_status = queue_result.get('status')
+                if queue_status == 'already_processed':
+                    print(f"     ⏭️  Forecast queue skipped (already processed): {queue_result.get('finalize_key')}")
+                elif queue_status == 'queued':
+                    sa_path = os.environ.get('GOOGLE_APPLICATION_CREDENTIALS') or '/app/config/serviceAccountKey.json'
+                    stats = process_generation_jobs_for_route(
+                        fb_client=fb_client,
+                        route_number=str(route_number),
+                        worker_id=WORKER_ID,
+                        sa_path=sa_path,
+                        max_jobs=int(os.environ.get('FORECAST_FINALIZE_MAX_JOBS_PER_EVENT', '4')),
+                    )
+                    reconciliation = reconcile_finalize_event(str(queue_result.get('finalize_key')))
+                    print(
+                        "     🧠 Forecast queue:"
+                        f" claimed={stats.get('claimed', 0)} done={stats.get('done', 0)}"
+                        f" skipped={stats.get('skipped_fresh', 0)}"
+                        f" retry_or_error={stats.get('retry_or_error', 0)}"
+                        f" finalize_status={reconciliation.get('status')}"
+                    )
+                else:
+                    print(f"     ℹ️  Forecast queue result: {queue_status}")
+            else:
+                _maybe_generate_next_forecast_after_finalization(fb_client, route_number)
     except Exception as e:
         print(f"     ❌ Error syncing order: {e}")
+        if finalize_event_key:
+            try:
+                mark_finalize_event_error(str(finalize_event_key), f"sync_exception:{e}")
+            except Exception:
+                pass
 
 
 def regenerate_forecasts_after_finalization(
@@ -1389,6 +1489,11 @@ def watch_all_orders(sa_path: str):
     print(f"\n   Press Ctrl+C to stop\n")
     
     fb_client = get_firestore_client(sa_path)
+    if _forecast_on_finalize_enabled():
+        try:
+            ensure_forecast_queue_tables()
+        except Exception as e:
+            print(f"⚠️  Failed to ensure forecast queue tables: {e}")
     # Watch all orders
     orders_col = fb_client.collection_group('orders')
     

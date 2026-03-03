@@ -22,24 +22,34 @@ from __future__ import annotations
 
 import argparse
 import os
+import socket
 import time
 from datetime import datetime, timedelta
 
 from google.cloud import firestore
 
 try:
-    from .forecast_engine import ForecastConfig, generate_forecast
     from .pg_utils import execute, fetch_all, fetch_one
     from .band_calibration import calibrate_route_if_due
+    from .forecast_generation_queue import (
+        enqueue_generation_job,
+        ensure_forecast_queue_tables,
+        process_generation_jobs_for_route,
+    )
     from .learning_snapshot_refresh import refresh_learning_snapshots
 except ImportError:
-    from forecast_engine import ForecastConfig, generate_forecast
     from pg_utils import execute, fetch_all, fetch_one
     from band_calibration import calibrate_route_if_due
+    from forecast_generation_queue import (
+        enqueue_generation_job,
+        ensure_forecast_queue_tables,
+        process_generation_jobs_for_route,
+    )
     from learning_snapshot_refresh import refresh_learning_snapshots
 
 DEFAULT_INTERVAL = 86400  # 24 hours (once per day)
 DEFAULT_SA_PATH = '/Users/kylemacmini/Desktop/dev/firebase-tools/routespark-1f47d-firebase-adminsdk-tnv5k-b259331cbc.json'
+WORKER_ID = f"retrain-daemon-{socket.gethostname()}-{__import__('os').getpid()}"
 
 def log(msg: str):
     """Print timestamped log message."""
@@ -297,37 +307,6 @@ def write_forecast_status(fb_client: firestore.Client, route_number: str, order_
         log(f"    ⚠️  Error writing forecast status: {e}")
 
 
-def forecast_exists(fb_client: firestore.Client, route_number: str, delivery_date: str, schedule_key: str) -> bool:
-    """Check if a valid (non-expired) forecast already exists for this date/schedule."""
-    try:
-        cached_ref = fb_client.collection('forecasts').document(route_number).collection('cached')
-        # Query for matching forecasts
-        from google.cloud.firestore_v1.base_query import FieldFilter
-        query = cached_ref.where(filter=FieldFilter('deliveryDate', '==', delivery_date)).where(filter=FieldFilter('scheduleKey', '==', schedule_key))
-        
-        for doc in query.stream():
-            data = doc.to_dict()
-            expires_at = data.get('expiresAt')
-            if expires_at:
-                # Check if not expired
-                from datetime import datetime, timezone
-                if hasattr(expires_at, 'timestamp'):
-                    # Firestore Timestamp
-                    if expires_at.timestamp() > datetime.now(timezone.utc).timestamp():
-                        return True
-                else:
-                    # Already a datetime
-                    if expires_at > datetime.now(timezone.utc):
-                        return True
-            else:
-                # No expiry, consider it valid
-                return True
-        return False
-    except Exception as e:
-        log(f"    ⚠️  Error checking forecast existence: {e}")
-        return False
-
-
 def generate_forecasts_for_route(
     fb_client: firestore.Client,
     route_number: str,
@@ -345,45 +324,35 @@ def generate_forecasts_for_route(
         log(f"    No upcoming delivery dates found")
         return 0
     
-    generated = 0
+    queued = 0
     for delivery in upcoming:
         delivery_date = delivery['delivery_date']
         schedule_key = delivery['schedule_key']
-        
-        # Skip if forecast already exists
-        if forecast_exists(fb_client, route_number, delivery_date, schedule_key):
-            log(f"    ⏭️  Forecast already exists for {delivery_date} ({schedule_key})")
-            continue
-        
-        try:
-            log(f"    🔮 Generating forecast for {delivery_date} ({schedule_key})...")
-            
-            config = ForecastConfig(
-                route_number=route_number,
-                delivery_date=delivery_date,
-                schedule_key=schedule_key,
-                service_account=sa_path,
-                since_days=365,
-                round_cases=True,
-                ttl_days=7,
-            )
-            
-            forecast = generate_forecast(config)
-            log(f"    ✅ Forecast {forecast.forecast_id}: {len(forecast.items)} items")
-            generated += 1
-            
-        except RuntimeError as e:
-            # Whole-case invariant or other hard gate: skip emission and keep daemon running.
-            log(f"    ❌ Forecast skipped (hard gate) for {delivery_date}: {e}")
-        except ValueError as e:
-            if 'insufficient_history' in str(e):
-                log(f"    ⏳ Not enough history for {delivery_date}")
-            else:
-                log(f"    ⚠️  Forecast error for {delivery_date}: {e}")
-        except Exception as e:
-            log(f"    ❌ Forecast failed for {delivery_date}: {e}")
-    
-    return generated
+        row = enqueue_generation_job(
+            route_number=str(route_number),
+            schedule_key=str(schedule_key),
+            delivery_date=str(delivery_date),
+            source='daemon',
+            finalize_key=None,
+        )
+        if row:
+            queued += 1
+
+    stats = process_generation_jobs_for_route(
+        fb_client=fb_client,
+        route_number=str(route_number),
+        worker_id=WORKER_ID,
+        max_jobs=int(os.environ.get('FORECAST_DAEMON_MAX_JOBS_PER_ROUTE', '4')),
+        sa_path=sa_path,
+    )
+    if queued > 0 or stats.get('claimed', 0) > 0:
+        log(
+            "    🧠 Queue run:"
+            f" queued={queued} claimed={stats.get('claimed', 0)} done={stats.get('done', 0)}"
+            f" skipped={stats.get('skipped_fresh', 0)} retry_or_error={stats.get('retry_or_error', 0)}"
+        )
+
+    return int(stats.get('done', 0))
 
 
 def run_retrain_check(fb_client: firestore.Client, route_number: str, sa_path: str) -> bool:
@@ -539,6 +508,8 @@ def main():
     log(f"   Mode: All synced routes (via PostgreSQL)")
     log(f"   Interval: {args.interval}s ({args.interval // 3600}h {(args.interval % 3600) // 60}m)")
     log("=" * 60)
+
+    ensure_forecast_queue_tables()
     
     # Create Firestore client
     fb_client = firestore.Client.from_service_account_json(args.service_account)
