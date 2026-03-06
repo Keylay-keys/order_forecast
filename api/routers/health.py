@@ -2,8 +2,9 @@
 
 Endpoints:
     GET /api/health - Overall health status
-    GET /api/health/database - PostgreSQL sync status
-    GET /api/health/firebase - Firebase/Firestore connectivity
+    GET /api/health/database - PostgreSQL sync status (auth required)
+    GET /api/health/firebase - Firebase/Firestore connectivity (auth required)
+    GET /api/health/services - Supervisor/service heartbeat status (auth required)
     POST /api/health/sync - Best-effort manual sync (Firebase -> PostgreSQL)
 """
 
@@ -49,7 +50,9 @@ async def health_check() -> dict:
 
 
 @router.get("/health/database")
-async def database_health() -> dict:
+async def database_health(
+    decoded_token: dict = Depends(verify_firebase_token),
+) -> dict:
     """PostgreSQL database health check with sync status.
     
     Returns:
@@ -57,6 +60,7 @@ async def database_health() -> dict:
     - degraded: Connected but stale data
     - unhealthy: Connection failed
     """
+    _ = decoded_token
     now = datetime.utcnow()
     
     conn = None
@@ -127,12 +131,14 @@ async def database_health() -> dict:
 
 @router.get("/health/firebase")
 async def firebase_health(
+    decoded_token: dict = Depends(verify_firebase_token),
     db = Depends(get_firestore)
 ) -> dict:
     """Firebase/Firestore health check.
     
     Performs a simple read to verify connectivity.
     """
+    _ = decoded_token
     try:
         # Try to read a known document
         doc = db.collection('_health').document('ping').get()
@@ -226,8 +232,11 @@ async def trigger_sync(
 
 
 @router.get("/health/services")
-async def services_health() -> dict:
+async def services_health(
+    decoded_token: dict = Depends(verify_firebase_token),
+) -> dict:
     """Order-forecast service heartbeat status (from supervisor)."""
+    _ = decoded_token
     # Allowed directories for status files (path traversal protection)
     ALLOWED_STATUS_DIRS = [
         Path("/app/logs"),

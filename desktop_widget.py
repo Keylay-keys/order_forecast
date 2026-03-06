@@ -207,10 +207,16 @@ def check_process_running(pattern: str) -> tuple[bool, int]:
 
 def check_server_health(server_api_url: str, timeout_seconds: int) -> dict:
     """Check server health via API."""
-    health = {'connected': False, 'status': 'offline'}
+    health = {
+        'connected': False,
+        'status': 'offline',
+        'detailsProtected': True,
+        'firebaseHealth': {'status': 'protected'},
+        'serviceHealth': {'status': 'protected', 'services': []},
+    }
     try:
         req = urllib.request.Request(
-            f"{server_api_url}/api/health/database",
+            f"{server_api_url}/api/health",
             headers={'User-Agent': 'RouteSpark-Widget/1.0'}
         )
         with urllib.request.urlopen(req, timeout=timeout_seconds) as response:
@@ -219,40 +225,12 @@ def check_server_health(server_api_url: str, timeout_seconds: int) -> dict:
                 health.update({
                     'connected': True,
                     'status': data.get('status', 'unknown'),
-                    'database': data.get('database', 'unknown'),
-                    'orderCount': data.get('orderCount', 0),
-                    'routesCount': data.get('routesCount', 0),
-                    'syncAgeMinutes': data.get('syncAgeMinutes'),
-                    'databaseHealth': data,
+                    'apiHealth': data,
                 })
     except Exception as e:
         health.update({'connected': False, 'status': 'offline', 'error': str(e)})
         return health
-    
-    # Firebase health
-    try:
-        req = urllib.request.Request(
-            f"{server_api_url}/api/health/firebase",
-            headers={'User-Agent': 'RouteSpark-Widget/1.0'}
-        )
-        with urllib.request.urlopen(req, timeout=timeout_seconds) as response:
-            if response.status == 200:
-                health['firebaseHealth'] = json.loads(response.read().decode('utf-8'))
-    except Exception as e:
-        health['firebaseHealth'] = {'status': 'unhealthy', 'error': str(e)}
-    
-    # Order-forecast service heartbeats
-    try:
-        req = urllib.request.Request(
-            f"{server_api_url}/api/health/services",
-            headers={'User-Agent': 'RouteSpark-Widget/1.0'}
-        )
-        with urllib.request.urlopen(req, timeout=timeout_seconds) as response:
-            if response.status == 200:
-                health['serviceHealth'] = json.loads(response.read().decode('utf-8'))
-    except Exception as e:
-        health['serviceHealth'] = {'status': 'unavailable', 'error': str(e)}
-    
+
     return health
 
 
@@ -708,9 +686,7 @@ class RouteSparkWidget(QWidget):
         if display_running and is_connected:
             self.server_status.setText("Connected")
             self.server_status.setStyleSheet(f"color: {COLORS['green']};")
-            orders = self.server_health.get('orderCount', 0)
-            routes = self.server_health.get('routesCount', 0)
-            self.server_stats.setText(f"Orders: {orders} | Routes: {routes}")
+            self.server_stats.setText("Public health OK")
         elif display_running and not is_connected:
             self.server_status.setText("Retrying...")
             self.server_status.setStyleSheet(f"color: {COLORS['yellow']};")
@@ -755,6 +731,8 @@ class RouteSparkWidget(QWidget):
         firebase_status = firebase_health.get('status', 'unknown')
         if firebase_status == 'healthy':
             self.firebase_row.update_status(running=True, info="OK")
+        elif firebase_status == 'protected':
+            self.firebase_row.update_status(running=True, info="AUTH")
         elif firebase_status == 'unhealthy':
             self.firebase_row.update_status(running=False, info="DOWN")
         else:
@@ -770,6 +748,9 @@ class RouteSparkWidget(QWidget):
         for label, service_name in SERVER_SERVICE_MAP.items():
             row = self.server_service_rows.get(label)
             svc = services_by_name.get(service_name) if services_by_name else None
+            if service_status == 'protected':
+                row.update_status(running=True, info="AUTH")
+                continue
             if is_stale:
                 row.update_status(running=False, info="STALE")
                 continue

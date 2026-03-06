@@ -22,6 +22,7 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
 import firebase_admin
 from firebase_admin import auth, credentials, firestore
+from .utils.client_ip import get_client_ip
 
 # =============================================================================
 # CONFIGURATION
@@ -333,7 +334,7 @@ def _log_auth_failure(request: Request, reason: str, **extra):
     security_logger.warning({
         "event": "auth_failure",
         "reason": reason,
-        "ip": request.client.host if request.client else "unknown",
+        "ip": get_client_ip(request),
         "user_agent": request.headers.get("user-agent", "unknown"),
         "path": request.url.path,
         **extra

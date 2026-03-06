@@ -39,6 +39,7 @@ class IPBlocklist:
     def __init__(self):
         self.blocklist: Dict[str, Dict] = {}  # IP -> {until, reason, hits}
         self._lock = threading.Lock()
+        self._dirty = False
         self._load()
     
     def _load(self):
@@ -73,6 +74,7 @@ class IPBlocklist:
         
         try:
             BLOCKLIST_FILE.write_text(json.dumps(data, indent=2))
+            self._dirty = False
         except Exception as e:
             print(f"[blocklist] Error saving blocklist: {e}")
     
@@ -119,7 +121,7 @@ class IPBlocklist:
                 "reason": reason,
                 "hits": hits
             }
-            
+            self._dirty = True
             self._save()
         
         # Log the block
@@ -147,7 +149,7 @@ class IPBlocklist:
             if datetime.utcnow() > entry["until"]:
                 # Expired, clean up
                 del self.blocklist[ip]
-                self._save()
+                self._dirty = True
                 return False
             
             return True
@@ -176,6 +178,7 @@ class IPBlocklist:
         with self._lock:
             if ip in self.blocklist:
                 del self.blocklist[ip]
+                self._dirty = True
                 self._save()
                 return True
             return False
@@ -225,6 +228,7 @@ class IPBlocklist:
                 del self.blocklist[ip]
             
             if expired:
+                self._dirty = True
                 self._save()
         
         return len(expired)

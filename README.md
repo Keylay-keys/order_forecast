@@ -1,5 +1,37 @@
 ﻿# Mission Order Forecasting Toolkit
 
+## Server Sync Boundary
+
+`/srv/routespark/order_forecast` is the Docker build context for `order-forecast` and `web-api`.
+
+Only sync the `order_forecast/` submodule contents into that path. Do not sync the root app repo there.
+
+Approved sync command:
+
+```bash
+rsync -rlDz --delete --delete-excluded --omit-dir-times \
+  --exclude='.git/' \
+  --exclude='venv/' \
+  --exclude='__pycache__/' \
+  --exclude='logs/' \
+  --exclude='.DS_Store' \
+  --exclude='.claude/' \
+  --exclude='.cursor/' \
+  --exclude='*.pyc' \
+  --exclude='*.pyo' \
+  --exclude='data/*.duckdb' \
+  --exclude='data/*.duckdb-*' \
+  /local/path/to/order_forecast/ \
+  keylay@routespark:/srv/routespark/order_forecast/
+```
+
+Rules:
+
+- Source path must be the `order_forecast/` submodule, not the repo root.
+- Destination path must be `/srv/routespark/order_forecast/`.
+- Use `--delete --delete-excluded` so local-only junk is removed from the server build context.
+- Do not run a production compose rebuild just to sync files.
+
 A lightweight toolkit for generating twice-weekly order forecasts, comparing them with actual shipments, and keeping historical inputs organized. The repo is structured so you can drop in your own order exports and promo sheets without committing personal data.
 
 ## Prerequisites

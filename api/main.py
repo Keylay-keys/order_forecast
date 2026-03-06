@@ -117,22 +117,9 @@ else:
 # =============================================================================
 # MIDDLEWARE
 # =============================================================================
-# Order matters! Outermost middleware runs first.
-# 1. Code protection (blocklist + enumeration) - reject bad actors early
-# 2. Honeypots - detect scanners
-# 3. Brute force - track auth failures
-# 4. Rate limiting - general rate limits
-# 5. CORS - allow cross-origin
-
-# Security middleware (order: last added = first to run)
-# So we add in REVERSE order of desired execution:
-# Desired: blocklist → honeypots → brute_force → rate_limit
-setup_rate_limiting(app)           # 4th: Rate limits (runs last)
-setup_brute_force_protection(app)  # 3rd: Auth failure tracking
-setup_honeypots(app)               # 2nd: Honeypot path detection
-setup_code_protection(app)         # 1st: Blocklist + enumeration (runs first)
-
 # CORS - strict origins only
+# Add CORS before the abuse controls so it does not wrap them.
+# FastAPI/Starlette middleware executes last-added first.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
@@ -141,6 +128,15 @@ app.add_middleware(
     allow_headers=["Authorization", "Content-Type"],
     max_age=3600,
 )
+
+# Order matters! Outermost middleware runs first.
+# Desired order for the abuse controls:
+#   blocklist/enumeration -> honeypots -> brute force -> rate limits -> CORS
+# We add them in reverse because last-added runs first.
+setup_rate_limiting(app)           # runs after brute force
+setup_brute_force_protection(app)  # tracks auth failures
+setup_honeypots(app)               # detects scanners
+setup_code_protection(app)         # blocklist + enumeration (runs first among abuse controls)
 
 
 @app.middleware("http")
@@ -249,17 +245,7 @@ async def root():
 
 @app.get("/api")
 async def api_root():
-    """API root - available endpoints."""
+    """Minimal API root - no endpoint inventory."""
     return {
-        "endpoints": {
-            "auth": "/api/auth/verify",
-            "history": "/api/history",
-            "health": "/api/health",
-            "orders": "/api/orders",
-            "forecast": "/api/forecast",
-            "reference": "/api/products",
-            "low_quantity": "/api/low-quantity",
-            "billing": "/api/billing/products",
-            "archive_exports": "/api/archive/exports",
-        }
+        "status": "ok"
     }

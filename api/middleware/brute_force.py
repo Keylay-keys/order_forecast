@@ -116,14 +116,6 @@ class BruteForceProtection:
         remaining = (unlock_time - datetime.utcnow()).total_seconds()
         return max(1, int(remaining))
     
-    def clear_failures(self, ip: str):
-        """Clear failure history for an IP (e.g., after successful auth)."""
-        with self._lock:
-            if ip in self.failed_attempts:
-                del self.failed_attempts[ip]
-            if ip in self.locked_out:
-                del self.locked_out[ip]
-    
     def get_stats(self) -> Dict:
         """Get brute force protection statistics."""
         now = datetime.utcnow()
@@ -162,6 +154,7 @@ class BruteForceMiddleware(BaseHTTPMiddleware):
     
     async def dispatch(self, request: Request, call_next):
         ip = get_client_ip(request)
+        path = request.url.path
         
         # Check if IP is locked out
         if brute_force.is_locked_out(ip):
@@ -170,7 +163,7 @@ class BruteForceMiddleware(BaseHTTPMiddleware):
                 severity="low",
                 details={},
                 ip=ip,
-                path=request.url.path
+                path=path
             )
             
             retry_after = brute_force.get_retry_after_seconds(ip)
@@ -190,13 +183,12 @@ class BruteForceMiddleware(BaseHTTPMiddleware):
         # 403 can be legitimate (user accessing wrong route) and shouldn't
         # contribute to lockout. This prevents DoS via route enumeration.
         if response.status_code == 401:
+            # Health endpoints may be polled by internal widgets without auth.
+            # Keep them protected, but do not let their 401s lock out the caller's
+            # entire IP and take down unrelated API access.
+            if path.startswith("/api/health"):
+                return response
             brute_force.record_failure(ip, "auth_failure")
-        elif response.status_code == 200:
-            # Successful auth - clear failure history to prevent accumulation
-            # Only clear on auth endpoints to avoid clearing on every request
-            if request.url.path.startswith("/api/auth"):
-                brute_force.clear_failures(ip)
-        
         return response
 
 
