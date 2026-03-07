@@ -1806,7 +1806,7 @@ def _predict_slow_intermittent_units(row: pd.Series) -> float:
       E(size | ordered)  ~= avg_qty_when_ordered (fallback to lag/rolling history)
     """
     try:
-        slow_threshold = float(os.environ.get("SLOW_MOVER_ORDER_FREQ_THRESHOLD", "0.25"))
+        slow_threshold = float(os.environ.get("SLOW_MOVER_ORDER_FREQ_THRESHOLD", "0.70"))
     except Exception:
         slow_threshold = 0.25
 
@@ -1930,17 +1930,35 @@ def _should_zero_low_signal_slow_line(row: pd.Series, case_pack: Optional[int]) 
 
     pred_units = float(row.get("pred_units", 0.0) or 0.0)
     confidence = float(row.get("confidence", 0.0) or 0.0)
+    order_frequency = float(row.get("order_frequency", 0.0) or 0.0)
     corr_removal_rate = float(row.get("corr_removal_rate", 0.0) or 0.0)
+    corr_add_rate = float(row.get("corr_add_rate", 0.0) or 0.0)
     corr_samples = float(row.get("corr_samples", 0.0) or 0.0)
     days_since_last = float(row.get("days_since_last_order", 999.0) or 999.0)
+    days_since_last_same_schedule = float(
+        row.get("days_since_last_order_same_schedule", days_since_last) or days_since_last
+    )
 
     min_case_fraction = float(os.environ.get("SLOW_MOVER_MIN_CASE_FRACTION_GATE", "0.60"))
     low_conf_threshold = float(os.environ.get("SLOW_MOVER_LOW_CONFIDENCE_GATE", "0.55"))
     removal_threshold = float(os.environ.get("SLOW_MOVER_REMOVAL_RATE_GATE", "0.50"))
     min_samples = float(os.environ.get("SLOW_MOVER_REMOVAL_MIN_SAMPLES_GATE", "2"))
     stale_days = float(os.environ.get("SLOW_MOVER_STALE_DAYS_GATE", "14"))
+    sparse_case_fraction = float(
+        os.environ.get("SLOW_MOVER_SPARSE_NO_FEEDBACK_CASE_FRACTION_GATE", "0.50")
+    )
+    sparse_max_samples = float(os.environ.get("SLOW_MOVER_SPARSE_NO_FEEDBACK_MAX_SAMPLES_GATE", "1"))
+    sparse_max_frequency = float(
+        os.environ.get("SLOW_MOVER_SPARSE_NO_FEEDBACK_MAX_ORDER_FREQUENCY_GATE", "0.35")
+    )
+    sparse_very_low_frequency = float(
+        os.environ.get("SLOW_MOVER_SPARSE_NO_FEEDBACK_VERY_LOW_ORDER_FREQUENCY_GATE", "0.15")
+    )
+    sparse_stale_days = float(
+        os.environ.get("SLOW_MOVER_SPARSE_NO_FEEDBACK_STALE_DAYS_GATE", "21")
+    )
 
-    return (
+    removal_gate = (
         pred_units > 0.0
         and pred_units < (float(case_pack) * min_case_fraction)
         and confidence < low_conf_threshold
@@ -1948,6 +1966,18 @@ def _should_zero_low_signal_slow_line(row: pd.Series, case_pack: Optional[int]) 
         and corr_removal_rate >= removal_threshold
         and days_since_last >= stale_days
     )
+    sparse_no_feedback_gate = (
+        pred_units > 0.0
+        and pred_units < (float(case_pack) * sparse_case_fraction)
+        and corr_samples <= sparse_max_samples
+        and corr_add_rate <= 0.0
+        and order_frequency <= sparse_max_frequency
+        and (
+            days_since_last_same_schedule >= sparse_stale_days
+            or order_frequency <= sparse_very_low_frequency
+        )
+    )
+    return removal_gate or sparse_no_feedback_gate
 
 
 def _compute_prediction_confidence(row: pd.Series, branch: str) -> float:
@@ -2215,7 +2245,9 @@ def _train_and_predict(
     target_schedule_feats = _compute_schedule_features(target_date, days_until_next)
     
     slow_branch_enabled = os.environ.get("FORECAST_ENABLE_INTERMITTENT_SLOW", "1").lower() in ("1", "true", "yes")
-    slow_threshold = float(os.environ.get("SLOW_MOVER_ORDER_FREQ_THRESHOLD", "0.25"))
+    # Tuned against walk-forward on route 989262: a wider intermittent branch
+    # reduced persistent zero-actual over-forecast on borderline-frequency items.
+    slow_threshold = float(os.environ.get("SLOW_MOVER_ORDER_FREQ_THRESHOLD", "0.70"))
     target_schedule_key = str(schedule_key or "").strip().lower()
     slow_branch_count = 0
     gbr_branch_count = 0
@@ -2910,7 +2942,6 @@ def generate_forecast(config: ForecastConfig) -> ForecastPayload:
                         )
                         continue
 
-            # Prevent tiny low-signal slow-mover recommendations from being promoted to full cases.
             if is_slow and _should_zero_low_signal_slow_line(row, case_pack):
                 suppressed_slow_movers.append(
                     f"{sap_str} (SLOW gate, store={store_id}, pred={float(row.get('pred_units', 0.0) or 0.0):.2f}, "

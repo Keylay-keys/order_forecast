@@ -32,6 +32,7 @@ try:
         _load_corrections_from_postgres,
         _orders_to_dataframe,
         _parse_date,
+        _should_zero_low_signal_slow_line,
         _summarize_schedule_shape,
         _train_and_predict,
     )
@@ -50,6 +51,7 @@ except ImportError:
         _load_corrections_from_postgres,
         _orders_to_dataframe,
         _parse_date,
+        _should_zero_low_signal_slow_line,
         _summarize_schedule_shape,
         _train_and_predict,
     )
@@ -156,6 +158,21 @@ def _build_key_meta_map(preds_df: pd.DataFrame) -> Dict[LineKey, Dict[str, float
             "corr_samples": float(row.get("corr_samples", 0.0) or 0.0),
         }
     return out
+
+
+def _apply_live_slow_gate(preds_df: pd.DataFrame, case_pack_by_sap: Dict[str, int]) -> pd.DataFrame:
+    """Mirror the production low-signal slow-mover gate before scoring."""
+    if preds_df.empty:
+        return preds_df
+    gated = preds_df.copy()
+    for idx, row in gated.iterrows():
+        case_pack = case_pack_by_sap.get(str(row.get("sap") or ""))
+        if _should_zero_low_signal_slow_line(row, case_pack):
+            gated.at[idx, "pred_units"] = 0.0
+            gated.at[idx, "p10_units"] = 0.0
+            gated.at[idx, "p50_units"] = 0.0
+            gated.at[idx, "p90_units"] = 0.0
+    return gated
 
 
 def _apply_band_scale_and_center(
@@ -1230,6 +1247,7 @@ def run_backtest(
                         active_promos=None,
                         band_scale=band_scale,
                     )
+                    preds_df = _apply_live_slow_gate(preds_df, case_pack_by_sap)
 
                     pred_line_map = _build_pred_line_map(preds_df)
                     key_source_map = _build_key_source_map(preds_df)
