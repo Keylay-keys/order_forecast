@@ -1,0 +1,68 @@
+# RouteSpark Docker Ignore
+# Active build-context filter for /srv/routespark/order_forecast
+
+# DuckDB / local data artifacts
+*.duckdb
+*.duckdb.wal
+data/*.duckdb
+data/analytics.duckdb
+data/local.duckdb
+
+# Logs - mounted at runtime, not baked into images
+logs/
+*.log
+
+# Local runtime data that should not be copied into the image
+data/
+models/
+config/*.json
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+*.egg-info/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Git
+.git/
+.gitignore
+
+# Documentation / plans
+*.md
+docs/
+
+# Tests
+tests/
+test_*.py
+*_test.py
+api/tests/
+
+# Mac-only / local-only helpers
+desktop_widget.py
+menubar_app.py
+supervisor_mac_only.py
+launch_widget.command
+com.routespark.pcf-archive-sync.plist
+start_menubar.sh
+*.plist
+*.command
+
+# Misc build artifacts
+Makefile
+.DS_Store
+dist/
+build/
+*.egg
