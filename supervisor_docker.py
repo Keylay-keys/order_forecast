@@ -210,6 +210,16 @@ def create_services() -> List[Service]:
             ],
             log_file=LOG_DIR / 'archive_purge_worker.log',
         ),
+        # POS invoice archive worker (guarded by POS_ARCHIVE_ENABLED)
+        Service(
+            name="POS Archive Worker",
+            cmd=[
+                python,
+                "/app/workers/archive/pos_archive_worker.py",
+                "--serviceAccount", SA_PATH,
+            ],
+            log_file=LOG_DIR / 'pos_archive_worker.log',
+        ),
         # Periodic retraining check
         Service(
             name="Retrain Daemon",
