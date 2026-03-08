@@ -284,12 +284,12 @@ def _find_archived_invoice(route: Optional[str], invoice_id: str) -> Optional[Di
 
 
 def _find_any_invoice_doc(db: firestore.Client, invoice_id: str) -> Tuple[Optional[Any], Optional[str]]:
-    doc = _find_active_invoice_doc(db, invoice_id)
-    if doc:
-        return doc, ACTIVE_COLLECTION
     archived = _find_archived_invoice(None, invoice_id)
     if archived:
         return archived, SERVER_ARCHIVE_SOURCE
+    doc = _find_active_invoice_doc(db, invoice_id)
+    if doc:
+        return doc, ACTIVE_COLLECTION
     return None, None
 
 
