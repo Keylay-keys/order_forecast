@@ -1,4 +1,4 @@
-"""POS invoice router - active + archived access, archive job enqueueing, no hard delete."""
+"""POS invoice router - Firebase hot tier + server archive access."""
 
 from __future__ import annotations
 
@@ -30,13 +30,12 @@ router = APIRouter()
 logger = logging.getLogger("api.pos")
 
 ACTIVE_COLLECTION = "pos_invoices"
-ARCHIVED_COLLECTION = "archived_pos_invoices"
+SERVER_ARCHIVE_SOURCE = "server_archive"
 JOB_COLLECTION = "posArchiveJobs"
 STATUS_VALUES = {
     "active",
     "archived",
     "archived_server",
-    "archive_requested",
     "all",
 }
 
@@ -79,7 +78,7 @@ def _to_epoch_ms(value: Any) -> Optional[int]:
 def _normalize_invoice(doc: firestore.DocumentSnapshot, *, collection_name: str) -> Dict[str, Any]:
     data = doc.to_dict() or {}
     data["id"] = data.get("id") or doc.id
-    data["storageTier"] = "server" if collection_name == ARCHIVED_COLLECTION else "firebase"
+    data["storageTier"] = "firebase"
     data["sourceCollection"] = collection_name
     for field in ("createdAt", "archivedAt", "firebaseDeletedAt", "retentionUntil"):
         if field in data:
@@ -130,11 +129,11 @@ def _is_admin(user_data: Dict[str, Any]) -> bool:
     return role in {"owner", "admin"}
 
 
-def _route_collections(db: firestore.Client, route_number: str) -> Tuple[firestore.CollectionReference, firestore.CollectionReference]:
+def _route_collections(db: firestore.Client, route_number: str) -> Tuple[firestore.CollectionReference, Optional[firestore.CollectionReference]]:
     route_doc = db.collection("routes").document(route_number)
     return (
         route_doc.collection(ACTIVE_COLLECTION),
-        route_doc.collection(ARCHIVED_COLLECTION),
+        None,
     )
 
 
@@ -146,7 +145,7 @@ def _query_collection(
     cursor: Optional[str],
 ) -> List[firestore.DocumentSnapshot]:
     query: firestore.Query = collection_ref.order_by("createdAt", direction=firestore.Query.DESCENDING)
-    if status and status not in {"all", "archived"}:
+    if status and status not in {"all", "archived", "archived_server"}:
         query = query.where("status", "==", status)
 
     if cursor:
@@ -166,23 +165,64 @@ def _list_active_docs(
     cursor: Optional[str],
 ) -> List[firestore.DocumentSnapshot]:
     active_ref, _ = _route_collections(db, route)
-    if status in {"archived_server"}:
+    if status in {"archived", "archived_server"}:
         return []
     return _query_collection(active_ref, status=status, limit=limit, cursor=cursor)
 
 
-def _list_archived_docs(
-    db: firestore.Client,
-    route: str,
-    *,
-    status: Optional[str],
-    limit: int,
-) -> List[firestore.DocumentSnapshot]:
-    _, archived_ref = _route_collections(db, route)
-    if status == "active":
+def _load_archived_metadata(route: str, invoice_id: str) -> Optional[Dict[str, Any]]:
+    metadata_file = _archive_metadata_file(route, invoice_id)
+    if not metadata_file.exists():
+        return None
+    try:
+        return json.loads(metadata_file.read_text())
+    except Exception as exc:
+        logger.warning("Failed reading POS archive metadata %s: %s", metadata_file, exc)
+        return None
+
+
+def _normalize_archived_invoice(route: str, invoice_id: str, metadata: Dict[str, Any]) -> Dict[str, Any]:
+    created_at = metadata.get("createdAt")
+    created_at_ms = _to_epoch_ms(created_at)
+    archived_at = metadata.get("archivedAt")
+    archived_at_ms = _to_epoch_ms(archived_at)
+    firebase_deleted_at = metadata.get("firebaseDeletedAt")
+    firebase_deleted_at_ms = _to_epoch_ms(firebase_deleted_at)
+    invoice: Dict[str, Any] = {
+        "id": invoice_id,
+        "invoiceId": invoice_id,
+        "routeNumber": route,
+        "status": "archived_server",
+        "storageTier": "server",
+        "sourceCollection": SERVER_ARCHIVE_SOURCE,
+        "store": metadata.get("store"),
+        "invoiceNumber": metadata.get("invoiceNumber"),
+        "date": metadata.get("date"),
+        "pageCount": int(metadata.get("pageCount") or 0),
+        "pages": [],
+        "createdAt": _to_iso(created_at_ms if created_at_ms is not None else created_at),
+        "archivedAt": _to_iso(archived_at_ms if archived_at_ms is not None else archived_at),
+        "firebaseDeletedAt": _to_iso(firebase_deleted_at_ms if firebase_deleted_at_ms is not None else firebase_deleted_at),
+        "retentionUntil": _to_iso(_compute_retention_until(created_at_ms)),
+        "archiveVerified": True,
+        "serverArchivePath": str(_archive_path(route, invoice_id)),
+        "archivedFrom": metadata.get("archivedFrom"),
+    }
+    return invoice
+
+
+def _iter_archived_items(route: str) -> List[Dict[str, Any]]:
+    route_dir = POS_ARCHIVE_BASE / route
+    if not route_dir.exists():
         return []
-    archived_status = "archived_server" if status in {None, "archived", "archived_server", "all"} else status
-    return _query_collection(archived_ref, status=archived_status, limit=limit, cursor=None)
+    items: List[Dict[str, Any]] = []
+    for metadata_file in route_dir.glob("*/metadata.json"):
+        invoice_id = metadata_file.parent.name
+        metadata = _load_archived_metadata(route, invoice_id)
+        if not metadata:
+            continue
+        items.append(_normalize_archived_invoice(route, invoice_id, metadata))
+    return items
 
 
 def _merged_items(
@@ -198,23 +238,25 @@ def _merged_items(
     cursor: Optional[str],
 ) -> List[Dict[str, Any]]:
     per_collection_limit = max(limit * 2, 100)
-    docs_with_source: List[Tuple[firestore.DocumentSnapshot, str]] = []
-
     active_docs = _list_active_docs(db, route, status=status, limit=per_collection_limit, cursor=cursor)
-    docs_with_source.extend((doc, ACTIVE_COLLECTION) for doc in active_docs)
-
-    archived_docs = _list_archived_docs(db, route, status=status, limit=per_collection_limit)
-    docs_with_source.extend((doc, ARCHIVED_COLLECTION) for doc in archived_docs)
 
     items: List[Dict[str, Any]] = []
     seen_ids = set()
-    for doc, collection_name in docs_with_source:
-        invoice = _normalize_invoice(doc, collection_name=collection_name)
+    for doc in active_docs:
+        invoice = _normalize_invoice(doc, collection_name=ACTIVE_COLLECTION)
         if invoice["id"] in seen_ids:
             continue
         if _matches_filters(invoice, store, invoice_number, start_date, end_date):
             items.append(invoice)
             seen_ids.add(invoice["id"])
+
+    if status != "active":
+        for invoice in _iter_archived_items(route):
+            if invoice["id"] in seen_ids:
+                continue
+            if _matches_filters(invoice, store, invoice_number, start_date, end_date):
+                items.append(invoice)
+                seen_ids.add(invoice["id"])
 
     items.sort(key=lambda item: (_to_epoch_ms(item.get("createdAt")) or 0), reverse=True)
     return items[:limit]
@@ -225,18 +267,29 @@ def _find_active_invoice_doc(db: firestore.Client, invoice_id: str) -> Optional[
     return next(iter(invoices_group.where("id", "==", invoice_id).limit(1).stream()), None)
 
 
-def _find_archived_invoice_doc(db: firestore.Client, invoice_id: str) -> Optional[firestore.DocumentSnapshot]:
-    invoices_group = db.collection_group(ARCHIVED_COLLECTION)
-    return next(iter(invoices_group.where("id", "==", invoice_id).limit(1).stream()), None)
+def _find_archived_invoice(route: Optional[str], invoice_id: str) -> Optional[Dict[str, Any]]:
+    if route:
+        metadata = _load_archived_metadata(route, invoice_id)
+        if metadata:
+            return _normalize_archived_invoice(route, invoice_id, metadata)
+        return None
+
+    route_dir_glob = POS_ARCHIVE_BASE.glob(f"*/{invoice_id}/metadata.json")
+    for metadata_file in route_dir_glob:
+        route_number = metadata_file.parent.parent.name
+        metadata = _load_archived_metadata(route_number, invoice_id)
+        if metadata:
+            return _normalize_archived_invoice(route_number, invoice_id, metadata)
+    return None
 
 
-def _find_any_invoice_doc(db: firestore.Client, invoice_id: str) -> Tuple[Optional[firestore.DocumentSnapshot], Optional[str]]:
+def _find_any_invoice_doc(db: firestore.Client, invoice_id: str) -> Tuple[Optional[Any], Optional[str]]:
     doc = _find_active_invoice_doc(db, invoice_id)
     if doc:
         return doc, ACTIVE_COLLECTION
-    doc = _find_archived_invoice_doc(db, invoice_id)
-    if doc:
-        return doc, ARCHIVED_COLLECTION
+    archived = _find_archived_invoice(None, invoice_id)
+    if archived:
+        return archived, SERVER_ARCHIVE_SOURCE
     return None, None
 
 
@@ -433,10 +486,13 @@ async def get_pos_invoice(
     if not doc or not collection_name:
         raise HTTPException(404, "Invoice not found")
 
-    data = doc.to_dict() or {}
-    route_number = str(data.get("routeNumber") or "")
+    if collection_name == ACTIVE_COLLECTION:
+        invoice = _normalize_invoice(doc, collection_name=collection_name)
+    else:
+        invoice = doc
+    route_number = str(invoice.get("routeNumber") or "")
     await require_route_access(route_number, decoded_token, db)
-    return _normalize_invoice(doc, collection_name=collection_name)
+    return invoice
 
 
 @router.get("/pos/{invoice_id}/page/{page_number}")
@@ -455,7 +511,10 @@ async def get_pos_invoice_page(
     if not doc or not collection_name:
         raise HTTPException(404, "Invoice not found")
 
-    invoice = _normalize_invoice(doc, collection_name=collection_name)
+    if collection_name == ACTIVE_COLLECTION:
+        invoice = _normalize_invoice(doc, collection_name=collection_name)
+    else:
+        invoice = doc
     route_number = str(invoice.get("routeNumber") or "")
     await require_route_access(route_number, decoded_token, db)
 
@@ -463,7 +522,7 @@ async def get_pos_invoice_page(
     if page_number >= page_count:
         raise HTTPException(404, "Page not found")
 
-    if collection_name == ARCHIVED_COLLECTION:
+    if collection_name != ACTIVE_COLLECTION:
         archive_file = _archive_file(route_number, invoice_id, page_number)
         resolved = archive_file.resolve()
         archive_root = POS_ARCHIVE_BASE.resolve()
@@ -501,7 +560,10 @@ async def download_pos_invoice(
     if not doc or not collection_name:
         raise HTTPException(404, "Invoice not found")
 
-    invoice = _normalize_invoice(doc, collection_name=collection_name)
+    if collection_name == ACTIVE_COLLECTION:
+        invoice = _normalize_invoice(doc, collection_name=collection_name)
+    else:
+        invoice = doc
     route_number = str(invoice.get("routeNumber") or "")
     await require_route_access(route_number, decoded_token, db)
 
@@ -525,9 +587,9 @@ async def archive_pos_invoice(
 ) -> Dict[str, Any]:
     doc = _find_active_invoice_doc(db, invoice_id)
     if not doc:
-        archived_doc = _find_archived_invoice_doc(db, invoice_id)
-        if archived_doc:
-            invoice = _normalize_invoice(archived_doc, collection_name=ARCHIVED_COLLECTION)
+        archived_invoice = _find_archived_invoice(None, invoice_id)
+        if archived_invoice:
+            invoice = archived_invoice
             route_number = str(invoice.get("routeNumber") or "")
             await require_route_access(route_number, decoded_token, db)
             return {"ok": True, "reused": True, "invoice": invoice, "job": None}
