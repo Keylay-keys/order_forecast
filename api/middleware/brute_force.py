@@ -155,6 +155,11 @@ class BruteForceMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         ip = get_client_ip(request)
         path = request.url.path
+
+        # CORS preflight requests are unauthenticated by design and must never
+        # participate in auth lockout logic.
+        if request.method == "OPTIONS":
+            return await call_next(request)
         
         # Check if IP is locked out
         if brute_force.is_locked_out(ip):

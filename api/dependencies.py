@@ -331,6 +331,8 @@ async def verify_firebase_token(
 
 def _log_auth_failure(request: Request, reason: str, **extra):
     """Log authentication failure for security monitoring."""
+    if request.method == "OPTIONS":
+        return
     security_logger.warning({
         "event": "auth_failure",
         "reason": reason,
