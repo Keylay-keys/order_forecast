@@ -14,6 +14,7 @@ import sys
 import json
 import urllib.request
 import urllib.error
+import re
 from datetime import datetime
 from pathlib import Path
 from threading import Thread
@@ -37,8 +38,9 @@ VENV_PYTHON = APP_DIR / 'venv' / 'bin' / 'python'
 SETTINGS_FILE = APP_DIR / '.widget_settings.json'
 WIDGET_LOG_FILE = Path.home() / 'Library' / 'Logs' / 'routespark-widget.log'
 BACKUP_LOG_FILE = Path.home() / 'Library' / 'Logs' / 'routespark-critical-backup.log'
-ARCHIVE_STATUS_PATH = "/home/keylay/scripts/archive-cleanup/last_run.json"
+ARCHIVE_SYNC_LOG_FILE = Path.home() / 'Library' / 'Logs' / 'routespark-pcf-archive-sync.log'
 ARCHIVE_SSH_HOST = "keylay@100.64.201.120"
+ARCHIVE_PURGE_SERVICE_NAME = "Archive Purge Worker"
 logger = logging.getLogger("routespark_widget")
 
 # Server API URL (default; can be overridden in .widget_settings.json)
@@ -248,18 +250,75 @@ def get_last_backup_success(log_path: Path) -> str | None:
     return None
 
 
-def get_archive_cleanup_status() -> dict | None:
-    """Fetch last_run.json from the server via SSH. Returns parsed dict or None."""
+def get_archive_sync_status() -> dict | None:
+    """Return local archive sync status from the Mac launchd-managed log."""
+    try:
+        if not ARCHIVE_SYNC_LOG_FILE.exists():
+            return None
+        last_start = None
+        last_complete = None
+        for line in ARCHIVE_SYNC_LOG_FILE.read_text(errors='ignore').splitlines():
+            if "Starting PCF archive sync" in line:
+                last_start = line.strip()
+            elif "PCF archive sync complete" in line:
+                last_complete = line.strip()
+        if not last_complete:
+            return None
+        return {
+            "status": "success",
+            "lastStart": last_start,
+            "lastComplete": last_complete,
+        }
+    except Exception as e:
+        logger.debug("Archive sync status check failed: %s", e)
+    return None
+
+
+def get_archive_purge_status() -> dict | None:
+    """Fetch live archive purge worker status from the server."""
     try:
         result = subprocess.run(
             ['ssh', '-o', 'ConnectTimeout=3', '-o', 'BatchMode=yes',
-             ARCHIVE_SSH_HOST, f'cat {ARCHIVE_STATUS_PATH}'],
+             ARCHIVE_SSH_HOST,
+             (
+                 "docker exec routespark-order-forecast sh -lc "
+                 "\"cat /app/logs/service_status.json 2>/dev/null; "
+                 "printf '\\n---ROUTESPARK-SEP---\\n'; "
+                 "tail -n 40 /app/logs/archive_purge_worker.log 2>/dev/null\""
+             )],
             capture_output=True, text=True, timeout=8,
         )
         if result.returncode == 0 and result.stdout.strip():
-            return json.loads(result.stdout)
+            raw = result.stdout
+            if "\n---ROUTESPARK-SEP---\n" not in raw:
+                return None
+            status_raw, log_raw = raw.split("\n---ROUTESPARK-SEP---\n", 1)
+            service_status = json.loads(status_raw)
+            services = service_status.get("services", [])
+            purge_service = next(
+                (svc for svc in services if svc.get("name") == ARCHIVE_PURGE_SERVICE_NAME),
+                None,
+            )
+            last_log_line = ""
+            for line in reversed(log_raw.splitlines()):
+                if "[archive_purge_worker]" in line:
+                    last_log_line = line.strip()
+                    break
+            state = "unknown"
+            if "ARCHIVE_PURGE_ENABLED=false; purge cycle skipped" in last_log_line:
+                state = "disabled"
+            elif "purge cycle skipped" in last_log_line:
+                state = "skipped"
+            elif last_log_line:
+                state = "active"
+            return {
+                "serviceTimestamp": service_status.get("timestamp"),
+                "running": bool(purge_service and purge_service.get("running")),
+                "state": state,
+                "lastLogLine": last_log_line,
+            }
     except Exception as e:
-        logger.debug("Archive cleanup status check failed: %s", e)
+        logger.debug("Archive purge status check failed: %s", e)
     return None
 
 
@@ -271,6 +330,27 @@ def format_archive_timestamp(ts: str) -> str:
         return local_dt.strftime("%b %d %H:%M")
     except Exception:
         return ts[:16] if ts else "?"
+
+
+def extract_log_timestamp(line: str) -> str:
+    """Extract timestamp prefix from local or server log lines."""
+    if not line:
+        return ""
+    patterns = [
+        (r"^[A-Z][a-z]{2} [A-Z][a-z]{2}\s+\d{1,2} \d\d:\d\d:\d\d [A-Z]{2,4} \d{4}", "%a %b %d %H:%M:%S %Z %Y"),
+        (r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}", "%Y-%m-%d %H:%M:%S"),
+    ]
+    for pattern, fmt in patterns:
+        match = re.match(pattern, line)
+        if not match:
+            continue
+        raw = match.group(0)
+        try:
+            parsed = datetime.strptime(raw, fmt)
+            return parsed.strftime("%b %d %H:%M")
+        except Exception:
+            return raw
+    return ""
 
 
 def format_backup_timestamp(ts: str) -> str:
@@ -513,10 +593,14 @@ class RouteSparkWidget(QWidget):
         self.backup_row = ServiceRow("Backup", is_server=True, info_width=120)
         layout.addWidget(self.backup_row)
 
-        self.archive_row = ServiceRow("Archive Cleanup", is_server=True, info_width=120)
-        layout.addWidget(self.archive_row)
-        self._archive_cache = None
-        self._archive_last_check = 0
+        self.archive_sync_row = ServiceRow("Archive Sync", is_server=False, info_width=120)
+        layout.addWidget(self.archive_sync_row)
+        self.archive_purge_row = ServiceRow("Archive Purge", is_server=True, info_width=120)
+        layout.addWidget(self.archive_purge_row)
+        self._archive_sync_cache = None
+        self._archive_sync_last_check = 0
+        self._archive_purge_cache = None
+        self._archive_purge_last_check = 0
 
         self.server_service_rows = {}
         for label in SERVER_SERVICE_MAP.keys():
@@ -607,11 +691,11 @@ class RouteSparkWidget(QWidget):
         layout.addLayout(btn_layout)
         
         # Set size
-        self.setFixedSize(320, 565)
+        self.setFixedSize(320, 590)
         
         # Position in bottom-right corner
         screen = QApplication.primaryScreen().geometry()
-        self.move(screen.width() - 340, screen.height() - 585)
+        self.move(screen.width() - 340, screen.height() - 610)
         
         # Initial refresh
         self.refresh_status()
@@ -703,28 +787,41 @@ class RouteSparkWidget(QWidget):
         else:
             self.backup_row.update_status(running=False, info="NONE")
 
-        # Archive cleanup status (SSH check once per hour, cached between)
+        # Archive sync status (local log, check once per minute)
         now = time.time()
-        if now - self._archive_last_check >= 3600:
-            self._archive_last_check = now
-            def fetch_archive():
-                self._archive_cache = get_archive_cleanup_status()
-            Thread(target=fetch_archive, daemon=True).start()
+        if now - self._archive_sync_last_check >= 60:
+            self._archive_sync_last_check = now
+            self._archive_sync_cache = get_archive_sync_status()
 
-        if self._archive_cache:
-            arc_status = self._archive_cache.get("status", "unknown")
-            arc_ts = self._archive_cache.get("timestamp", "")
-            arc_info = format_archive_timestamp(arc_ts)
-            if arc_status == "success":
-                self.archive_row.update_status(running=True, info=arc_info)
-            elif arc_status == "partial":
-                self.archive_row.update_status(running=True, info=f"WARN {arc_info}")
-            elif arc_status == "dry_run":
-                self.archive_row.update_status(running=True, info=f"DRY {arc_info}")
-            else:
-                self.archive_row.update_status(running=False, info=arc_info)
+        if self._archive_sync_cache:
+            complete_line = self._archive_sync_cache.get("lastComplete", "")
+            sync_info = extract_log_timestamp(complete_line)
+            self.archive_sync_row.update_status(running=True, info=sync_info or "OK")
         else:
-            self.archive_row.update_status(running=False, info="NO DATA")
+            self.archive_sync_row.update_status(running=False, info="NO DATA")
+
+        # Archive purge status (SSH check once per hour, cached between)
+        if now - self._archive_purge_last_check >= 3600:
+            self._archive_purge_last_check = now
+            def fetch_archive_purge():
+                self._archive_purge_cache = get_archive_purge_status()
+            Thread(target=fetch_archive_purge, daemon=True).start()
+
+        if self._archive_purge_cache:
+            purge_state = self._archive_purge_cache.get("state", "unknown")
+            purge_running = bool(self._archive_purge_cache.get("running"))
+            purge_line = self._archive_purge_cache.get("lastLogLine", "")
+            purge_info = extract_log_timestamp(purge_line)
+            if purge_state == "disabled":
+                self.archive_purge_row.update_status(running=True, info=f"OFF {purge_info}".strip())
+            elif purge_state == "skipped":
+                self.archive_purge_row.update_status(running=True, info=f"SKIP {purge_info}".strip())
+            elif purge_running:
+                self.archive_purge_row.update_status(running=True, info=purge_info or "OK")
+            else:
+                self.archive_purge_row.update_status(running=False, info=purge_info or "DOWN")
+        else:
+            self.archive_purge_row.update_status(running=False, info="NO DATA")
 
         # Firebase health
         firebase_health = self.server_health.get('firebaseHealth', {})
