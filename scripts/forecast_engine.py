@@ -1055,6 +1055,126 @@ def _get_same_cycle_recent_orders_by_store(
         return {}
 
 
+def _get_recent_route_ordered_saps(
+    route_number: str,
+    target_delivery_date: str,
+    recent_orders: int = 2,
+) -> Dict[str, int]:
+    """
+    Find SAPs ordered in the last N finalized route-order opportunities before the target.
+
+    Returns dict sap -> order_rank where:
+      1 = most recent route order before target
+      2 = second most recent route order before target
+    """
+    if recent_orders <= 0:
+        return {}
+    try:
+        recent_order_rows = fetch_all(
+            """
+            SELECT o.order_id
+            FROM orders_historical o
+            WHERE o.route_number = %s
+              AND o.delivery_date < %s
+              AND o.status = 'finalized'
+            GROUP BY o.order_id, o.delivery_date
+            ORDER BY o.delivery_date DESC
+            LIMIT %s
+            """,
+            [route_number, target_delivery_date, recent_orders],
+        )
+        order_ids = [row["order_id"] for row in recent_order_rows if row.get("order_id")]
+        if not order_ids:
+            return {}
+
+        rows = fetch_all(
+            """
+            SELECT oli.sap, oli.order_id
+            FROM order_line_items oli
+            WHERE oli.order_id = ANY(%s)
+              AND oli.quantity > 0
+            """,
+            [order_ids],
+        )
+        if not rows:
+            return {}
+
+        rank_by_order = {order_id: idx + 1 for idx, order_id in enumerate(order_ids)}
+        result: Dict[str, int] = {}
+        for row in rows:
+            sap = str(row["sap"])
+            rank = rank_by_order.get(row["order_id"])
+            if rank is None:
+                continue
+            current = result.get(sap)
+            if current is None or rank < current:
+                result[sap] = rank
+        return result
+    except Exception as e:
+        print(f"[forecast] Warning: Recent route-ordered SAP query exception: {e}")
+        return {}
+
+
+def _get_recent_route_ordered_saps_by_store(
+    route_number: str,
+    target_delivery_date: str,
+    recent_orders: int = 2,
+) -> Dict[Tuple[str, str], int]:
+    """
+    Find store+SAP combinations ordered in the last N finalized route-order opportunities.
+
+    Returns dict (store_id, sap) -> order_rank where:
+      1 = most recent route order before target
+      2 = second most recent route order before target
+    """
+    if recent_orders <= 0:
+        return {}
+    try:
+        recent_order_rows = fetch_all(
+            """
+            SELECT o.order_id
+            FROM orders_historical o
+            WHERE o.route_number = %s
+              AND o.delivery_date < %s
+              AND o.status = 'finalized'
+            GROUP BY o.order_id, o.delivery_date
+            ORDER BY o.delivery_date DESC
+            LIMIT %s
+            """,
+            [route_number, target_delivery_date, recent_orders],
+        )
+        order_ids = [row["order_id"] for row in recent_order_rows if row.get("order_id")]
+        if not order_ids:
+            return {}
+
+        rows = fetch_all(
+            """
+            SELECT oli.store_id, oli.sap, oli.order_id
+            FROM order_line_items oli
+            WHERE oli.order_id = ANY(%s)
+              AND oli.quantity > 0
+            """,
+            [order_ids],
+        )
+        if not rows:
+            return {}
+
+        rank_by_order = {order_id: idx + 1 for idx, order_id in enumerate(order_ids)}
+        result: Dict[Tuple[str, str], int] = {}
+        for row in rows:
+            key = (row["store_id"], str(row["sap"]))
+            rank = rank_by_order.get(row["order_id"])
+            if rank is None:
+                continue
+            current = result.get(key)
+            if current is None or rank < current:
+                result[key] = rank
+        return result
+    except Exception as e:
+        print(f"[forecast] Warning: Recent route-ordered store/SAP query exception: {e}")
+        return {}
+
+
 @dataclass
 class ForecastConfig:
     route_number: str
@@ -2544,6 +2664,19 @@ def generate_forecast(config: ForecastConfig) -> ForecastPayload:
             f"[forecast] Found {len(same_cycle_recent_by_store)} store/SAPs ordered in same cycle "
             f"within {same_cycle_lookback_days} days"
         )
+    recent_order_opportunity_block = int(
+        os.environ.get("SLOW_MOVER_RECENT_ORDER_OPPORTUNITY_BLOCK", "2")
+    )
+    recent_route_ordered_saps = _get_recent_route_ordered_saps(
+        route_number=config.route_number,
+        target_delivery_date=delivery_iso,
+        recent_orders=recent_order_opportunity_block,
+    )
+    recent_route_ordered_saps_by_store = _get_recent_route_ordered_saps_by_store(
+        route_number=config.route_number,
+        target_delivery_date=delivery_iso,
+        recent_orders=recent_order_opportunity_block,
+    )
     
     # SAP velocity tiers: SLOW (≤25%), MEDIUM (25-60%), FAST (>60%)
     # Used for tiered suppression logic - slow movers get rule-based handling
@@ -2825,7 +2958,7 @@ def generate_forecast(config: ForecastConfig) -> ForecastPayload:
             print(f"[DEBUG] SAP {sap}: case_pack={case_pack}, products count={len(products)}")
         
         # === TIERED SUPPRESSION LOGIC ===
-        # SLOW movers: Rule-based with home cycle assignment
+        # SLOW movers: recency-based suppression across recent order opportunities
         # MEDIUM/FAST movers: ML prediction (no suppression)
         
         tier_info = sap_tiers.get(sap_str)
@@ -2833,56 +2966,43 @@ def generate_forecast(config: ForecastConfig) -> ForecastPayload:
         is_shared_case = bool(tier_info and tier_info.is_shared_case)
         
         if is_slow and is_shared_case:
-            # Shared-case slow movers: route-level home cycle suppression (single restock event)
-            home_cycle = tier_info.home_cycle if tier_info else None
+            # Shared-case slow movers: if the item was ordered recently on any cycle,
+            # suppress it for the next few route-order opportunities.
             slow_suppression_days = _compute_slow_suppression_days(
                 float(tier_info.order_frequency if tier_info else 0.25)
             )
-            
-            if home_cycle:
-                if schedule_key != home_cycle:
-                    cross_match = None
-                    for (sid, s), cco in cross_cycle_orders.items():
-                        if s == sap_str:
-                            cross_match = cco
-                            break
-                    
-                    if cross_match:
+            recent_rank = recent_route_ordered_saps.get(sap_str)
+            if recent_rank is not None and recent_rank <= recent_order_opportunity_block:
+                suppressed_slow_movers.append(
+                    f"{sap_str} (SLOW shared, ordered in route opportunity "
+                    f"{recent_rank}/{recent_order_opportunity_block})"
+                )
+                continue
+            shared_cross_matches = [
+                cco for (sid, s), cco in cross_cycle_orders.items() if s == sap_str
+            ]
+            shared_cross_days = min((cco.days_ago for cco in shared_cross_matches), default=None)
+            shared_same_days = same_cycle_recent.get(sap_str)
+
+            candidate_days = [
+                d for d in (shared_cross_days, shared_same_days) if d is not None
+            ]
+            if candidate_days:
+                recent_days = min(candidate_days)
+                if recent_days < slow_suppression_days:
+                    if shared_cross_days is not None and (
+                        shared_same_days is None or shared_cross_days <= shared_same_days
+                    ):
+                        cross_match = min(shared_cross_matches, key=lambda cco: cco.days_ago)
                         suppressed_slow_movers.append(
-                            f"{sap_str} (SLOW shared, home={home_cycle}, ordered {cross_match.days_ago}d ago)"
+                            f"{sap_str} (SLOW shared, ordered {cross_match.days_ago}d ago in "
+                            f"{cross_match.schedule_key}, window={slow_suppression_days}d)"
                         )
                     else:
                         suppressed_slow_movers.append(
-                            f"{sap_str} (SLOW shared, home={home_cycle}, current={schedule_key})"
-                        )
-                    continue
-                else:
-                    days_ago = same_cycle_recent.get(sap_str)
-                    if days_ago is not None and days_ago < slow_suppression_days:
-                        suppressed_slow_movers.append(
-                            f"{sap_str} (SLOW shared, home={home_cycle}, same-cycle {days_ago}d ago, "
+                            f"{sap_str} (SLOW shared, same-cycle {shared_same_days}d ago, "
                             f"window={slow_suppression_days}d)"
                         )
-                        continue
-            else:
-                cross_match = None
-                for (sid, s), cco in cross_cycle_orders.items():
-                    if s == sap_str:
-                        cross_match = cco
-                        break
-                
-                if cross_match:
-                    suppressed_slow_movers.append(
-                        f"{sap_str} (SLOW shared, no home, ordered {cross_match.days_ago}d ago in {cross_match.schedule_key})"
-                    )
-                    continue
-                
-                days_ago = same_cycle_recent.get(sap_str)
-                if days_ago is not None and days_ago < slow_suppression_days:
-                    suppressed_slow_movers.append(
-                        f"{sap_str} (SLOW shared, no home, same-cycle {days_ago}d ago, "
-                        f"window={slow_suppression_days}d)"
-                    )
                     continue
         
         # MEDIUM and FAST movers: No suppression - ML handles them
@@ -2912,34 +3032,30 @@ def generate_forecast(config: ForecastConfig) -> ForecastPayload:
             if is_slow and not is_shared_case:
                 store_order_freq = float(row.get("order_frequency", 0.0) or 0.0)
                 slow_suppression_days = _compute_slow_suppression_days(store_order_freq)
-                store_home = store_sap_home_cycles.get((store_id, sap_str))
-                if store_home:
-                    home_cycle = store_home[0]
-                    if schedule_key != home_cycle:
-                        suppressed_slow_movers.append(
-                            f"{sap_str} (SLOW store={store_id}, home={home_cycle}, current={schedule_key})"
-                        )
-                        continue
-                    days_ago = same_cycle_recent_by_store.get((store_id, sap_str))
-                    if days_ago is not None and days_ago < slow_suppression_days:
-                        suppressed_slow_movers.append(
-                            f"{sap_str} (SLOW store={store_id}, home={home_cycle}, same-cycle {days_ago}d ago, "
-                            f"window={slow_suppression_days}d)"
-                        )
-                        continue
-                else:
-                    cross_match = cross_cycle_orders.get((store_id, sap_str))
-                    if cross_match:
-                        suppressed_slow_movers.append(
-                            f"{sap_str} (SLOW store={store_id}, no home, ordered {cross_match.days_ago}d ago in {cross_match.schedule_key})"
-                        )
-                        continue
-                    days_ago = same_cycle_recent_by_store.get((store_id, sap_str))
-                    if days_ago is not None and days_ago < slow_suppression_days:
-                        suppressed_slow_movers.append(
-                            f"{sap_str} (SLOW store={store_id}, no home, same-cycle {days_ago}d ago, "
-                            f"window={slow_suppression_days}d)"
-                        )
+                recent_rank = recent_route_ordered_saps_by_store.get((store_id, sap_str))
+                if recent_rank is not None and recent_rank <= recent_order_opportunity_block:
+                    suppressed_slow_movers.append(
+                        f"{sap_str} (SLOW store={store_id}, ordered in route opportunity "
+                        f"{recent_rank}/{recent_order_opportunity_block})"
+                    )
+                    continue
+                cross_match = cross_cycle_orders.get((store_id, sap_str))
+                cross_days = cross_match.days_ago if cross_match else None
+                same_days = same_cycle_recent_by_store.get((store_id, sap_str))
+                candidate_days = [d for d in (cross_days, same_days) if d is not None]
+                if candidate_days:
+                    recent_days = min(candidate_days)
+                    if recent_days < slow_suppression_days:
+                        if cross_days is not None and (same_days is None or cross_days <= same_days):
+                            suppressed_slow_movers.append(
+                                f"{sap_str} (SLOW store={store_id}, ordered {cross_match.days_ago}d ago in "
+                                f"{cross_match.schedule_key}, window={slow_suppression_days}d)"
+                            )
+                        else:
+                            suppressed_slow_movers.append(
+                                f"{sap_str} (SLOW store={store_id}, same-cycle {same_days}d ago, "
+                                f"window={slow_suppression_days}d)"
+                            )
                         continue
 
             if is_slow and _should_zero_low_signal_slow_line(row, case_pack):

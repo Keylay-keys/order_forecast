@@ -15,9 +15,10 @@ import json
 import urllib.request
 import urllib.error
 import re
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from threading import Thread
+from threading import Lock, Thread
 import time
 import logging
 from logging.handlers import RotatingFileHandler
@@ -39,6 +40,7 @@ SETTINGS_FILE = APP_DIR / '.widget_settings.json'
 WIDGET_LOG_FILE = Path.home() / 'Library' / 'Logs' / 'routespark-widget.log'
 BACKUP_LOG_FILE = Path.home() / 'Library' / 'Logs' / 'routespark-critical-backup.log'
 ARCHIVE_SYNC_LOG_FILE = Path.home() / 'Library' / 'Logs' / 'routespark-pcf-archive-sync.log'
+PCF_RECONCILER_HEARTBEAT_FILE = Path.home() / 'projects' / 'pcf_pipeline' / 'logs' / 'reconciler' / 'archive_selector_heartbeat.json'
 ARCHIVE_SSH_HOST = "keylay@100.64.201.120"
 ARCHIVE_PURGE_SERVICE_NAME = "Archive Purge Worker"
 logger = logging.getLogger("routespark_widget")
@@ -191,6 +193,38 @@ COLORS = {
 }
 
 
+@dataclass
+class ProbeResult:
+    service: str
+    ok: bool
+    checked_at: float
+    latency_ms: int | None
+    status: str
+    error: str | None = None
+    details: dict | None = None
+
+
+@dataclass
+class MonitorState:
+    service: str
+    status: str = "up"
+    consecutive_failures: int = 0
+    consecutive_successes: int = 0
+    last_result: ProbeResult | None = None
+    last_transition_at: float | None = None
+    last_notified_at: float | None = None
+    last_error_logged: str | None = None
+
+
+@dataclass
+class TransitionInfo:
+    old_status: str
+    new_status: str
+    did_transition: bool
+    should_notify_down: bool = False
+    should_notify_recovery: bool = False
+
+
 def check_process_running(pattern: str) -> tuple[bool, int]:
     """Check if a process matching pattern is running."""
     try:
@@ -319,6 +353,20 @@ def get_archive_purge_status() -> dict | None:
             }
     except Exception as e:
         logger.debug("Archive purge status check failed: %s", e)
+    return None
+
+
+def get_pcf_reconciler_status() -> dict | None:
+    """Return local archive-triggered reconciler heartbeat state."""
+    try:
+        if not PCF_RECONCILER_HEARTBEAT_FILE.exists():
+            return None
+        data = json.loads(PCF_RECONCILER_HEARTBEAT_FILE.read_text())
+        if not isinstance(data, dict):
+            return None
+        return data
+    except Exception as e:
+        logger.debug("PCF reconciler status check failed: %s", e)
     return None
 
 
@@ -462,11 +510,10 @@ class RouteSparkWidget(QWidget):
         global logger
         logger = init_logger(self.settings)
         self.server_health = {'connected': False}
-        self.server_failures = 0
-        self.server_successes = 0
-        self.server_is_down = False
-        self.last_server_is_down = None
-        self.last_server_error = None
+        self.server_monitor = MonitorState(service="server")
+        self._server_probe_lock = Lock()
+        self._server_pending_result = None
+        self._server_probe_inflight = False
         self.last_notify_at = {}
         self.init_ui()
         logger.info(
@@ -499,15 +546,166 @@ class RouteSparkWidget(QWidget):
         title = "RouteSpark Service Down"
         message = f"{service_name} stopped at {timestamp}"
         logger.warning("%s", message)
+        if self._notification_allowed(service_name):
+            send_notification(title, message, self.settings)
+        else:
+            logger.info("Suppressed %s alert (cooldown)", service_name)
+
+    def _notification_allowed(self, service_name: str) -> bool:
+        """Return True when a notification is outside the configured cooldown."""
         cooldown_minutes = int(self.settings.get('notification_cooldown_minutes', 30))
         last_ts = self.last_notify_at.get(service_name, 0)
         now_ts = time.time()
         if now_ts - last_ts >= cooldown_minutes * 60:
             self.last_notify_at[service_name] = now_ts
-            send_notification(title, message, self.settings)
+            return True
+        return False
+
+    def _probe_server_health(self) -> ProbeResult:
+        """Return a timestamped server health probe result."""
+        timeout_seconds = int(self.settings.get('server_check_timeout_seconds', 5))
+        server_api_url = self.settings.get('server_api_url', SERVER_API_URL)
+        started_at = time.time()
+        details = check_server_health(server_api_url, timeout_seconds)
+        latency_ms = int((time.time() - started_at) * 1000)
+        return ProbeResult(
+            service="server",
+            ok=bool(details.get('connected', False)),
+            checked_at=time.time(),
+            latency_ms=latency_ms,
+            status=details.get('status', 'offline'),
+            error=details.get('error'),
+            details=details,
+        )
+
+    def _launch_server_probe(self):
+        """Start a server probe if one is not already in flight."""
+        with self._server_probe_lock:
+            if self._server_probe_inflight:
+                return
+            self._server_probe_inflight = True
+
+        def check_server():
+            result = self._probe_server_health()
+            with self._server_probe_lock:
+                self._server_pending_result = result
+                self._server_probe_inflight = False
+
+        Thread(target=check_server, daemon=True).start()
+
+    def _consume_server_probe_result(self) -> ProbeResult | None:
+        """Return the latest completed server probe result, if any."""
+        with self._server_probe_lock:
+            result = self._server_pending_result
+            self._server_pending_result = None
+            return result
+
+    def _apply_server_probe_result(self, probe_result: ProbeResult) -> TransitionInfo:
+        """Apply a fresh probe result to the server monitor state."""
+        monitor = self.server_monitor
+        old_status = monitor.status
+        failure_threshold = int(self.settings.get('server_failure_threshold', 3))
+        recovery_threshold = int(self.settings.get('server_recovery_threshold', 2))
+
+        if probe_result.ok:
+            monitor.consecutive_failures = 0
+            if old_status == "down":
+                monitor.consecutive_successes += 1
+            else:
+                monitor.consecutive_successes = 1
+            if old_status == "down" and monitor.consecutive_successes >= recovery_threshold:
+                monitor.status = "up"
+            elif old_status == "retrying":
+                monitor.status = "up"
+            else:
+                monitor.status = "up"
+            monitor.last_error_logged = None
         else:
-            logger.info("Suppressed %s alert (cooldown)", service_name)
-    
+            monitor.consecutive_successes = 0
+            monitor.consecutive_failures += 1
+            if old_status == "up":
+                monitor.status = "retrying"
+            elif old_status == "retrying" and monitor.consecutive_failures >= failure_threshold:
+                monitor.status = "down"
+            else:
+                monitor.status = old_status
+
+        monitor.last_result = probe_result
+        did_transition = monitor.status != old_status
+        if did_transition:
+            monitor.last_transition_at = probe_result.checked_at
+
+        return TransitionInfo(
+            old_status=old_status,
+            new_status=monitor.status,
+            did_transition=did_transition,
+            should_notify_down=did_transition and old_status == "retrying" and monitor.status == "down",
+            should_notify_recovery=(
+                did_transition
+                and old_status == "down"
+                and monitor.status == "up"
+                and bool(self.settings.get('notify_recovery', False))
+            ),
+        )
+
+    def _handle_server_transition(self, transition: TransitionInfo):
+        """Log and notify on server status transitions."""
+        if not transition.did_transition:
+            return
+
+        logger.info("Server transition %s -> %s", transition.old_status, transition.new_status)
+
+        if transition.should_notify_down:
+            service_name = self.server_row.name
+            timestamp = datetime.now().strftime('%H:%M:%S')
+            title = "RouteSpark Service Down"
+            message = f"{service_name} stopped at {timestamp}"
+            logger.warning("%s", message)
+            if self._notification_allowed(service_name):
+                send_notification(title, message, self.settings)
+            else:
+                logger.info("Suppressed %s alert (cooldown)", service_name)
+
+        if transition.should_notify_recovery:
+            service_name = self.server_row.name
+            if self._notification_allowed(service_name):
+                send_notification("RouteSpark Service Up", "Server recovered", self.settings)
+            else:
+                logger.info("Suppressed %s recovery alert (cooldown)", service_name)
+
+    def _render_server_row(self):
+        """Render the server row from the current monitor state."""
+        monitor = self.server_monitor
+        result = monitor.last_result
+
+        if result is None:
+            self.server_row.update_status(running=True, info="...")
+            self.server_row.indicator.setStyleSheet(f"color: {COLORS['yellow']};")
+            self.server_status.setText("Checking...")
+            self.server_status.setStyleSheet(f"color: {COLORS['yellow']};")
+            self.server_stats.setText("")
+            return
+
+        if monitor.status == "down":
+            self.server_row.update_status(running=False, info="DOWN")
+            self.server_status.setText("Offline")
+            self.server_status.setStyleSheet(f"color: {COLORS['red']};")
+            self.server_stats.setText("")
+            return
+
+        if monitor.status == "retrying":
+            self.server_row.update_status(running=True, info="RETRY")
+            self.server_row.indicator.setStyleSheet(f"color: {COLORS['yellow']};")
+            self.server_status.setText("Retrying...")
+            self.server_status.setStyleSheet(f"color: {COLORS['yellow']};")
+            self.server_stats.setText("")
+            return
+
+        self.server_row.update_status(running=True, info="OK")
+        self.server_status.setText("Connected")
+        self.server_status.setStyleSheet(f"color: {COLORS['green']};")
+        self.server_stats.setText("Public health OK")
+
     def init_ui(self):
         """Initialize the UI."""
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint)
@@ -584,7 +782,6 @@ class RouteSparkWidget(QWidget):
         
         # Server info rows
         self.server_row = ServiceRow("API + PostgreSQL", is_server=True)
-        self.server_row.service_down.connect(self._on_service_down)
         layout.addWidget(self.server_row)
 
         self.firebase_row = ServiceRow("Firebase", is_server=True)
@@ -599,6 +796,8 @@ class RouteSparkWidget(QWidget):
         layout.addWidget(self.archive_purge_row)
         self._archive_sync_cache = None
         self._archive_sync_last_check = 0
+        self._reconciler_cache = None
+        self._reconciler_last_check = 0
         self._archive_purge_cache = None
         self._archive_purge_last_check = 0
 
@@ -644,6 +843,9 @@ class RouteSparkWidget(QWidget):
             row.service_down.connect(self._on_service_down)
             self.mac_rows.append(row)
             layout.addWidget(row)
+
+        self.reconciler_row = ServiceRow("PCF Reconciler", is_server=False, info_width=120)
+        layout.addWidget(self.reconciler_row)
         
         # Divider
         divider2 = QFrame()
@@ -719,66 +921,17 @@ class RouteSparkWidget(QWidget):
     
     def refresh_status(self):
         """Refresh all service statuses."""
-        # Check server
-        def check_server():
-            timeout_seconds = int(self.settings.get('server_check_timeout_seconds', 5))
-            server_api_url = self.settings.get('server_api_url', SERVER_API_URL)
-            self.server_health = check_server_health(server_api_url, timeout_seconds)
-        
-        Thread(target=check_server, daemon=True).start()
-        
-        # Update server row with debounce to avoid flapping notifications
-        is_connected = self.server_health.get('connected', False)
-        if is_connected:
-            self.server_failures = 0
-            self.server_successes += 1
-            self.last_server_error = None
-        else:
-            self.server_successes = 0
-            self.server_failures += 1
-        
-        failure_threshold = int(self.settings.get('server_failure_threshold', 3))
-        recovery_threshold = int(self.settings.get('server_recovery_threshold', 2))
-        
-        if not self.server_is_down and self.server_failures >= failure_threshold:
-            self.server_is_down = True
-        elif self.server_is_down and self.server_successes >= recovery_threshold:
-            self.server_is_down = False
-            if self.settings.get('notify_recovery', False):
-                send_notification("RouteSpark Service Up", "Server recovered", self.settings)
+        latest_probe = self._consume_server_probe_result()
+        if latest_probe is not None:
+            self.server_health = latest_probe.details or {'connected': False}
+            transition = self._apply_server_probe_result(latest_probe)
+            if latest_probe.error and latest_probe.error != self.server_monitor.last_error_logged:
+                logger.warning("Server health error: %s", latest_probe.error)
+                self.server_monitor.last_error_logged = latest_probe.error
+            self._handle_server_transition(transition)
 
-        if self.last_server_is_down is None:
-            self.last_server_is_down = self.server_is_down
-        elif self.server_is_down != self.last_server_is_down:
-            if self.server_is_down:
-                logger.warning("Server marked DOWN after %s failures", self.server_failures)
-            else:
-                logger.info("Server marked UP after %s successes", self.server_successes)
-            self.last_server_is_down = self.server_is_down
-
-        server_error = self.server_health.get('error')
-        if server_error and server_error != self.last_server_error:
-            logger.warning("Server health error: %s", server_error)
-            self.last_server_error = server_error
-        
-        display_running = not self.server_is_down
-        self.server_row.update_status(
-            running=display_running,
-            info="OK" if display_running else "DOWN"
-        )
-        
-        if display_running and is_connected:
-            self.server_status.setText("Connected")
-            self.server_status.setStyleSheet(f"color: {COLORS['green']};")
-            self.server_stats.setText("Public health OK")
-        elif display_running and not is_connected:
-            self.server_status.setText("Retrying...")
-            self.server_status.setStyleSheet(f"color: {COLORS['yellow']};")
-            self.server_stats.setText("")
-        else:
-            self.server_status.setText("Offline")
-            self.server_status.setStyleSheet(f"color: {COLORS['red']};")
-            self.server_stats.setText("")
+        self._launch_server_probe()
+        self._render_server_row()
 
         backup_ts = get_last_backup_success(BACKUP_LOG_FILE)
         if backup_ts:
@@ -799,6 +952,24 @@ class RouteSparkWidget(QWidget):
             self.archive_sync_row.update_status(running=True, info=sync_info or "OK")
         else:
             self.archive_sync_row.update_status(running=False, info="NO DATA")
+
+        # PCF fragmented-delivery reconciler heartbeat (local file, check once per minute)
+        if now - self._reconciler_last_check >= 60:
+            self._reconciler_last_check = now
+            self._reconciler_cache = get_pcf_reconciler_status()
+
+        if self._reconciler_cache:
+            watcher = bool(self._reconciler_cache.get("watcher"))
+            observer_alive = bool(self._reconciler_cache.get("observerAlive"))
+            pending = int(self._reconciler_cache.get("pendingDeliveries", 0) or 0)
+            last_seen = format_archive_timestamp(self._reconciler_cache.get("lastSeenAt", ""))
+            if watcher and observer_alive:
+                info = f"{last_seen} · {pending}" if last_seen else f"P{pending}"
+                self.reconciler_row.update_status(running=True, info=info)
+            else:
+                self.reconciler_row.update_status(running=False, info="STALE")
+        else:
+            self.reconciler_row.update_status(running=False, info="NO DATA")
 
         # Archive purge status (SSH check once per hour, cached between)
         if now - self._archive_purge_last_check >= 3600:
