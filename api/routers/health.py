@@ -15,6 +15,8 @@ import json
 import logging
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, List
+from urllib.error import URLError, HTTPError
+from urllib.request import Request as UrlRequest, urlopen
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pathlib import Path
 
@@ -235,8 +237,28 @@ async def trigger_sync(
 async def services_health(
     decoded_token: dict = Depends(verify_firebase_token),
 ) -> dict:
-    """Order-forecast service heartbeat status (from supervisor)."""
+    """Order-forecast service heartbeat status."""
     _ = decoded_token
+    status_url = os.environ.get("ORDER_FORECAST_STATUS_URL", "").strip()
+    if status_url:
+        timeout = float(os.environ.get("ORDER_FORECAST_STATUS_TIMEOUT_SECONDS", "3"))
+        try:
+            req = UrlRequest(status_url, headers={"Accept": "application/json"})
+            with urlopen(req, timeout=timeout) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+                return payload if isinstance(payload, dict) else {
+                    "status": "unavailable",
+                    "error": "invalid_status_payload",
+                    "timestamp": datetime.utcnow().isoformat(),
+                }
+        except (HTTPError, URLError, TimeoutError, json.JSONDecodeError) as exc:
+            logger.error("Remote services health check failed: %s", exc)
+            return {
+                "status": "unavailable",
+                "error": "status_service_unreachable",
+                "timestamp": datetime.utcnow().isoformat(),
+            }
+
     # Allowed directories for status files (path traversal protection)
     ALLOWED_STATUS_DIRS = [
         Path("/app/logs"),
@@ -245,7 +267,7 @@ async def services_health(
 
     status_file = os.environ.get(
         "ORDER_FORECAST_STATUS_FILE",
-        "/app/logs/order-forecast/service_status.json",
+        "/app/logs/order-forecast/order_forecast_status.json",
     )
     path = Path(status_file).resolve()
 

@@ -18,6 +18,7 @@ import argparse
 import json
 import os
 import socket
+import threading
 import time
 from datetime import datetime, timezone
 from typing import Optional, Dict, List, Set
@@ -33,23 +34,41 @@ WORKER_ID = f"config-sync-{socket.gethostname()}-{os.getpid()}"
 # PostgreSQL Connection
 # =============================================================================
 
-_pg_conn: Optional[psycopg2.extensions.connection] = None
+_pg_state = threading.local()
+
+
+def _new_pg_connection() -> psycopg2.extensions.connection:
+    conn = psycopg2.connect(
+        host=os.environ.get('POSTGRES_HOST', 'localhost'),
+        port=int(os.environ.get('POSTGRES_PORT', 5432)),
+        database=os.environ.get('POSTGRES_DB', 'routespark'),
+        user=os.environ.get('POSTGRES_USER', 'routespark'),
+        password=os.environ.get('POSTGRES_PASSWORD', ''),
+    )
+    # Keep autocommit disabled so each sync unit can commit/rollback atomically.
+    conn.autocommit = False
+    return conn
 
 
 def get_pg_connection() -> psycopg2.extensions.connection:
-    """Get or create a PostgreSQL connection for direct DB access."""
-    global _pg_conn
-    if _pg_conn is None or _pg_conn.closed:
-        _pg_conn = psycopg2.connect(
-            host=os.environ.get('POSTGRES_HOST', 'localhost'),
-            port=int(os.environ.get('POSTGRES_PORT', 5432)),
-            database=os.environ.get('POSTGRES_DB', 'routespark'),
-            user=os.environ.get('POSTGRES_USER', 'routespark'),
-            password=os.environ.get('POSTGRES_PASSWORD', ''),
-        )
-        # Keep autocommit disabled so each sync unit can commit/rollback atomically.
-        _pg_conn.autocommit = False
-    return _pg_conn
+    """Get or create a thread-local PostgreSQL connection for direct DB access."""
+    conn = getattr(_pg_state, 'conn', None)
+    if conn is None or conn.closed:
+        conn = _new_pg_connection()
+        _pg_state.conn = conn
+    return conn
+
+
+def close_pg_connection() -> None:
+    """Close the current thread-local PostgreSQL connection, if any."""
+    conn = getattr(_pg_state, 'conn', None)
+    if conn is None:
+        return
+    try:
+        if not conn.closed:
+            conn.close()
+    finally:
+        _pg_state.conn = None
 
 
 def get_firestore_client(sa_path: str) -> firestore.Client:
@@ -619,6 +638,7 @@ def main(sa_path: str):
         print("\n\n[*] Shutdown requested...")
     finally:
         manager.stop_all()
+        close_pg_connection()
 
     return 0
 

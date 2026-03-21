@@ -28,6 +28,30 @@ from google.cloud import firestore  # type: ignore
 # Worker ID for this instance
 WORKER_ID = f"route-transfer-sync-{socket.gethostname()}-{os.getpid()}"
 
+
+def _allowed_routes() -> set[str] | None:
+    raw = os.environ.get("ROUTESPARK_ALLOWED_ROUTES", "").strip()
+    if not raw:
+        return None
+    values = {item.strip() for item in raw.split(",") if item.strip()}
+    return values or None
+
+
+def _transfer_allowed(data: dict) -> bool:
+    allowed = _allowed_routes()
+    if allowed is None:
+        return True
+    candidates = {
+        str(data.get("purchaseRouteNumber") or "").strip(),
+        str(data.get("fromRouteNumber") or "").strip(),
+        str(data.get("toRouteNumber") or "").strip(),
+    }
+    return any(value and value in allowed for value in candidates)
+
+
+def _skip_initial_snapshot() -> bool:
+    return os.environ.get("ROUTESPARK_SKIP_INITIAL_ROUTE_TRANSFER_SNAPSHOT", "0").lower() in ("1", "true", "yes")
+
 _pg_conn: Optional[psycopg2.extensions.connection] = None
 
 
@@ -102,6 +126,8 @@ def ensure_schema() -> None:
 
 def upsert_transfer(doc) -> None:
     data = doc.to_dict() or {}
+    if not _transfer_allowed(data):
+        return
     path = doc.reference.path  # routeTransfers/{routeGroupId}/transfers/{transferId}
     parts = path.split("/")
     if len(parts) < 4:
@@ -225,9 +251,17 @@ def watch_all_transfers(sa_path: str) -> None:
     db = get_firestore_client(sa_path)
 
     transfers_col = db.collection_group("transfers")
+    initial_snapshot_seen = False
 
     def on_snapshot(col_snapshot, changes, read_time):
+        nonlocal initial_snapshot_seen
         try:
+            if not initial_snapshot_seen:
+                initial_snapshot_seen = True
+                if _skip_initial_snapshot():
+                    primed = sum(1 for change in changes if change.type.name in ("ADDED", "MODIFIED"))
+                    print(f"   Initial snapshot skipped; primed {primed} existing transfer(s)")
+                    return
             for change in changes:
                 if change.type.name not in ("ADDED", "MODIFIED"):
                     continue
@@ -258,4 +292,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

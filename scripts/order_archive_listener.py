@@ -10,6 +10,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import os
 import socket
 import time
 from datetime import datetime, timezone
@@ -24,6 +25,25 @@ except ImportError:
 
 # Worker ID for this instance
 WORKER_ID = f"archive-{socket.gethostname()}-{__import__('os').getpid()}"
+
+
+def _allowed_routes() -> set[str] | None:
+    raw = os.environ.get("ROUTESPARK_ALLOWED_ROUTES", "").strip()
+    if not raw:
+        return None
+    values = {item.strip() for item in raw.split(",") if item.strip()}
+    return values or None
+
+
+def _route_allowed(route_number: str | None) -> bool:
+    if not route_number:
+        return False
+    allowed = _allowed_routes()
+    return True if allowed is None else str(route_number) in allowed
+
+
+def _skip_initial_snapshot() -> bool:
+    return os.environ.get("ROUTESPARK_SKIP_INITIAL_ORDER_ARCHIVE_SNAPSHOT", "0").lower() in ("1", "true", "yes")
 
 
 def get_firestore_client(sa_path: str) -> firestore.Client:
@@ -67,6 +87,9 @@ def handle_request(doc_ref, data: dict) -> bool:
             "workerId": WORKER_ID,
             "completedAt": firestore.SERVER_TIMESTAMP,
         })
+        return False
+
+    if not _route_allowed(route_number):
         return False
     
     # Claim this request
@@ -148,9 +171,19 @@ def watch_requests(sa_path: str):
 
     fb_client = get_firestore_client(sa_path)
     requests_col = fb_client.collection("orderRequests")
+    initial_snapshot_seen = False
     
     def on_snapshot(col_snapshot, changes, read_time):
         """Handle collection changes."""
+        nonlocal initial_snapshot_seen
+
+        if not initial_snapshot_seen:
+            initial_snapshot_seen = True
+            if _skip_initial_snapshot():
+                primed = sum(1 for change in changes if change.type.name in ("ADDED", "MODIFIED"))
+                print(f"   Initial snapshot skipped; primed {primed} existing request(s)")
+                return
+
         for change in changes:
             if change.type.name not in ('ADDED', 'MODIFIED'):
                 continue

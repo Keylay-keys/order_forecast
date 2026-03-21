@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import socket
 import time
 from datetime import datetime
@@ -30,8 +31,11 @@ except ImportError:
     from pg_utils import fetch_one, execute
     from low_quantity_loader import get_items_for_order_date, get_user_timezone
 
-WORKER_ID = f"low-qty-notif-{socket.gethostname()}-{__import__('os').getpid()}"
+WORKER_ID = f"low-qty-notif-{socket.gethostname()}-{os.getpid()}"
 EXPO_PUSH_URL = "https://exp.host/--/api/v2/push/send"
+LOW_QTY_NOTIFICATIONS_ENABLED = os.environ.get("LOW_QTY_NOTIFICATIONS_ENABLED", "true").lower() == "true"
+LOW_QTY_NOTIFICATION_DRY_RUN = os.environ.get("LOW_QTY_NOTIFICATION_DRY_RUN", "false").lower() == "true"
+CHECK_INTERVAL_SECONDS = int(os.environ.get("LOW_QTY_NOTIFICATION_CHECK_INTERVAL_SECONDS", "60"))
 
 # In-memory cache of users with reminders enabled
 # Updated by snapshot listener
@@ -48,6 +52,21 @@ reminder_cache: Dict[str, Dict] = {}
 _users_watcher: Optional[Watch] = None
 
 
+def _allowed_routes() -> set[str] | None:
+    raw = os.environ.get("ROUTESPARK_ALLOWED_ROUTES", "").strip()
+    if not raw:
+        return None
+    values = {item.strip() for item in raw.split(",") if item.strip()}
+    return values or None
+
+
+def _route_allowed(route_number: str | None) -> bool:
+    if not route_number:
+        return False
+    allowed = _allowed_routes()
+    return True if allowed is None else str(route_number) in allowed
+
+
 def get_firestore_client(sa_path: str) -> firestore.Client:
     """Initialize Firestore client."""
     return firestore.Client.from_service_account_json(sa_path)
@@ -57,14 +76,30 @@ def get_route_owner(db: firestore.Client, route_number: str) -> Optional[str]:
     """Get the owner user_id for a route.
     
     Returns:
-        The ownerUid (or userId) field from routes/{route_number}, or None if not found.
+        The owner UID from the best available route metadata source, or None if not found.
     """
     try:
         route_doc = db.collection("routes").document(route_number).get()
         if route_doc.exists:
             data = route_doc.to_dict()
             # Check both field names (ownerUid is current, userId is legacy)
-            return data.get("ownerUid") or data.get("userId")
+            owner_uid = data.get("ownerUid") or data.get("userId")
+            if owner_uid:
+                return owner_uid
+
+        entitlement_doc = db.collection("routeEntitlements").document(route_number).get()
+        if entitlement_doc.exists:
+            data = entitlement_doc.to_dict() or {}
+            owner_uid = data.get("ownerUid")
+            if owner_uid:
+                return owner_uid
+
+        route_number_doc = db.collection("routeNumbers").document(route_number).get()
+        if route_number_doc.exists:
+            data = route_number_doc.to_dict() or {}
+            owner_uid = data.get("userId") or data.get("userID")
+            if owner_uid:
+                return owner_uid
     except Exception as e:
         print(f"    [route] Error getting owner for route {route_number}: {e}")
     return None
@@ -102,6 +137,11 @@ def setup_reminder_listener(db: firestore.Client) -> Watch:
             profile = data.get("profile", {})
             route_number = profile.get("currentRoute") or profile.get("routeNumber")
             timezone = profile.get("timezone", "America/Denver")
+
+            if not _route_allowed(route_number):
+                if user_id in reminder_cache:
+                    del reminder_cache[user_id]
+                continue
             
             if change.type.name == "REMOVED":
                 if user_id in reminder_cache:
@@ -124,6 +164,41 @@ def setup_reminder_listener(db: firestore.Client) -> Watch:
     print(f"  [listener] Watching users collection for reminder changes")
     
     return _users_watcher
+
+
+def load_reminder_cache_once(db: firestore.Client) -> int:
+    """Populate reminder cache from a one-time users scan."""
+    reminder_cache.clear()
+    users_ref = db.collection("users")
+    count = 0
+
+    for doc in users_ref.stream():
+        user_id = doc.id
+        data = doc.to_dict() or {}
+
+        user_settings = data.get("userSettings", {})
+        notifications = user_settings.get("notifications", {})
+        order_reminders = notifications.get("orderReminders", {})
+
+        enabled = order_reminders.get("enabled", False)
+        reminder_time = order_reminders.get("time", {})
+
+        profile = data.get("profile", {})
+        route_number = profile.get("currentRoute") or profile.get("routeNumber")
+        timezone = profile.get("timezone", "America/Denver")
+
+        if not _route_allowed(route_number):
+            continue
+
+        if enabled and route_number and reminder_time:
+            reminder_cache[user_id] = {
+                "route_number": route_number,
+                "reminder_time": reminder_time,
+                "timezone": timezone,
+            }
+            count += 1
+
+    return count
 
 
 def reminder_time_to_minutes(reminder_time: Dict) -> int:
@@ -298,6 +373,9 @@ def check_and_notify(db: firestore.Client) -> None:
         reminder_time = user_data["reminder_time"]
         timezone = user_data["timezone"]
         route_number = user_data["route_number"]
+
+        if not _route_allowed(route_number):
+            continue
         
         # Check if it's reminder time for this user
         if not is_reminder_time_now(reminder_time, timezone):
@@ -346,7 +424,7 @@ def check_and_notify(db: firestore.Client) -> None:
             if not tokens:
                 print(f"    No FCM tokens for user {user_id}")
                 continue
-            
+
             # Build and send notification
             item_count = len(items)
             title = "Low Stock Alert"
@@ -357,7 +435,14 @@ def check_and_notify(db: firestore.Client) -> None:
                 "orderDate": today,
                 "saps": saps,
             }
-            
+
+            if LOW_QTY_NOTIFICATION_DRY_RUN:
+                print(
+                    f"    [dry-run] Would send notification: {item_count} items "
+                    f"to {len(tokens)} token(s) for route {route_number}"
+                )
+                continue
+
             if send_push_notification(tokens, title, body, data):
                 mark_as_sent(route_number, user_id, today, saps, saps_hash)
                 print(f"    ✅ Sent notification: {item_count} items")
@@ -368,17 +453,28 @@ def check_and_notify(db: firestore.Client) -> None:
             print(f"    ❌ Error processing user {user_id}: {e}")
 
 
-def run_daemon(sa_path: str) -> None:
+def run_daemon(sa_path: str, *, run_once: bool = False) -> None:
     """Main daemon loop."""
     global _users_watcher
 
     print(f"\n📦 Low-Quantity Notification Daemon")
     print(f"   Worker ID: {WORKER_ID}")
+    print(f"   Enabled: {LOW_QTY_NOTIFICATIONS_ENABLED}")
+    print(f"   Dry Run: {LOW_QTY_NOTIFICATION_DRY_RUN}")
     print(f"   Using: Direct PostgreSQL (pg_utils)")
-    print(f"   Checking every 60 seconds")
+    print(f"   Checking every {CHECK_INTERVAL_SECONDS} seconds")
     print(f"\n   Press Ctrl+C to stop\n")
 
     db = get_firestore_client(sa_path)
+
+    if run_once:
+        loaded = load_reminder_cache_once(db)
+        print(f"  [cache] {loaded} users with reminders enabled (one-time scan)")
+        if LOW_QTY_NOTIFICATIONS_ENABLED:
+            check_and_notify(db)
+        else:
+            print("  [skip] LOW_QTY_NOTIFICATIONS_ENABLED=false; notification cycle skipped")
+        return
 
     # Set up snapshot listener for users with reminders
     # Keep reference to prevent garbage collection
@@ -390,8 +486,12 @@ def run_daemon(sa_path: str) -> None:
 
     try:
         while True:
+            if not LOW_QTY_NOTIFICATIONS_ENABLED:
+                print("  [skip] LOW_QTY_NOTIFICATIONS_ENABLED=false; notification cycle skipped")
+                time.sleep(CHECK_INTERVAL_SECONDS)
+                continue
             check_and_notify(db)
-            time.sleep(60)
+            time.sleep(CHECK_INTERVAL_SECONDS)
     except KeyboardInterrupt:
         print("\n\n👋 Stopping daemon...")
         if _users_watcher:
@@ -407,6 +507,11 @@ if __name__ == "__main__":
         required=True, 
         help='Path to Firebase service account JSON'
     )
+    parser.add_argument(
+        '--once',
+        action='store_true',
+        help='Run a single reminder scan/check cycle and exit'
+    )
     
     args = parser.parse_args()
-    run_daemon(args.serviceAccount)
+    run_daemon(args.serviceAccount, run_once=bool(args.once))

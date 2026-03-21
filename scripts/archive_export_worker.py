@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import re
+import select
 import shutil
 import socket
 import tempfile
@@ -29,6 +30,26 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from firebase_admin import credentials, firestore as admin_firestore, initialize_app, storage
 from google.cloud import firestore as gcf_firestore
+import psycopg2
+
+try:
+    from .archive_export_pg_queue import (
+        claim_next_job as pg_claim_next_job,
+        ensure_archive_export_queue_tables,
+        finalize_job_failure as pg_finalize_job_failure,
+        finalize_job_success as pg_finalize_job_success,
+        recover_stale_processing_jobs as pg_recover_stale_processing_jobs,
+        update_job_heartbeat as pg_update_job_heartbeat,
+    )
+except ImportError:
+    from archive_export_pg_queue import (
+        claim_next_job as pg_claim_next_job,
+        ensure_archive_export_queue_tables,
+        finalize_job_failure as pg_finalize_job_failure,
+        finalize_job_success as pg_finalize_job_success,
+        recover_stale_processing_jobs as pg_recover_stale_processing_jobs,
+        update_job_heartbeat as pg_update_job_heartbeat,
+    )
 
 
 EXPORT_COLLECTION = "archiveExports"
@@ -41,6 +62,9 @@ HEARTBEAT_SECONDS = int(os.environ.get("ARCHIVE_EXPORT_HEARTBEAT_SECONDS", "30")
 MAX_GLOBAL_CONCURRENCY = int(os.environ.get("ARCHIVE_EXPORT_WORKER_CONCURRENCY", "3"))
 HDD_ARCHIVE_BASE = Path(os.environ.get("PCF_ARCHIVE_PATH", "/mnt/archive/pcf/pcf_archive"))
 ARTIFACT_TTL_DAYS = int(os.environ.get("ARCHIVE_EXPORT_ARTIFACT_TTL_DAYS", "14"))
+ARCHIVE_EXPORT_ENABLED = os.environ.get("ARCHIVE_EXPORT_ENABLED", "true").lower() == "true"
+ARCHIVE_EXPORT_QUEUE_BACKEND = str(os.environ.get("ARCHIVE_EXPORT_QUEUE_BACKEND") or "firestore").strip().lower()
+ARCHIVE_EXPORT_POSTGRES_RECONCILE_SECONDS = int(os.environ.get("ARCHIVE_EXPORT_POSTGRES_RECONCILE_SECONDS", "60"))
 
 logger = logging.getLogger("archive_export_worker")
 
@@ -164,6 +188,10 @@ def _build_export_filename(route: str, from_date: str, to_date: str) -> str:
     return f"pcf_export_{route}_{from_date}_{to_date}_part01.zip"
 
 
+def _use_postgres_queue() -> bool:
+    return ARCHIVE_EXPORT_QUEUE_BACKEND == "postgres"
+
+
 def _bucket() -> storage.bucket:
     bucket_name = str(os.environ.get("FIREBASE_STORAGE_BUCKET") or "").strip()
     if bucket_name:
@@ -176,14 +204,6 @@ def _bucket() -> storage.bucket:
             retryable=False,
         )
     return bucket
-
-
-def _list_active_delivery_ids(db: admin_firestore.client, route_number: str) -> set[str]:
-    active = set()
-    docs = db.collection("routes").document(route_number).collection("pcfs").select([]).stream()
-    for doc in docs:
-        active.add(doc.id)
-    return active
 
 
 def _find_latest_hdd_run(route_number: str, delivery_number: str) -> Optional[Path]:
@@ -214,8 +234,6 @@ def _collect_deliveries_in_range(
     from_date: date,
     to_date: date,
 ) -> List[DeliveryEntry]:
-    active_ids = _list_active_delivery_ids(db, route_number)
-
     seen: Dict[str, DeliveryEntry] = {}
 
     # Source 1: Firestore archivedPCFs
@@ -233,7 +251,13 @@ def _collect_deliveries_in_range(
             continue
         seen[doc.id] = DeliveryEntry(delivery_number=doc.id, source="firebase", created_at=created)
 
-    # Source 2: HDD (skip if Firestore already has it or if still active)
+    # Source 2: HDD
+    #
+    # Do not suppress HDD deliveries just because the same delivery number exists in
+    # the live pcfs collection. HDD runs are historical archive snapshots keyed by
+    # delivery number, and routes often retain the same delivery ids in the active
+    # collection long after earlier runs were archived. Skipping on active id causes
+    # valid dated archive runs to disappear from export results entirely.
     route_dir = HDD_ARCHIVE_BASE / route_number
     if route_dir.exists() and route_dir.is_dir():
         for item in route_dir.iterdir():
@@ -241,8 +265,6 @@ def _collect_deliveries_in_range(
                 continue
             delivery_number = item.name
             if delivery_number in seen:
-                continue
-            if delivery_number in active_ids:
                 continue
             run_path = _find_latest_hdd_run(route_number, delivery_number)
             if not run_path:
@@ -300,24 +322,70 @@ def _load_hdd_delivery_detail(route_number: str, delivery_number: str) -> Option
         return None
 
     fs_path = run_path / "firestore" / "delivery.json"
-    if not fs_path.exists():
+    if fs_path.exists():
+        try:
+            data = json.loads(fs_path.read_text())
+        except Exception:
+            return None
+
+        containers: List[Dict[str, Any]] = []
+        containers_dir = run_path / "firestore" / "containers"
+        if containers_dir.exists() and containers_dir.is_dir():
+            for file_path in sorted(containers_dir.glob("*.json")):
+                try:
+                    containers.append(json.loads(file_path.read_text()))
+                except Exception:
+                    continue
+
+        data["deliveryNumber"] = delivery_number
+        data["containers"] = containers
+        data["source"] = "hdd"
+        data["_runPath"] = str(run_path)
+        return data
+
+    manifest_path = run_path / "manifest.json"
+    if not manifest_path.exists():
         return None
 
     try:
-        data = json.loads(fs_path.read_text())
+        manifest = json.loads(manifest_path.read_text())
     except Exception:
         return None
 
-    containers: List[Dict[str, Any]] = []
-    containers_dir = run_path / "firestore" / "containers"
-    if containers_dir.exists() and containers_dir.is_dir():
-        for file_path in sorted(containers_dir.glob("*.json")):
-            try:
-                containers.append(json.loads(file_path.read_text()))
-            except Exception:
-                continue
+    queue_metadata = manifest.get("queueMetadata")
+    data = dict(queue_metadata) if isinstance(queue_metadata, dict) else {}
+    containers = data.get("containers") if isinstance(data.get("containers"), list) else []
 
-    data["deliveryNumber"] = delivery_number
+    if not containers:
+        inferred: Dict[str, Dict[str, Any]] = {}
+        image_pattern = re.compile(
+            rf"^{re.escape(delivery_number)}_(.+?)_page_(\d+)\.(jpg|jpeg|png)$",
+            re.IGNORECASE,
+        )
+        for rel_path in manifest.get("images", []) or []:
+            filename = Path(str(rel_path)).name
+            match = image_pattern.match(filename)
+            if not match:
+                continue
+            container_code = match.group(1)
+            page_number = int(match.group(2))
+            inferred.setdefault(
+                container_code,
+                {
+                    "containerCode": container_code,
+                    "status": "archived",
+                    "pages": [],
+                },
+            )["pages"].append({"pageNumber": page_number})
+        containers = [
+            inferred[container_code]
+            for container_code in sorted(inferred.keys())
+        ]
+
+    data.setdefault("routeNumber", str(manifest.get("route") or route_number))
+    data.setdefault("deliveryNumber", str(manifest.get("delivery") or delivery_number))
+    data.setdefault("createdAt", _hdd_run_date(run_path))
+    data.setdefault("status", "completed")
     data["containers"] = containers
     data["source"] = "hdd"
     data["_runPath"] = str(run_path)
@@ -892,14 +960,209 @@ def _process_job(db: admin_firestore.client, doc: admin_firestore.DocumentSnapsh
         _clear_route_lock(db, route_number=route_number, export_id=doc.id)
 
 
+def _process_pg_job(db: admin_firestore.client, job: Dict[str, Any]) -> None:
+    export_id = str(job.get("export_id") or "").strip()
+    route_number = str(job.get("route_number") or "").strip()
+    if not export_id or not route_number:
+        if export_id:
+            pg_finalize_job_failure(
+                export_id,
+                current_attempt_count=int(job.get("attempt_count") or 0),
+                max_attempts=int(job.get("max_attempts") or 3),
+                error_code="EXPORT_ROUTE_INVALID",
+                error_message="Missing route_number",
+                retryable=False,
+                retry_delay_seconds=0,
+            )
+        return
+
+    try:
+        from_date = _parse_date_or_raise(job.get("from_date"), "from_date")
+        to_date = _parse_date_or_raise(job.get("to_date"), "to_date")
+        if from_date > to_date:
+            raise WorkerError("INVALID_DATE_RANGE", "fromDate is after toDate", retryable=False)
+
+        logger.info(
+            "Processing postgres export %s route=%s range=%s..%s",
+            export_id,
+            route_number,
+            from_date.isoformat(),
+            to_date.isoformat(),
+        )
+
+        last_heartbeat = 0.0
+
+        def heartbeat_cb() -> None:
+            nonlocal last_heartbeat
+            now = time.time()
+            if now - last_heartbeat >= HEARTBEAT_SECONDS:
+                pg_update_job_heartbeat(export_id)
+                last_heartbeat = now
+
+        heartbeat_cb()
+        result = _build_export_artifact(
+            db=db,
+            route_number=route_number,
+            export_id=export_id,
+            from_date=from_date,
+            to_date=to_date,
+            heartbeat_cb=heartbeat_cb,
+        )
+        heartbeat_cb()
+        pg_finalize_job_success(export_id, result, artifact_ttl_days=ARTIFACT_TTL_DAYS)
+        logger.info("Postgres export %s completed status=%s", export_id, result["status"])
+    except WorkerError as exc:
+        row = pg_finalize_job_failure(
+            export_id,
+            current_attempt_count=int(job.get("attempt_count") or 0),
+            max_attempts=int(job.get("max_attempts") or 3),
+            error_code=exc.code,
+            error_message=exc.message,
+            retryable=exc.retryable,
+            retry_delay_seconds=_retry_delay_seconds(int(job.get("attempt_count") or 0) + 1),
+        )
+        if row and str(row.get("status") or "") == "queued":
+            logger.warning(
+                "Re-queued postgres export %s after failure (%s): attempt=%s/%s",
+                export_id,
+                exc.code,
+                int(row.get("attempt_count") or 0),
+                int(row.get("max_attempts") or 0),
+            )
+    except Exception as exc:
+        logger.exception("Unexpected postgres export error for %s", export_id)
+        row = pg_finalize_job_failure(
+            export_id,
+            current_attempt_count=int(job.get("attempt_count") or 0),
+            max_attempts=int(job.get("max_attempts") or 3),
+            error_code="EXPORT_PROCESSING_ERROR",
+            error_message=str(exc),
+            retryable=True,
+            retry_delay_seconds=_retry_delay_seconds(int(job.get("attempt_count") or 0) + 1),
+        )
+        if row and str(row.get("status") or "") == "queued":
+            logger.warning(
+                "Re-queued postgres export %s after unexpected error: attempt=%s/%s",
+                export_id,
+                int(row.get("attempt_count") or 0),
+                int(row.get("max_attempts") or 0),
+            )
+
+
+def _open_pg_listen_connection() -> psycopg2.extensions.connection:
+    conn = psycopg2.connect(
+        host=os.environ.get("POSTGRES_HOST", "localhost"),
+        port=int(os.environ.get("POSTGRES_PORT", 5432)),
+        database=os.environ.get("POSTGRES_DB", "routespark"),
+        user=os.environ.get("POSTGRES_USER", "routespark"),
+        password=os.environ.get("POSTGRES_PASSWORD", ""),
+    )
+    conn.set_session(autocommit=True)
+    with conn.cursor() as cur:
+        cur.execute("LISTEN archive_export_jobs")
+    return conn
+
+
+def _wait_for_pg_signal(conn: psycopg2.extensions.connection, timeout_seconds: int) -> bool:
+    readable, _, _ = select.select([conn], [], [], max(timeout_seconds, 1))
+    if not readable:
+        return False
+    conn.poll()
+    while conn.notifies:
+        conn.notifies.pop(0)
+    return True
+
+
+def run_worker_postgres(sa_path: str, *, poll_seconds: int, run_once: bool = False) -> None:
+    del poll_seconds
+    _ensure_firebase(sa_path)
+    ensure_archive_export_queue_tables()
+    db = admin_firestore.client()
+
+    logger.info(
+        "Archive export worker started: worker=%s enabled=%s backend=postgres reconcile=%ss",
+        WORKER_ID,
+        ARCHIVE_EXPORT_ENABLED,
+        ARCHIVE_EXPORT_POSTGRES_RECONCILE_SECONDS,
+    )
+
+    listen_conn: Optional[psycopg2.extensions.connection] = None
+    try:
+        if not run_once:
+            listen_conn = _open_pg_listen_connection()
+
+        while True:
+            try:
+                if not ARCHIVE_EXPORT_ENABLED:
+                    logger.info("ARCHIVE_EXPORT_ENABLED=false; export cycle skipped")
+                    if run_once:
+                        return
+                    if listen_conn is not None:
+                        _wait_for_pg_signal(listen_conn, ARCHIVE_EXPORT_POSTGRES_RECONCILE_SECONDS)
+                    continue
+
+                pg_recover_stale_processing_jobs(
+                    worker_timeout_seconds=WORKER_TIMEOUT_SECONDS,
+                    stale_threshold_seconds=_stale_threshold_seconds(),
+                )
+                claimed = pg_claim_next_job(
+                    worker_id=WORKER_ID,
+                    max_global_concurrency=MAX_GLOBAL_CONCURRENCY,
+                )
+                if claimed is not None:
+                    _process_pg_job(db, claimed)
+                    if run_once:
+                        return
+                    continue
+
+                if run_once:
+                    return
+
+                if listen_conn is None or listen_conn.closed:
+                    listen_conn = _open_pg_listen_connection()
+                _wait_for_pg_signal(listen_conn, ARCHIVE_EXPORT_POSTGRES_RECONCILE_SECONDS)
+            except KeyboardInterrupt:
+                logger.info("Archive export worker interrupted, shutting down")
+                return
+            except Exception:
+                logger.exception("Archive export postgres worker loop failure")
+                if run_once:
+                    raise
+                time.sleep(5)
+                if listen_conn is not None:
+                    try:
+                        listen_conn.close()
+                    except Exception:
+                        pass
+                    listen_conn = None
+    finally:
+        if listen_conn is not None:
+            try:
+                listen_conn.close()
+            except Exception:
+                pass
+
+
 def run_worker(sa_path: str, *, poll_seconds: int, run_once: bool = False) -> None:
     _ensure_firebase(sa_path)
     db = admin_firestore.client()
 
-    logger.info("Archive export worker started: worker=%s poll=%ss", WORKER_ID, poll_seconds)
+    logger.info(
+        "Archive export worker started: worker=%s enabled=%s poll=%ss",
+        WORKER_ID,
+        ARCHIVE_EXPORT_ENABLED,
+        poll_seconds,
+    )
 
     while True:
         try:
+            if not ARCHIVE_EXPORT_ENABLED:
+                logger.info("ARCHIVE_EXPORT_ENABLED=false; export cycle skipped")
+                if run_once:
+                    return
+                time.sleep(poll_seconds)
+                continue
+
             _recover_stale_processing_jobs(db)
             claimed = _claim_one_queued_job(db)
             if claimed is None:
@@ -955,7 +1218,10 @@ def main() -> int:
         logger.error("Service account path does not exist: %s", sa_path)
         return 2
 
-    run_worker(sa_path, poll_seconds=max(args.poll_seconds, 5), run_once=bool(args.once))
+    if _use_postgres_queue():
+        run_worker_postgres(sa_path, poll_seconds=max(args.poll_seconds, 5), run_once=bool(args.once))
+    else:
+        run_worker(sa_path, poll_seconds=max(args.poll_seconds, 5), run_once=bool(args.once))
     return 0
 
 

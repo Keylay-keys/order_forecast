@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import socket
 import time
 from datetime import datetime, timezone
@@ -26,6 +27,19 @@ from google.cloud import firestore  # type: ignore
 
 # Worker ID for this instance
 WORKER_ID = f"promo-sync-{socket.gethostname()}-{os.getpid()}"
+
+
+def _allowed_routes() -> Set[str] | None:
+    raw = os.environ.get("ROUTESPARK_ALLOWED_ROUTES", "").strip()
+    if not raw:
+        return None
+    values = {item.strip() for item in raw.split(",") if item.strip()}
+    return values or None
+
+
+def _route_allowed(route_number: str) -> bool:
+    allowed = _allowed_routes()
+    return True if allowed is None else str(route_number) in allowed
 
 # =============================================================================
 # PostgreSQL Connection
@@ -52,6 +66,30 @@ def get_pg_connection() -> psycopg2.extensions.connection:
 def get_firestore_client(sa_path: str) -> firestore.Client:
     """Create a Firestore client from service account."""
     return firestore.Client.from_service_account_json(sa_path)
+
+
+def _promo_item_id(promo_id: str, sap: str, account: Optional[str]) -> str:
+    """Build the promo_items primary key the same way the legacy sync path does.
+
+    Some promos are scoped per account/store. Those rows must not collide on the
+    bare `{promo_id}-{sap}` key.
+    """
+    account_key = str(account or "").strip()
+    if not account_key:
+        return f"{promo_id}-{sap}"
+    normalized = re.sub(r"[^A-Za-z0-9._-]+", "_", account_key).strip("_")
+    normalized = normalized or "account"
+    return f"{promo_id}-{sap}-{normalized}"
+
+
+def _normalize_date_value(value):
+    """Normalize Firestore/date-ish values to ISO date strings or None."""
+    if value is None:
+        return None
+    if hasattr(value, 'isoformat'):
+        return value.date().isoformat() if hasattr(value, 'date') else str(value)
+    text = str(value).strip()
+    return text or None
 
 
 # =============================================================================
@@ -91,14 +129,8 @@ def sync_promo_to_pg(
                 return
 
             # Parse dates
-            start_date = data.get('startDate') or data.get('start_date')
-            end_date = data.get('endDate') or data.get('end_date')
-
-            # Handle Firestore timestamps
-            if hasattr(start_date, 'isoformat'):
-                start_date = start_date.date().isoformat() if hasattr(start_date, 'date') else str(start_date)
-            if hasattr(end_date, 'isoformat'):
-                end_date = end_date.date().isoformat() if hasattr(end_date, 'date') else str(end_date)
+            start_date = _normalize_date_value(data.get('startDate') or data.get('start_date'))
+            end_date = _normalize_date_value(data.get('endDate') or data.get('end_date'))
 
             # Determine promo type from subcollection
             promo_type = data.get('promoType') or data.get('promo_type') or subcollection
@@ -172,25 +204,19 @@ def sync_promo_items(promo_id: str, items: List[dict]) -> None:
 
             # Insert new items
             if items:
-                rows = []
+                rows_by_id = {}
                 for item in items:
                     sap = item.get('sap') or item.get('sap_code') or item.get('sap_raw')
                     if not sap:
                         continue
 
-                    # Parse dates from item if available
-                    start_date = item.get('startDate') or item.get('start_date')
-                    end_date = item.get('endDate') or item.get('end_date')
+                    start_date = _normalize_date_value(item.get('startDate') or item.get('start_date'))
+                    end_date = _normalize_date_value(item.get('endDate') or item.get('end_date'))
 
-                    if hasattr(start_date, 'isoformat'):
-                        start_date = start_date.date().isoformat() if hasattr(start_date, 'date') else str(start_date)
-                    if hasattr(end_date, 'isoformat'):
-                        end_date = end_date.date().isoformat() if hasattr(end_date, 'date') else str(end_date)
-
-                    item_id = f"{promo_id}-{sap}"
                     account = item.get('account') or item.get('customer_account')
+                    item_id = _promo_item_id(promo_id, sap, account)
 
-                    rows.append((
+                    rows_by_id[item_id] = (
                         item_id,
                         promo_id,
                         sap,
@@ -200,8 +226,9 @@ def sync_promo_items(promo_id: str, items: List[dict]) -> None:
                         item.get('specialPrice') or item.get('special_price'),
                         item.get('discountPercent') or item.get('discount_percent'),
                         now,
-                    ))
+                    )
 
+                rows = list(rows_by_id.values())
                 if rows:
                     execute_values(
                         cur,
@@ -211,7 +238,8 @@ def sync_promo_items(promo_id: str, items: List[dict]) -> None:
                             special_price, discount_percent, synced_at
                         )
                         VALUES %s
-                        ON CONFLICT (promo_id, sap, account) DO UPDATE SET
+                        ON CONFLICT (id) DO UPDATE SET
+                            account = EXCLUDED.account,
                             start_date = EXCLUDED.start_date,
                             end_date = EXCLUDED.end_date,
                             special_price = EXCLUDED.special_price,
@@ -245,12 +273,12 @@ def sync_promo_items_from_saps(
 
             # Insert basic items
             if sap_codes:
-                rows = []
+                rows_by_id = {}
                 for sap in sap_codes:
                     if not sap:
                         continue
-                    item_id = f"{promo_id}-{sap}"
-                    rows.append((
+                    item_id = _promo_item_id(promo_id, sap, None)
+                    rows_by_id[item_id] = (
                         item_id,
                         promo_id,
                         sap,
@@ -260,8 +288,9 @@ def sync_promo_items_from_saps(
                         None,  # special_price
                         None,  # discount_percent
                         now,
-                    ))
+                    )
 
+                rows = list(rows_by_id.values())
                 if rows:
                     execute_values(
                         cur,
@@ -271,7 +300,8 @@ def sync_promo_items_from_saps(
                             special_price, discount_percent, synced_at
                         )
                         VALUES %s
-                        ON CONFLICT (promo_id, sap, account) DO UPDATE SET
+                        ON CONFLICT (id) DO UPDATE SET
+                            account = EXCLUDED.account,
                             start_date = EXCLUDED.start_date,
                             end_date = EXCLUDED.end_date,
                             synced_at = EXCLUDED.synced_at
@@ -321,6 +351,8 @@ class PromoSyncManager:
 
     def start_route_listeners(self, route_number: str) -> None:
         """Start all promo listeners for a single route."""
+        if not _route_allowed(route_number):
+            return
         if route_number in self.known_routes:
             return  # Already listening
 
@@ -369,8 +401,8 @@ class PromoSyncManager:
 
             for row in routes:
                 route_number = row['route_number']
-                if route_number:
-                    # First discover which subcollections exist
+                if route_number and _route_allowed(str(route_number)):
+                    # Discover only the explicitly allowed routes during constrained validation.
                     subcols = self.discover_promo_subcollections(route_number)
                     if subcols:
                         print(f"  [Route {route_number}] Found promo subcollections: {subcols}")
@@ -452,7 +484,11 @@ def main(sa_path: str):
 
                     for row in routes:
                         route_number = row['route_number']
-                        if route_number and route_number not in manager.known_routes:
+                        if (
+                            route_number
+                            and _route_allowed(str(route_number))
+                            and route_number not in manager.known_routes
+                        ):
                             print(f"\n[+] New route discovered: {route_number}")
                             manager.start_route_listeners(route_number)
 

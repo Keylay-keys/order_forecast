@@ -12,6 +12,7 @@ Common honeypot paths:
 
 from __future__ import annotations
 
+import os
 import re
 from datetime import timedelta
 from fastapi import Request
@@ -20,7 +21,13 @@ from starlette.middleware.base import BaseHTTPMiddleware
 
 from ..utils.security_logger import security_logger
 from ..utils.blocklist import blocklist
-from ..utils.client_ip import get_client_ip
+from ..utils.client_ip import TRUST_PROXY, get_client_ip
+
+PERMANENT_HONEYPOT_IPS = {
+    ip.strip()
+    for ip in os.environ.get("PERMANENT_HONEYPOT_IPS", "").split(",")
+    if ip.strip()
+}
 
 # Honeypot paths that trigger immediate blocking
 HONEYPOT_PATHS = [
@@ -125,6 +132,38 @@ def is_honeypot_path(path: str) -> bool:
     return False
 
 
+def build_honeypot_request_details(request: Request) -> dict[str, str | bool]:
+    """Capture enough request context to investigate scanners later."""
+    query_string = request.url.query or ""
+    forwarded_for = request.headers.get("x-forwarded-for")
+    cf_connecting_ip = request.headers.get("cf-connecting-ip")
+    x_real_ip = request.headers.get("x-real-ip")
+
+    ip_source = "direct"
+    if TRUST_PROXY and cf_connecting_ip:
+        ip_source = "cf-connecting-ip"
+    elif TRUST_PROXY and forwarded_for:
+        ip_source = "x-forwarded-for"
+    elif x_real_ip:
+        ip_source = "x-real-ip"
+
+    return {
+        "query_string": query_string,
+        "full_path": f"{request.url.path}?{query_string}" if query_string else request.url.path,
+        "host": request.headers.get("host", ""),
+        "referer": request.headers.get("referer", ""),
+        "accept": request.headers.get("accept", ""),
+        "accept_language": request.headers.get("accept-language", ""),
+        "cf_ray": request.headers.get("cf-ray", ""),
+        "cf_connecting_ip": cf_connecting_ip or "",
+        "x_forwarded_for": forwarded_for or "",
+        "x_real_ip": x_real_ip or "",
+        "forwarded_proto": request.headers.get("x-forwarded-proto", ""),
+        "ip_source": ip_source,
+        "trust_proxy": TRUST_PROXY,
+    }
+
+
 class HoneypotMiddleware(BaseHTTPMiddleware):
     """Middleware to detect and block attackers hitting honeypot paths."""
     
@@ -133,17 +172,23 @@ class HoneypotMiddleware(BaseHTTPMiddleware):
         
         if is_honeypot_path(path):
             ip = get_client_ip(request)
+            details = build_honeypot_request_details(request)
+            permanent = ip in PERMANENT_HONEYPOT_IPS
             
             # Log the honeypot trigger
             security_logger.honeypot_triggered(
                 ip=ip,
                 path=path,
                 user_agent=request.headers.get("user-agent"),
-                method=request.method
+                method=request.method,
+                details=details,
             )
             
-            # Add to blocklist (24 hour ban, escalates for repeat offenders)
-            blocklist.add(ip, reason="honeypot", duration=timedelta(hours=24))
+            # Add to blocklist. Known-bad IPs can be pinned permanently.
+            if permanent:
+                blocklist.permaban(ip, reason="honeypot", metadata=details)
+            else:
+                blocklist.add(ip, reason="honeypot", duration=timedelta(hours=24), metadata=details)
             
             # Return believable error (don't reveal it's a trap)
             return JSONResponse(

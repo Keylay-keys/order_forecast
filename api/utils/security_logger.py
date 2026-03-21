@@ -155,16 +155,20 @@ class SecurityLogger:
         ip: str,
         path: str,
         user_agent: Optional[str] = None,
-        method: Optional[str] = None
+        method: Optional[str] = None,
+        details: Optional[Dict[str, Any]] = None,
     ):
         """Log honeypot trigger (scanner/attacker detected)."""
+        payload = {
+            "user_agent": user_agent,
+            "method": method
+        }
+        if details:
+            payload.update(details)
         self.log_event(
             event_type="honeypot_triggered",
             severity="high",
-            details={
-                "user_agent": user_agent,
-                "method": method
-            },
+            details=payload,
             ip=ip,
             path=path
         )
@@ -192,16 +196,30 @@ class SecurityLogger:
         self,
         ip: str,
         reason: str,
-        duration_hours: float
+        duration_hours: Optional[float] = None,
+        *,
+        permanent: bool = False,
+        hits: Optional[int] = None,
+        expires_at: Optional[str] = None,
+        details: Optional[Dict[str, Any]] = None,
     ):
         """Log IP being added to blocklist."""
+        payload: Dict[str, Any] = {
+            "reason": reason,
+            "permanent": permanent,
+        }
+        if duration_hours is not None:
+            payload["duration_hours"] = duration_hours
+        if hits is not None:
+            payload["hits"] = hits
+        if expires_at is not None:
+            payload["expires_at"] = expires_at
+        if details:
+            payload.update(details)
         self.log_event(
             event_type="ip_blocked",
             severity="high",
-            details={
-                "reason": reason,
-                "duration_hours": duration_hours
-            },
+            details=payload,
             ip=ip
         )
     
@@ -222,12 +240,12 @@ class SecurityLogger:
             path=path
         )
     
-    def blocked_ip_attempt(self, ip: str, path: str):
+    def blocked_ip_attempt(self, ip: str, path: str, details: Optional[Dict[str, Any]] = None):
         """Log request from blocked IP."""
         self.log_event(
             event_type="blocked_ip_attempt",
             severity="low",
-            details={},
+            details=details or {},
             ip=ip,
             path=path
         )

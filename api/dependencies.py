@@ -448,6 +448,14 @@ def _feature_payload_for_plan(plan: Optional[str]) -> Dict[str, bool]:
     }
 
 
+def _active_route_for_user(user_data: Dict[str, Any]) -> str:
+    profile = user_data.get("profile", {}) or {}
+    return (
+        _normalize_route_number(profile.get("currentRoute"))
+        or _normalize_route_number(profile.get("routeNumber"))
+    )
+
+
 def _is_owner_for_route(user_data: Dict[str, Any], route_number: str) -> bool:
     profile = user_data.get("profile", {}) or {}
     if (
@@ -471,6 +479,23 @@ def _resolve_owner_uid_for_route(
     if route_doc.exists:
         route_data = route_doc.to_dict() or {}
         owner_uid = str(route_data.get("ownerUid") or route_data.get("userId") or "").strip()
+        if owner_uid:
+            return owner_uid
+    ent_doc = db.collection("routeEntitlements").document(route_number).get()
+    if ent_doc.exists:
+        ent_data = ent_doc.to_dict() or {}
+        owner_uid = str(ent_data.get("ownerUid") or "").strip()
+        if owner_uid:
+            return owner_uid
+    route_number_doc = db.collection("routeNumbers").document(route_number).get()
+    if route_number_doc.exists:
+        route_number_data = route_number_doc.to_dict() or {}
+        owner_uid = str(
+            route_number_data.get("userId")
+            or route_number_data.get("userID")
+            or route_number_data.get("ownerUid")
+            or ""
+        ).strip()
         if owner_uid:
             return owner_uid
     if _is_owner_for_route(requester_data, route_number):
@@ -535,9 +560,8 @@ def _has_trial_feature(
     owner_data: Dict[str, Any],
     feature_key: str,
 ) -> bool:
-    profile = owner_data.get("profile", {}) or {}
-    primary_route = _normalize_route_number(profile.get("routeNumber"))
-    if primary_route != route_number:
+    active_route = _active_route_for_user(owner_data)
+    if active_route != route_number:
         return False
     trial_status = owner_data.get("trialStatus", {}) or {}
     trial_features = trial_status.get("features", {}) if isinstance(trial_status.get("features"), dict) else {}
@@ -562,6 +586,32 @@ def _has_trial_feature(
     return bool(trial_features.get(feature_key))
 
 
+def _has_requester_direct_feature_grant(
+    *,
+    route_number: str,
+    requester_data: Dict[str, Any],
+    feature_key: str,
+) -> bool:
+    # Team-member access is currently written onto the member user doc during
+    # onboarding/approval flows. Preserve that live schema while aligning API
+    # enforcement with the app.
+    profile = requester_data.get("profile", {}) or {}
+    normalized_role = str(profile.get("role") or "").strip().lower()
+    if normalized_role not in ("teammember", "team_member"):
+        return False
+    if not has_access_to_route(requester_data, route_number):
+        return False
+
+    trial_status = requester_data.get("trialStatus", {}) or {}
+    trial_features = trial_status.get("features", {}) if isinstance(trial_status.get("features"), dict) else {}
+
+    if feature_key in ("scanner", "ordering"):
+        return bool(trial_features.get("scanner"))
+    if feature_key == "managementDashboard":
+        return bool(trial_features.get("managementDashboard"))
+    return bool(trial_features.get(feature_key))
+
+
 def _has_route_feature_entitlement(
     *,
     db: firestore.Client,
@@ -572,6 +622,12 @@ def _has_route_feature_entitlement(
 ) -> bool:
     # Priority chain: routeEntitlements -> legacy subscription -> trial.
     if _has_route_entitlement_feature(db=db, route_number=route_number, feature_key=feature_key):
+        return True
+    if _has_requester_direct_feature_grant(
+        route_number=route_number,
+        requester_data=requester_data,
+        feature_key=feature_key,
+    ):
         return True
 
     owner_uid = _resolve_owner_uid_for_route(

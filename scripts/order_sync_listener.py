@@ -141,6 +141,25 @@ WORKER_ID = f"order-sync-{socket.gethostname()}-{__import__('os').getpid()}"
 _store_alias_cache: Dict[str, Dict[str, str]] = {}  # route_number -> {alias_id: canonical_id}
 
 
+def _allowed_routes() -> Optional[set[str]]:
+    raw = os.environ.get("ROUTESPARK_ALLOWED_ROUTES", "").strip()
+    if not raw:
+        return None
+    values = {item.strip() for item in raw.split(",") if item.strip()}
+    return values or None
+
+
+def _route_allowed(route_number: Optional[str]) -> bool:
+    if not route_number:
+        return False
+    allowed = _allowed_routes()
+    return True if allowed is None else str(route_number) in allowed
+
+
+def _skip_initial_snapshot() -> bool:
+    return os.environ.get('ROUTESPARK_SKIP_INITIAL_ORDER_SNAPSHOT', '0').lower() in ('1', 'true', 'yes')
+
+
 def get_firestore_client(sa_path: str) -> firestore.Client:
     return firestore.Client.from_service_account_json(sa_path)
 
@@ -679,7 +698,7 @@ def handle_new_order(fb_client: firestore.Client, order_id: str, data: dict):
     user_id = data.get('userId')
     status = data.get('status')
     
-    if not route_number:
+    if not _route_allowed(route_number):
         return
     
     print(f"  📦 New order: {order_id} (route: {route_number}, status: {status})")
@@ -701,7 +720,7 @@ def handle_finalized_order(fb_client: firestore.Client, order_id: str, data: dic
     finalized_at = _extract_finalized_at(data)
     finalize_event_key = None
     
-    if not route_number:
+    if not _route_allowed(route_number):
         return
     
     print(f"  ✅ Order finalized: {order_id}")
@@ -1499,9 +1518,26 @@ def watch_all_orders(sa_path: str):
     
     # Track seen orders to avoid reprocessing
     seen_orders = set()
+    initial_snapshot_seen = False
     
     def on_snapshot(col_snapshot, changes, read_time):
         """Handle order collection changes."""
+        nonlocal initial_snapshot_seen
+
+        if not initial_snapshot_seen:
+            initial_snapshot_seen = True
+            if _skip_initial_snapshot():
+                primed = 0
+                for change in changes:
+                    doc = change.document
+                    path_parts = doc.reference.path.split('/')
+                    if len(path_parts) != 4 or path_parts[0] != 'routes' or path_parts[2] != 'orders':
+                        continue
+                    seen_orders.add(doc.id)
+                    primed += 1
+                print(f"   Initial snapshot skipped; primed {primed} existing order(s)")
+                return
+
         for change in changes:
             doc = change.document
             order_id = doc.id

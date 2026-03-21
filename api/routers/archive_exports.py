@@ -23,6 +23,21 @@ from pydantic import BaseModel, Field
 from ..dependencies import get_firebase_app, get_firestore, require_route_access, verify_firebase_token
 from ..middleware.rate_limit import rate_limit_history, rate_limit_write
 from ..models import ErrorResponse
+from archive_export_pg_queue import (
+    build_queue_positions as _build_pg_queue_positions,
+    cancel_export_job as _cancel_pg_export_job,
+    count_active_queue_depth as _count_pg_active_queue_depth,
+    count_queued_jobs as _count_pg_queued_jobs,
+    count_requests_today as _count_pg_requests_today,
+    create_export_job as _create_pg_export_job,
+    fetch_export_job as _fetch_pg_export_job,
+    fetch_route_jobs as _fetch_pg_route_jobs,
+    find_reusable_job as _find_pg_reusable_job,
+    mark_export_expired as _mark_pg_export_expired,
+    notify_archive_export_job as _notify_pg_export_job,
+    serialize_archive_export_row as _serialize_pg_export_job,
+    touch_download_link as _touch_pg_download_link,
+)
 
 router = APIRouter()
 logger = logging.getLogger("api.archive_exports")
@@ -32,6 +47,7 @@ MAX_RANGE_DAYS = 31
 MAX_REQUESTS_PER_DAY = 3
 MAX_ROUTE_ACTIVE_QUEUE_DEPTH = 3
 SIGNED_URL_TTL_SECONDS = 60 * 60
+ARCHIVE_EXPORT_QUEUE_BACKEND = str(os.environ.get("ARCHIVE_EXPORT_QUEUE_BACKEND") or "firestore").strip().lower()
 
 
 class ArchiveExportRequest(BaseModel):
@@ -185,6 +201,14 @@ def _start_of_utc_day_millis(now: datetime) -> int:
     return int(start.timestamp() * 1000)
 
 
+def _start_of_utc_day(now: datetime) -> datetime:
+    return datetime.combine(now.date(), time.min, tzinfo=timezone.utc)
+
+
+def _use_postgres_queue() -> bool:
+    return ARCHIVE_EXPORT_QUEUE_BACKEND == "postgres"
+
+
 def _validate_export_date_range(
     *,
     db: firestore.Client,
@@ -235,6 +259,73 @@ async def request_archive_export(
         from_date=body.fromDate,
         to_date=body.toDate,
     )
+
+    if _use_postgres_queue():
+        now = datetime.now(timezone.utc)
+        reusable = _find_pg_reusable_job(
+            body.route,
+            body.fromDate,
+            body.toDate,
+            body.format,
+            now=now,
+        )
+        if reusable:
+            route_rows = _fetch_pg_route_jobs(body.route)
+            queue_positions = _build_pg_queue_positions(route_rows)
+            return {
+                "ok": True,
+                "reused": True,
+                "job": _serialize_pg_export_job(
+                    reusable,
+                    queue_position_by_export_id=queue_positions,
+                ),
+            }
+
+        requester_uid = str(decoded_token.get("uid") or "").strip()
+        requests_today = _count_pg_requests_today(requester_uid, _start_of_utc_day(now))
+        if requests_today >= MAX_REQUESTS_PER_DAY:
+            raise HTTPException(status_code=429, detail="EXPORT_DAILY_LIMIT_REACHED")
+
+        active_queue_depth = _count_pg_active_queue_depth(body.route)
+        if active_queue_depth >= MAX_ROUTE_ACTIVE_QUEUE_DEPTH:
+            raise HTTPException(status_code=409, detail="ROUTE_EXPORT_QUEUE_FULL")
+
+        user_settings = user_data.get("userSettings", {}) if isinstance(user_data.get("userSettings"), dict) else {}
+        database_settings = user_settings.get("database", {}) if isinstance(user_settings.get("database"), dict) else {}
+
+        export_id = f"exp_{uuid4().hex[:24]}"
+        _create_pg_export_job(
+            export_id=export_id,
+            route_number=body.route,
+            requested_by_uid=requester_uid,
+            requested_by_email=str((user_data.get("profile", {}) or {}).get("email") or "").strip() or None,
+            from_date=body.fromDate,
+            to_date=body.toDate,
+            export_format=body.format,
+            max_attempts=3,
+            archived_pcf_retention_days=int(database_settings.get("archivedPcfRetentionDays") or 90),
+            archived_pcf_end_of_life_action=str(
+                database_settings.get("archivedPcfEndOfLifeAction") or "allow_export_then_delete"
+            ),
+        )
+        _notify_pg_export_job(export_id)
+
+        route_rows = _fetch_pg_route_jobs(body.route)
+        queue_positions = _build_pg_queue_positions(route_rows)
+        created_row = next((row for row in route_rows if str(row.get("export_id") or "") == export_id), None)
+        if not created_row:
+            created_row = _fetch_pg_export_job(export_id)
+        if not created_row:
+            raise HTTPException(status_code=500, detail="EXPORT_CREATE_FAILED")
+
+        return {
+            "ok": True,
+            "reused": False,
+            "job": _serialize_pg_export_job(
+                created_row,
+                queue_position_by_export_id=queue_positions,
+            ),
+        }
 
     route_docs = list(db.collection(EXPORT_COLLECTION).where("routeNumber", "==", body.route).stream())
 
@@ -369,6 +460,15 @@ async def list_archive_exports(
     user_data = await require_route_access(route, decoded_token, db)
     _assert_owner_access(user_data, route)
 
+    if _use_postgres_queue():
+        rows = _fetch_pg_route_jobs(route)
+        queue_positions = _build_pg_queue_positions(rows)
+        jobs = [
+            _serialize_pg_export_job(row, queue_position_by_export_id=queue_positions)
+            for row in rows[:limit]
+        ]
+        return {"ok": True, "jobs": jobs}
+
     docs = list(db.collection(EXPORT_COLLECTION).where("routeNumber", "==", route).stream())
     docs.sort(
         key=lambda d: _to_epoch_millis((d.to_dict() or {}).get("createdAt")) or 0,
@@ -397,6 +497,36 @@ async def cancel_archive_export(
     decoded_token: dict = Depends(verify_firebase_token),
     db: firestore.Client = Depends(get_firestore),
 ) -> Dict[str, Any]:
+    if _use_postgres_queue():
+        export_row = _fetch_pg_export_job(export_id)
+        if not export_row:
+            raise HTTPException(status_code=404, detail="EXPORT_NOT_FOUND")
+
+        route_number = _normalize_route_number(export_row.get("route_number"))
+        if not route_number:
+            raise HTTPException(status_code=409, detail="EXPORT_ROUTE_INVALID")
+
+        user_data = await require_route_access(route_number, decoded_token, db)
+        _assert_owner_access(user_data, route_number)
+
+        if str(export_row.get("status") or "").strip().lower() != "queued":
+            raise HTTPException(status_code=409, detail="EXPORT_CANCEL_ONLY_QUEUED")
+
+        updated_row = _cancel_pg_export_job(export_id)
+        if not updated_row:
+            raise HTTPException(status_code=409, detail="EXPORT_CANCEL_ONLY_QUEUED")
+
+        route_rows = _fetch_pg_route_jobs(route_number)
+        queue_positions = _build_pg_queue_positions(route_rows)
+        return {
+            "ok": True,
+            "reused": False,
+            "job": _serialize_pg_export_job(
+                updated_row,
+                queue_position_by_export_id=queue_positions,
+            ),
+        }
+
     export_ref = db.collection(EXPORT_COLLECTION).document(export_id)
     export_doc = export_ref.get()
     if not export_doc.exists:
@@ -448,6 +578,64 @@ async def generate_archive_export_link(
     decoded_token: dict = Depends(verify_firebase_token),
     db: firestore.Client = Depends(get_firestore),
 ) -> Dict[str, Any]:
+    if _use_postgres_queue():
+        export_row = _fetch_pg_export_job(export_id)
+        if not export_row:
+            raise HTTPException(status_code=404, detail="EXPORT_NOT_FOUND")
+
+        route_number = _normalize_route_number(export_row.get("route_number"))
+        if not route_number:
+            raise HTTPException(status_code=409, detail="EXPORT_ROUTE_INVALID")
+
+        user_data = await require_route_access(route_number, decoded_token, db)
+        _assert_owner_access(user_data, route_number)
+
+        status = str(export_row.get("status") or "").strip().lower()
+        if status not in {"ready", "ready_partial"}:
+            raise HTTPException(status_code=409, detail="EXPORT_NOT_READY")
+
+        artifact_expires_ms = _to_epoch_millis(export_row.get("artifact_expires_at"))
+        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        if artifact_expires_ms is not None and artifact_expires_ms <= now_ms:
+            _mark_pg_export_expired(export_id)
+            raise HTTPException(status_code=410, detail="EXPORT_ARTIFACT_EXPIRED")
+
+        storage_path = str(export_row.get("artifact_storage_path") or "").strip()
+        if not storage_path:
+            raise HTTPException(status_code=409, detail="EXPORT_ARTIFACT_NOT_READY")
+
+        bucket_name = (
+            str(os.environ.get("FIREBASE_STORAGE_BUCKET") or "").strip()
+            or str((get_firebase_app().options or {}).get("storageBucket") or "").strip()
+        )
+        if not bucket_name:
+            raise HTTPException(status_code=500, detail="STORAGE_BUCKET_NOT_CONFIGURED")
+
+        try:
+            bucket = storage.bucket(name=bucket_name, app=get_firebase_app())
+            blob = bucket.blob(storage_path)
+            if not blob.exists():
+                raise HTTPException(status_code=404, detail="EXPORT_ARTIFACT_MISSING")
+
+            signed_url = blob.generate_signed_url(
+                version="v4",
+                expiration=timedelta(seconds=SIGNED_URL_TTL_SECONDS),
+                method="GET",
+            )
+        except HTTPException:
+            raise
+        except Exception as exc:
+            logger.exception("Failed to generate signed URL for export %s: %s", export_id, exc)
+            raise HTTPException(status_code=500, detail="EXPORT_LINK_GENERATION_FAILED")
+
+        _touch_pg_download_link(export_id)
+        return {
+            "ok": True,
+            "exportId": export_id,
+            "url": signed_url,
+            "expiresAtMs": now_ms + SIGNED_URL_TTL_SECONDS * 1000,
+        }
+
     export_ref = db.collection(EXPORT_COLLECTION).document(export_id)
     export_doc = export_ref.get()
     if not export_doc.exists:

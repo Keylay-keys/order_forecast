@@ -25,6 +25,7 @@ import os
 import socket
 import time
 from datetime import datetime, timedelta
+from pathlib import Path
 
 from google.cloud import firestore
 
@@ -50,11 +51,24 @@ except ImportError:
 DEFAULT_INTERVAL = 86400  # 24 hours (once per day)
 DEFAULT_SA_PATH = '/Users/kylemacmini/Desktop/dev/firebase-tools/routespark-1f47d-firebase-adminsdk-tnv5k-b259331cbc.json'
 WORKER_ID = f"retrain-daemon-{socket.gethostname()}-{__import__('os').getpid()}"
+FORECAST_STATUS_WRITE_ENABLED = os.environ.get("FORECAST_STATUS_WRITE_ENABLED", "true").lower() in ("1", "true", "yes")
+FORECAST_RETRAIN_ENABLED = os.environ.get("FORECAST_RETRAIN_ENABLED", "true").lower() in ("1", "true", "yes")
+FORECAST_GENERATION_ENABLED = os.environ.get("FORECAST_GENERATION_ENABLED", "true").lower() in ("1", "true", "yes")
+LOG_DIR = Path(os.environ.get("LOG_DIR", "/app/logs"))
+RETRAIN_LOG_FILE = LOG_DIR / "retrain_daemon.log"
 
 def log(msg: str):
     """Print timestamped log message."""
     ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    print(f"[{ts}] {msg}", flush=True)
+    line = f"[{ts}] {msg}"
+    print(line, flush=True)
+    try:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        with RETRAIN_LOG_FILE.open("a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
+    except Exception:
+        # Never let file logging break the daemon.
+        pass
 
 
 def _parse_date(value) -> datetime | None:
@@ -293,6 +307,9 @@ def _check_trained_model(route_number: str) -> bool:
 
 def write_forecast_status(fb_client: firestore.Client, route_number: str, order_count: int, min_required: int, has_trained_model: bool = False):
     """Write forecast status metadata to Firebase for app/portal to read."""
+    if not FORECAST_STATUS_WRITE_ENABLED:
+        log(f"    ℹ️  FORECAST_STATUS_WRITE_ENABLED=false; skipped status write for {route_number}")
+        return
     try:
         status_ref = fb_client.collection('forecasts').document(route_number)
         status_ref.set({
@@ -407,42 +424,49 @@ def run_retrain_check(fb_client: firestore.Client, route_number: str, sa_path: s
                 has_enough_data = False
         
         if has_enough_data:
-            log(f"  🚀 Route {route_number}: Cycle complete! Retraining model...")
-            
-            # Trigger model retrain via training_pipeline.py
-            try:
+            if not FORECAST_RETRAIN_ENABLED:
+                log(f"  ℹ️  FORECAST_RETRAIN_ENABLED=false; skipped retraining for {route_number}")
+            else:
+                log(f"  🚀 Route {route_number}: Cycle complete! Retraining model...")
+                
+                # Trigger model retrain via training_pipeline.py
                 try:
-                    from .training_pipeline import run_pipeline  # type: ignore
-                except Exception:
-                    from training_pipeline import run_pipeline  # type: ignore
-                metrics = run_pipeline(
-                    orders_csv=None,
-                    stock_csv=None,
-                    promos=None,
-                    corrections_csv=None,
-                    calendar_csv=None,
-                    mae_threshold=5.0,
-                    rmse_threshold=8.0,
-                    use_postgres=True,
-                    route_number=route_number,
-                    since_days=365,
-                )
-                log(f"    ✅ Training complete for {route_number}: {metrics}")
-                retrained = True
-            except Exception as e:
-                log(f"    ⚠️  Training failed for {route_number}: {e}")
+                    try:
+                        from .training_pipeline import run_pipeline  # type: ignore
+                    except Exception:
+                        from training_pipeline import run_pipeline  # type: ignore
+                    metrics = run_pipeline(
+                        orders_csv=None,
+                        stock_csv=None,
+                        promos=None,
+                        corrections_csv=None,
+                        calendar_csv=None,
+                        mae_threshold=5.0,
+                        rmse_threshold=8.0,
+                        use_postgres=True,
+                        route_number=route_number,
+                        since_days=365,
+                    )
+                    log(f"    ✅ Training complete for {route_number}: {metrics}")
+                    retrained = True
+                except Exception as e:
+                    log(f"    ⚠️  Training failed for {route_number}: {e}")
         else:
             log(f"  ⏳ Route {route_number}: Cycle complete but not enough data for retrain")
     else:
         log(f"  ⏳ Route {route_number}: Cycle not complete, skipping retrain")
     
     # --- Forecast generation: ALWAYS attempt (engine has last-order fallback) ---
-    forecasts_generated = generate_forecasts_for_route(fb_client, route_number, sa_path)
-    
-    if forecasts_generated > 0:
-        log(f"  ✅ Generated {forecasts_generated} forecast(s) for route {route_number}")
+    forecasts_generated = 0
+    if not FORECAST_GENERATION_ENABLED:
+        log(f"  ℹ️  FORECAST_GENERATION_ENABLED=false; skipped forecast generation for {route_number}")
     else:
-        log(f"  ℹ️  No new forecasts needed for route {route_number}")
+        forecasts_generated = generate_forecasts_for_route(fb_client, route_number, sa_path)
+        
+        if forecasts_generated > 0:
+            log(f"  ✅ Generated {forecasts_generated} forecast(s) for route {route_number}")
+        else:
+            log(f"  ℹ️  No new forecasts needed for route {route_number}")
 
     # --- Weekly band calibration: adjust p10/p90 width to target coverage ---
     band_calibration_enabled = os.environ.get("FORECAST_BAND_CALIBRATION_DAEMON_ENABLED", "1").lower() in ("1", "true", "yes")

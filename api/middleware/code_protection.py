@@ -88,7 +88,11 @@ class BlocklistMiddleware(BaseHTTPMiddleware):
         
         # Check blocklist
         if blocklist.is_blocked(ip):
-            security_logger.blocked_ip_attempt(ip, request.url.path)
+            security_logger.blocked_ip_attempt(
+                ip,
+                request.url.path,
+                details=blocklist.get_block_info(ip) or {},
+            )
             return JSONResponse(
                 status_code=403,
                 content={"error": "Access denied"}

@@ -1,0 +1,15 @@
+{
+  "macos_notifications": true,
+  "ntfy": {
+    "enabled": true,
+    "topic": "routespark-down-detection"
+  },
+  "server_failure_threshold": 3,
+  "server_recovery_threshold": 2,
+  "notification_cooldown_minutes": 30,
+  "server_check_timeout_seconds": 5,
+  "refresh_interval_ms": 5000,
+  "notify_recovery": false,
+  "server_api_url": "http://192.168.1.39",
+  "log_level": "INFO"
+}

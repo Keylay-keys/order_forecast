@@ -76,11 +76,11 @@ async def lifespan(app: FastAPI):
         # Initialize Firestore
         get_firestore()
         logger.info("Firestore connected")
-        
+
         # Initialize PostgreSQL connection pool
         get_pg_pool()
         logger.info("PostgreSQL connection pool initialized")
-        
+
     except Exception as e:
         logger.error(f"Startup failed: {e}")
         raise

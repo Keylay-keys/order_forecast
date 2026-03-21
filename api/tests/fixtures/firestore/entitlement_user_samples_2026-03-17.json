@@ -1,0 +1,256 @@
+{
+  "legacy_user": {
+    "doc": {
+      "business": {
+        "emailVerified": true,
+        "name": "KP Industries",
+        "phone": "2513773094",
+        "state": "UT",
+        "team": {
+          "hasTeam": false,
+          "members": []
+        }
+      },
+      "fcmTokens": [
+        "ExponentPushToken[PF0dQAO7TBgckX-Btr8sy1]",
+        "ExponentPushToken[_2VFM_IKiBttVEjEupM-K-]",
+        "ExponentPushToken[jCJRt-KASZezRuV4UrWPsJ]",
+        "ExponentPushToken[dHwH2yNBoQ6yUv2RKqzf7L]"
+      ],
+      "metadata": {
+        "lastLoginAt": "2026-02-19T23:30:28.932000+00:00"
+      },
+      "onboardingProgress": {
+        "accountCreated": true,
+        "businessDetailsComplete": true,
+        "emailVerified": true,
+        "pcfVerified": true
+      },
+      "profile": {
+        "additionalRoutes": [],
+        "createdAt": "2025-03-13T19:37:27.748000+00:00",
+        "currentRoute": "989262",
+        "email": "kylepurvis@gmail.com",
+        "personalName": "Kyle",
+        "photoURL": "https://lh3.googleusercontent.com/a/ACg8ocIIY9jRHVJnI8dZlIxpVZr_10IUdZBt_lLY_yTO4f3O37MjRg=s96-c",
+        "role": "owner",
+        "routeNumber": "989262",
+        "timezone": "America/Denver",
+        "updatedAt": "2025-03-13T19:37:27.748000+00:00"
+      },
+      "routeAssignments": {
+        "989262": {
+          "addedAt": "2025-12-20T22:21:38.412654+00:00",
+          "businessName": "KP Industries (Legacy)",
+          "isLegacy": true,
+          "role": "owner",
+          "verified": true
+        }
+      },
+      "status": {
+        "emailVerified": true,
+        "isTemporaryAccount": true,
+        "onboardingComplete": true,
+        "verifiedPCF": true
+      },
+      "subscriptions": {
+        "routes": {
+          "989262": {
+            "active": true,
+            "currentPeriodEnd": "2026-04-16T02:07:14.036000+00:00",
+            "interval": "monthly",
+            "plan": "pro",
+            "provider": "stripe",
+            "source": "manual_beta_test",
+            "startedAt": "2026-02-17T20:59:57.732000+00:00",
+            "status": "active",
+            "stripeCustomerId": "cus_TzvHTFsACoT0DE",
+            "stripeSubscriptionId": null,
+            "updatedAt": "2026-03-17T02:07:14.555000+00:00"
+          }
+        }
+      },
+      "timestamps": {
+        "updatedAt": "2026-03-17T02:07:14.555000+00:00"
+      },
+      "trialStatus": {
+        "endsAt": "2026-03-17T00:00:00+00:00",
+        "features": {
+          "managementDashboard": true,
+          "multiRoute": true,
+          "scanner": true
+        },
+        "hasBeenNotified": {
+          "expired": false,
+          "oneDayWarning": false,
+          "threeDayWarning": false
+        },
+        "inheritedFromOwner": false,
+        "startedAt": "2025-03-13T19:37:27.748000+00:00",
+        "updatedAt": "2026-03-13T19:47:15.805000+00:00"
+      },
+      "userSettings": {
+        "app": {
+          "biometricsDeclined": false,
+          "biometricsEnabled": true,
+          "itemsToShow": 5,
+          "posScannerType": "document",
+          "showExpiredItems": false,
+          "theme": "dark"
+        },
+        "database": {
+          "expiryRetentionDays": 4,
+          "pcfRetentionDays": 4
+        },
+        "notifications": {
+          "defaultTaskTime": {
+            "hour": 2,
+            "minute": 0,
+            "period": "AM"
+          },
+          "enabled": true,
+          "expirationAlertDays": 1,
+          "orderReminders": {
+            "enabled": true,
+            "time": {
+              "hour": 3,
+              "minute": 0,
+              "period": "PM"
+            }
+          },
+          "reminderTime": 1440,
+          "scheduling": {
+            "orderCycles": [
+              {
+                "deliveryDay": 4,
+                "loadDay": 3,
+                "orderDay": 1
+              },
+              {
+                "deliveryDay": 1,
+                "loadDay": 5,
+                "orderDay": 2
+              }
+            ]
+          },
+          "sound": true
+        },
+        "storeOrder": {
+          "989262": [
+            "store_1763033699847",
+            "store_1762898748785",
+            "store_1763150611812",
+            "store_1762919202568",
+            "store_1763150601142",
+            "store_1762926930357"
+          ]
+        },
+        "timestamps": {
+          "updatedAt": "2026-03-04T01:58:31.929000+00:00"
+        }
+      }
+    },
+    "email": "kylepurvis@gmail.com",
+    "uid": "ngIcm6lkb2cgIhq6gRjm28Mdiwk2"
+  },
+  "trial_user": {
+    "doc": {
+      "business": {
+        "name": "THORNTON DISTRIBUTION & MERCHANDISING LLC",
+        "phone": "5413359951",
+        "state": "OR",
+        "team": {
+          "hasTeam": false,
+          "members": []
+        }
+      },
+      "emails": {
+        "welcomeSentAt": "2026-03-16T16:41:48.372000+00:00"
+      },
+      "onboardingProgress": {
+        "accountCreated": true,
+        "businessDetailsComplete": true,
+        "emailVerified": true,
+        "pcfVerified": true
+      },
+      "profile": {
+        "additionalRoutes": [],
+        "createdAt": "2026-03-16T16:40:17.277000+00:00",
+        "currentRoute": "960581",
+        "email": "thornton3893@gmail.com",
+        "personalName": "",
+        "role": "owner",
+        "routeNumber": "960581",
+        "timezone": "America/Los_Angeles",
+        "updatedAt": "2026-03-16T16:41:43.177000+00:00"
+      },
+      "routeAssignments": {},
+      "status": {
+        "emailVerified": true,
+        "isTemporaryAccount": false,
+        "onboardingComplete": true,
+        "verifiedPCF": true
+      },
+      "timestamps": {
+        "updatedAt": "2026-03-16T16:41:43.177000+00:00"
+      },
+      "trialStatus": {
+        "endsAt": "2026-05-15T16:41:42.674000+00:00",
+        "features": {
+          "managementDashboard": true,
+          "multiRoute": true,
+          "scanner": true
+        },
+        "hasBeenNotified": {
+          "expired": false,
+          "oneDayWarning": false,
+          "threeDayWarning": false
+        },
+        "startedAt": "2026-03-16T16:41:43.177000+00:00",
+        "updatedAt": "2026-03-16T16:41:43.177000+00:00"
+      },
+      "userSettings": {
+        "app": {
+          "biometricsDeclined": false,
+          "biometricsEnabled": false,
+          "posScannerType": "document",
+          "theme": "system"
+        },
+        "database": {
+          "archivedPcfEndOfLifeAction": "allow_export_then_delete",
+          "archivedPcfRetentionDays": 90,
+          "expiryRetentionDays": 4,
+          "pcfRetentionDays": 4
+        },
+        "notifications": {
+          "defaultTaskTime": {
+            "hour": 9,
+            "minute": 0,
+            "period": "AM"
+          },
+          "enabled": true,
+          "expirationAlertDays": -1,
+          "orderReminders": {
+            "enabled": false,
+            "time": {
+              "hour": 8,
+              "minute": 0,
+              "period": "AM"
+            }
+          },
+          "reminderTime": 1440,
+          "scheduling": {
+            "orderCycles": []
+          },
+          "sound": true
+        },
+        "timestamps": {
+          "updatedAt": "2026-03-16T16:41:43.177000+00:00"
+        }
+      }
+    },
+    "email": "thornton3893@gmail.com",
+    "routeNumber": "960581",
+    "uid": "tN62DPDe9XhodcLwpv2mLvcjge13"
+  }
+}

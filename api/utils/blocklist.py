@@ -2,8 +2,9 @@
 
 Manages blocked IPs with:
 - Persistent storage (survives restarts)
-- Auto-expiry
-- Escalating bans for repeat offenders (capped at 48h max)
+- Auto-expiry for temporary bans
+- Explicit permanent bans for known bad IPs
+- Escalating bans for repeat offenders (capped at 48h max for temporary bans)
 - Whitelist for known good IPs
 """
 
@@ -13,7 +14,7 @@ import json
 import os
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Dict, Optional, Set
+from typing import Any, Dict, Optional, Set
 import threading
 
 from .security_logger import security_logger
@@ -37,7 +38,7 @@ class IPBlocklist:
     MAX_BAN_DURATION = timedelta(hours=48)
     
     def __init__(self):
-        self.blocklist: Dict[str, Dict] = {}  # IP -> {until, reason, hits}
+        self.blocklist: Dict[str, Dict[str, Any]] = {}
         self._lock = threading.Lock()
         self._dirty = False
         self._load()
@@ -48,10 +49,16 @@ class IPBlocklist:
             try:
                 data = json.loads(BLOCKLIST_FILE.read_text())
                 for ip, entry in data.items():
+                    permanent = bool(entry.get("permanent", False))
+                    until_raw = entry.get("until")
                     self.blocklist[ip] = {
-                        "until": datetime.fromisoformat(entry["until"]),
+                        "until": datetime.fromisoformat(until_raw) if until_raw else None,
                         "reason": entry["reason"],
-                        "hits": entry.get("hits", 1)
+                        "hits": entry.get("hits", 1),
+                        "permanent": permanent,
+                        "first_seen_at": entry.get("first_seen_at"),
+                        "last_seen_at": entry.get("last_seen_at"),
+                        "last_metadata": entry.get("last_metadata") or {},
                     }
             except Exception as e:
                 print(f"[blocklist] Error loading blocklist: {e}")
@@ -64,12 +71,16 @@ class IPBlocklist:
         now = datetime.utcnow()
         data = {
             ip: {
-                "until": entry["until"].isoformat(),
+                "until": entry["until"].isoformat() if entry.get("until") else None,
                 "reason": entry["reason"],
-                "hits": entry["hits"]
+                "hits": entry["hits"],
+                "permanent": entry.get("permanent", False),
+                "first_seen_at": entry.get("first_seen_at"),
+                "last_seen_at": entry.get("last_seen_at"),
+                "last_metadata": entry.get("last_metadata") or {},
             }
             for ip, entry in self.blocklist.items()
-            if entry["until"] > now
+            if entry.get("permanent") or (entry.get("until") and entry["until"] > now)
         }
         
         try:
@@ -82,7 +93,10 @@ class IPBlocklist:
         self,
         ip: str,
         reason: str,
-        duration: timedelta = timedelta(hours=24)
+        duration: timedelta = timedelta(hours=24),
+        *,
+        permanent: bool = False,
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> bool:
         """Add IP to blocklist.
         
@@ -96,41 +110,54 @@ class IPBlocklist:
         """
         if ip in WHITELISTED_IPS:
             return False
-        
+
         with self._lock:
             now = datetime.utcnow()
-            
-            if ip in self.blocklist:
-                existing = self.blocklist[ip]
+            now_iso = now.isoformat() + "Z"
+            existing = self.blocklist.get(ip)
+
+            if existing:
                 hits = existing["hits"] + 1
-                
+                if existing.get("permanent"):
+                    permanent = True
+            else:
+                hits = 1
+
+            if not permanent:
                 # Escalate duration for repeat offenders
                 if hits >= 3:
                     duration = duration * 4
                 elif hits >= 2:
                     duration = duration * 2
-                
+
                 # Cap at max duration to protect shared NAT IPs
                 if duration > self.MAX_BAN_DURATION:
                     duration = self.MAX_BAN_DURATION
-            else:
-                hits = 1
-            
+
+            expires_at = None if permanent else now + duration
             self.blocklist[ip] = {
-                "until": now + duration,
+                "until": expires_at,
                 "reason": reason,
-                "hits": hits
+                "hits": hits,
+                "permanent": permanent,
+                "first_seen_at": existing.get("first_seen_at", now_iso) if existing else now_iso,
+                "last_seen_at": now_iso,
+                "last_metadata": metadata or {},
             }
             self._dirty = True
             self._save()
-        
+
         # Log the block
         security_logger.ip_blocked(
             ip=ip,
             reason=reason,
-            duration_hours=duration.total_seconds() / 3600
+            duration_hours=None if permanent else duration.total_seconds() / 3600,
+            permanent=permanent,
+            hits=hits,
+            expires_at=expires_at.isoformat() + "Z" if expires_at else None,
+            details=metadata,
         )
-        
+
         return True
     
     def is_blocked(self, ip: str) -> bool:
@@ -144,8 +171,10 @@ class IPBlocklist:
         with self._lock:
             if ip not in self.blocklist:
                 return False
-            
+
             entry = self.blocklist[ip]
+            if entry.get("permanent"):
+                return True
             if datetime.utcnow() > entry["until"]:
                 # Expired, clean up
                 del self.blocklist[ip]
@@ -160,13 +189,17 @@ class IPBlocklist:
             return None
         
         entry = self.blocklist[ip]
-        if datetime.utcnow() > entry["until"]:
+        if not entry.get("permanent") and datetime.utcnow() > entry["until"]:
             return None
-        
+
         return {
-            "until": entry["until"].isoformat(),
+            "until": entry["until"].isoformat() if entry.get("until") else None,
             "reason": entry["reason"],
-            "hits": entry["hits"]
+            "hits": entry["hits"],
+            "permanent": entry.get("permanent", False),
+            "first_seen_at": entry.get("first_seen_at"),
+            "last_seen_at": entry.get("last_seen_at"),
+            "last_metadata": entry.get("last_metadata") or {},
         }
     
     def remove(self, ip: str) -> bool:
@@ -191,7 +224,7 @@ class IPBlocklist:
             active = {
                 ip: entry 
                 for ip, entry in self.blocklist.items()
-                if entry["until"] > now
+                if entry.get("permanent") or (entry.get("until") and entry["until"] > now)
             }
         
         # Sort by hits (most offensive first)
@@ -208,7 +241,9 @@ class IPBlocklist:
                     "ip": ip,
                     "hits": entry["hits"],
                     "reason": entry["reason"],
-                    "expires": entry["until"].isoformat()
+                    "expires": entry["until"].isoformat() if entry.get("until") else None,
+                    "permanent": entry.get("permanent", False),
+                    "last_seen_at": entry.get("last_seen_at"),
                 }
                 for ip, entry in top_offenders
             ]
@@ -221,7 +256,7 @@ class IPBlocklist:
         with self._lock:
             expired = [
                 ip for ip, entry in self.blocklist.items()
-                if entry["until"] <= now
+                if not entry.get("permanent") and entry.get("until") and entry["until"] <= now
             ]
             
             for ip in expired:
@@ -232,6 +267,10 @@ class IPBlocklist:
                 self._save()
         
         return len(expired)
+
+    def permaban(self, ip: str, reason: str, metadata: Optional[Dict[str, Any]] = None) -> bool:
+        """Apply a non-expiring block to an IP."""
+        return self.add(ip, reason=reason, permanent=True, metadata=metadata)
 
 
 # Singleton instance

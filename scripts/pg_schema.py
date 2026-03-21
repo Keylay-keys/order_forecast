@@ -95,6 +95,9 @@ def create_schema(conn: psycopg2.extensions.connection) -> None:
     _create_route_transfer_tables(cur)
     _create_route_sync_tables(cur)
     _create_forecast_queue_tables(cur)
+    _create_archive_export_tables(cur)
+    _create_forecast_calibration_tables(cur)
+    _create_forecast_learning_tables(cur)
     _create_notification_tables(cur)
     _create_indexes(cur)
     
@@ -804,6 +807,148 @@ def _create_forecast_queue_tables(cur) -> None:
     print("  ✓ Forecast queue tables created")
 
 
+def _create_archive_export_tables(cur) -> None:
+    """Create PostgreSQL-backed archive export queue tables."""
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS archive_export_jobs (
+            export_id TEXT PRIMARY KEY,
+            job_key TEXT NOT NULL,
+            route_number VARCHAR(20) NOT NULL,
+            requested_by_uid VARCHAR(255) NOT NULL,
+            requested_by_email TEXT,
+            from_date DATE NOT NULL,
+            to_date DATE NOT NULL,
+            format VARCHAR(16) NOT NULL DEFAULT 'zip',
+            status VARCHAR(20) NOT NULL DEFAULT 'queued',
+            attempt_count INTEGER NOT NULL DEFAULT 0,
+            max_attempts INTEGER NOT NULL DEFAULT 3,
+            retry_after_at TIMESTAMP WITH TIME ZONE,
+            claimed_by VARCHAR(100),
+            started_at TIMESTAMP WITH TIME ZONE,
+            worker_heartbeat_at TIMESTAMP WITH TIME ZONE,
+            ready_at TIMESTAMP WITH TIME ZONE,
+            artifact_storage_path TEXT,
+            artifact_expires_at TIMESTAMP WITH TIME ZONE,
+            artifact_parts JSONB NOT NULL DEFAULT '[]'::jsonb,
+            artifact_size_bytes BIGINT NOT NULL DEFAULT 0,
+            archived_pcf_retention_days INTEGER NOT NULL DEFAULT 90,
+            archived_pcf_end_of_life_action VARCHAR(64) NOT NULL DEFAULT 'allow_export_then_delete',
+            result_warning_count INTEGER NOT NULL DEFAULT 0,
+            result_total_deliveries_requested INTEGER NOT NULL DEFAULT 0,
+            result_total_deliveries_exported INTEGER NOT NULL DEFAULT 0,
+            result_warnings JSONB NOT NULL DEFAULT '[]'::jsonb,
+            error_code VARCHAR(64),
+            error_message TEXT,
+            last_download_link_generated_at TIMESTAMP WITH TIME ZONE,
+            created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS archive_export_attempts (
+            id BIGSERIAL PRIMARY KEY,
+            export_id TEXT NOT NULL REFERENCES archive_export_jobs(export_id) ON DELETE CASCADE,
+            attempt_number INTEGER NOT NULL,
+            worker_id VARCHAR(100),
+            started_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            finished_at TIMESTAMP WITH TIME ZONE,
+            outcome VARCHAR(24) NOT NULL,
+            error_code VARCHAR(64),
+            error_message TEXT,
+            artifact_size_bytes BIGINT,
+            created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    print("  ✓ Archive export queue tables created")
+
+
+def _create_forecast_calibration_tables(cur) -> None:
+    """Create forecast uncertainty calibration tables used by live forecasting."""
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS forecast_band_calibration (
+            route_number TEXT NOT NULL,
+            schedule_key TEXT NOT NULL,
+            interval_name TEXT NOT NULL DEFAULT 'p10_p90',
+            band_scale REAL NOT NULL DEFAULT 1.0,
+            target_coverage REAL NOT NULL DEFAULT 0.80,
+            observed_coverage REAL,
+            under_rate REAL,
+            over_rate REAL,
+            sample_lines INTEGER,
+            fold_count INTEGER,
+            notes TEXT,
+            last_backtest_at TIMESTAMP,
+            updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
+            band_center_offset_units REAL,
+            PRIMARY KEY (route_number, schedule_key, interval_name)
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS forecast_band_center_calibration (
+            route_number TEXT NOT NULL,
+            schedule_key TEXT NOT NULL,
+            interval_name TEXT NOT NULL DEFAULT 'p10_p90',
+            center_offset_units REAL NOT NULL DEFAULT 0.0,
+            observed_under_rate REAL,
+            observed_over_rate REAL,
+            sample_lines INTEGER,
+            fold_count INTEGER,
+            notes TEXT,
+            last_backtest_at TIMESTAMP,
+            updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
+            PRIMARY KEY (route_number, schedule_key, interval_name)
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS forecast_band_source_calibration (
+            route_number TEXT NOT NULL,
+            schedule_key TEXT NOT NULL,
+            source TEXT NOT NULL,
+            interval_name TEXT NOT NULL DEFAULT 'p10_p90',
+            band_scale_mult REAL NOT NULL DEFAULT 1.0,
+            center_offset_units REAL NOT NULL DEFAULT 0.0,
+            target_coverage REAL NOT NULL DEFAULT 0.80,
+            observed_coverage REAL,
+            observed_under_rate REAL,
+            observed_over_rate REAL,
+            sample_lines INTEGER,
+            fold_count INTEGER,
+            notes TEXT,
+            last_backtest_at TIMESTAMP,
+            updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
+            PRIMARY KEY (route_number, schedule_key, source, interval_name)
+        )
+    """)
+
+    print("  ✓ Forecast calibration tables created")
+
+
+def _create_forecast_learning_tables(cur) -> None:
+    """Create forecast learning refresh state table used by the web forecast card."""
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS forecast_learning_refresh_state (
+            route_number TEXT PRIMARY KEY,
+            last_refreshed_at TIMESTAMPTZ,
+            last_status TEXT NOT NULL DEFAULT 'never',
+            last_scorecard_file TEXT,
+            last_folds_file TEXT,
+            last_sources_file TEXT,
+            last_fold_count INTEGER,
+            last_error TEXT,
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+    """)
+
+    print("  ✓ Forecast learning tables created")
+
+
 # =============================================================================
 # NOTIFICATION TABLES
 # =============================================================================
@@ -890,6 +1035,13 @@ def _create_indexes(cur) -> None:
         ("idx_forecast_finalize_route_status", "forecast_finalize_events", "route_number, status"),
         ("idx_forecast_jobs_route_status_available", "forecast_generation_jobs", "route_number, status, available_at"),
         ("idx_forecast_jobs_status_available", "forecast_generation_jobs", "status, available_at"),
+
+        # Archive export queue indexes
+        ("idx_archive_export_jobs_route_status_created", "archive_export_jobs", "route_number, status, created_at"),
+        ("idx_archive_export_jobs_status_retry_created", "archive_export_jobs", "status, retry_after_at, created_at"),
+        ("idx_archive_export_jobs_requester_created", "archive_export_jobs", "requested_by_uid, created_at DESC"),
+        ("idx_archive_export_jobs_job_key", "archive_export_jobs", "job_key"),
+        ("idx_archive_export_attempts_export_id_started", "archive_export_attempts", "export_id, started_at DESC"),
     ]
     
     for name, table, columns in indexes:
@@ -897,6 +1049,15 @@ def _create_indexes(cur) -> None:
             cur.execute(f"CREATE INDEX IF NOT EXISTS {name} ON {table}({columns})")
         except Exception as e:
             print(f"  ⚠️  Index {name}: {e}")
+
+    try:
+        cur.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_archive_export_one_processing_per_route
+            ON archive_export_jobs(route_number)
+            WHERE status = 'processing'
+        """)
+    except Exception as e:
+        print(f"  ⚠️  Index idx_archive_export_one_processing_per_route: {e}")
     
     print("  ✓ Indexes created")
 
@@ -920,6 +1081,7 @@ def get_table_counts(conn: psycopg2.extensions.connection) -> dict:
         'route_transfers',
         'routes_synced', 'sync_log',
         'forecast_finalize_events', 'forecast_generation_jobs',
+        'archive_export_jobs', 'archive_export_attempts',
         'low_qty_notifications_sent'
     ]
     
@@ -952,6 +1114,7 @@ def print_schema_summary(conn: psycopg2.extensions.connection) -> None:
         "Delivery": ['delivery_allocations'],
         "Route Sync": ['routes_synced', 'sync_log'],
         "Forecast Queue": ['forecast_finalize_events', 'forecast_generation_jobs'],
+        "Archive Export Queue": ['archive_export_jobs', 'archive_export_attempts'],
         "Notifications": ['low_qty_notifications_sent']
     }
     
