@@ -10,6 +10,6 @@
   "server_check_timeout_seconds": 5,
   "refresh_interval_ms": 5000,
   "notify_recovery": false,
-  "server_api_url": "http://192.168.1.39",
+  "server_api_url": "https://api.routespark.pro",
   "log_level": "INFO"
 }
