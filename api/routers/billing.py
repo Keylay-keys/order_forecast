@@ -63,6 +63,18 @@ STRIPE_BILLING_PORTAL_ALLOWED_RETURN_ORIGINS = tuple(
     ).split(",")
     if origin.strip()
 )
+STRIPE_CHECKOUT_PRICE_SOLO_MONTHLY = str(
+    os.environ.get("STRIPE_CHECKOUT_PRICE_SOLO_MONTHLY", "price_1SoDFEFPbZgKhVUEosvsug6i")
+).strip()
+STRIPE_CHECKOUT_PRICE_SOLO_YEARLY = str(
+    os.environ.get("STRIPE_CHECKOUT_PRICE_SOLO_YEARLY", "price_1SoEfUFPbZgKhVUEVnAe0Idp")
+).strip()
+STRIPE_CHECKOUT_PRICE_PRO_MONTHLY = str(
+    os.environ.get("STRIPE_CHECKOUT_PRICE_PRO_MONTHLY", "price_1SoEIYFPbZgKhVUE00KFwmzH")
+).strip()
+STRIPE_CHECKOUT_PRICE_PRO_YEARLY = str(
+    os.environ.get("STRIPE_CHECKOUT_PRICE_PRO_YEARLY", "price_1SoEPAFPbZgKhVUEFrSlmweZ")
+).strip()
 
 
 def _normalize_route_number(value: Any) -> str:
@@ -888,6 +900,19 @@ class StripePortalSessionResponse(BaseModel):
     url: str
 
 
+class StripeCheckoutSessionRequest(BaseModel):
+    routeNumber: str = Field(..., pattern=r"^\d{1,10}$")
+    plan: Literal["solo", "pro"]
+    interval: Literal["monthly", "yearly"]
+    successUrl: Optional[str] = Field(default=None, max_length=2048)
+    cancelUrl: Optional[str] = Field(default=None, max_length=2048)
+
+
+class StripeCheckoutSessionResponse(BaseModel):
+    ok: bool
+    url: str
+
+
 def _normalize_provider(value: Any) -> Optional[str]:
     normalized = str(value or "").strip().lower()
     if not normalized:
@@ -1422,6 +1447,14 @@ def _build_default_stripe_return_url() -> str:
     return "https://routespark.pro/subscription"
 
 
+def _append_query_param(url: str, key: str, value: str) -> str:
+    parsed = url_parse.urlparse(url)
+    existing = url_parse.parse_qsl(parsed.query, keep_blank_values=True)
+    updated = [(k, v) for k, v in existing if k != key]
+    updated.append((key, value))
+    return url_parse.urlunparse(parsed._replace(query=url_parse.urlencode(updated)))
+
+
 def _resolve_stripe_portal_return_url(*, request: Request, payload_return_url: Optional[str]) -> str:
     candidate = str(payload_return_url or "").strip()
     if candidate and _is_allowed_return_url(candidate):
@@ -1432,6 +1465,58 @@ def _resolve_stripe_portal_return_url(*, request: Request, payload_return_url: O
         return f"{origin}/subscription"
 
     return _build_default_stripe_return_url()
+
+
+def _resolve_stripe_checkout_return_url(
+    *,
+    request: Request,
+    payload_return_url: Optional[str],
+    checkout_state: Literal["success", "cancel"],
+) -> str:
+    candidate = str(payload_return_url or "").strip()
+    if candidate and _is_allowed_return_url(candidate):
+        return candidate
+
+    origin = str(request.headers.get("origin") or "").strip().rstrip("/")
+    if origin and origin in STRIPE_BILLING_PORTAL_ALLOWED_RETURN_ORIGINS:
+        return _append_query_param(f"{origin}/subscription", "checkout", checkout_state)
+
+    return _append_query_param(_build_default_stripe_return_url(), "checkout", checkout_state)
+
+
+def _stripe_checkout_price_id(plan: Literal["solo", "pro"], interval: Literal["monthly", "yearly"]) -> str:
+    price_map = {
+        ("solo", "monthly"): STRIPE_CHECKOUT_PRICE_SOLO_MONTHLY,
+        ("solo", "yearly"): STRIPE_CHECKOUT_PRICE_SOLO_YEARLY,
+        ("pro", "monthly"): STRIPE_CHECKOUT_PRICE_PRO_MONTHLY,
+        ("pro", "yearly"): STRIPE_CHECKOUT_PRICE_PRO_YEARLY,
+    }
+    price_id = str(price_map.get((plan, interval)) or "").strip()
+    if price_id:
+        return price_id
+    _raise_apple_error(
+        status_code=501,
+        error="Stripe checkout is not configured",
+        code="STRIPE_CHECKOUT_PRICE_NOT_CONFIGURED",
+        details={"plan": plan, "interval": interval},
+    )
+
+
+def _resolve_existing_stripe_customer_id_from_user(user_data: Dict[str, Any]) -> Optional[str]:
+    routes = (
+        user_data.get("subscriptions", {}).get("routes", {})
+        if isinstance(user_data.get("subscriptions", {}), dict)
+        else {}
+    )
+    if not isinstance(routes, dict):
+        return None
+    for route_sub in routes.values():
+        if not isinstance(route_sub, dict):
+            continue
+        customer_id = str(route_sub.get("stripeCustomerId") or "").strip()
+        if customer_id:
+            return customer_id
+    return None
 
 
 def _stripe_api_request_form(
@@ -1663,6 +1748,146 @@ async def get_billing_entitlement(
             resolved_from="none",
         ),
     )
+
+
+@router.post(
+    "/billing/stripe/checkout",
+    response_model=StripeCheckoutSessionResponse,
+    responses={
+        401: {"model": ErrorResponse},
+        403: {"model": ErrorResponse},
+        409: {"model": ErrorResponse},
+        422: {"model": ErrorResponse},
+        500: {"model": ErrorResponse},
+        501: {"model": ErrorResponse},
+        502: {"model": ErrorResponse},
+    },
+)
+@rate_limit_write
+async def create_stripe_checkout_session(
+    request: Request,
+    payload: StripeCheckoutSessionRequest,
+    decoded_token: dict = Depends(verify_firebase_token),
+    db: firestore.Client = Depends(get_firestore),
+) -> StripeCheckoutSessionResponse:
+    correlation_id = _build_correlation_id(request)
+    route = payload.routeNumber
+    requester_data = await require_route_access(route, decoded_token, db)
+    gate_error = _require_primary_owner_billing_route(
+        user_data=requester_data,
+        route_number=route,
+        correlation_id=correlation_id,
+    )
+    if gate_error:
+        return gate_error
+
+    owner_uid = _resolve_owner_uid_for_billing_write(
+        db=db,
+        route_number=route,
+        requester_uid=decoded_token["uid"],
+        requester_data=requester_data,
+    )
+    owner_doc = db.collection("users").document(owner_uid).get()
+    if not owner_doc.exists:
+        return _error_response(
+            404,
+            error="Owner record not found",
+            code="OWNER_RECORD_NOT_FOUND",
+            details={"routeNumber": route, "ownerUid": owner_uid, "correlationId": correlation_id},
+        )
+
+    owner_data = owner_doc.to_dict() or {}
+    route_sub = (
+        owner_data.get("subscriptions", {})
+        .get("routes", {})
+        .get(route)
+        if isinstance(owner_data.get("subscriptions", {}), dict)
+        else None
+    )
+    if isinstance(route_sub, dict) and bool(route_sub.get("active")):
+        provider = _normalize_provider(route_sub.get("provider")) or "stripe"
+        if provider == "stripe":
+            return _error_response(
+                409,
+                error="Stripe subscription is already active for this route",
+                code="STRIPE_SUBSCRIPTION_ALREADY_ACTIVE",
+                details={"routeNumber": route, "correlationId": correlation_id},
+            )
+        return _error_response(
+            409,
+            error="Active entitlement is managed by another provider",
+            code="ENTITLEMENT_PROVIDER_CONFLICT",
+            details={
+                "routeNumber": route,
+                "existingProvider": provider,
+                "incomingProvider": "stripe",
+                "correlationId": correlation_id,
+            },
+        )
+
+    success_url = _resolve_stripe_checkout_return_url(
+        request=request,
+        payload_return_url=payload.successUrl,
+        checkout_state="success",
+    )
+    cancel_url = _resolve_stripe_checkout_return_url(
+        request=request,
+        payload_return_url=payload.cancelUrl,
+        checkout_state="cancel",
+    )
+    price_id = _stripe_checkout_price_id(payload.plan, payload.interval)
+    customer_email = str((owner_data.get("profile", {}) or {}).get("email") or "").strip() or None
+    customer_id = _resolve_existing_stripe_customer_id_from_user(owner_data)
+
+    data: Dict[str, Any] = {
+        "mode": "subscription",
+        "success_url": success_url,
+        "cancel_url": cancel_url,
+        "line_items[0][price]": price_id,
+        "line_items[0][quantity]": 1,
+        "automatic_tax[enabled]": "true",
+        "client_reference_id": owner_uid,
+        "metadata[userId]": owner_uid,
+        "metadata[uid]": owner_uid,
+        "metadata[routeNumber]": route,
+        "metadata[plan]": payload.plan,
+        "metadata[interval]": payload.interval,
+        "subscription_data[metadata][userId]": owner_uid,
+        "subscription_data[metadata][uid]": owner_uid,
+        "subscription_data[metadata][routeNumber]": route,
+        "subscription_data[metadata][plan]": payload.plan,
+        "subscription_data[metadata][interval]": payload.interval,
+    }
+    if customer_id:
+        data["customer"] = customer_id
+    elif customer_email:
+        data["customer_email"] = customer_email
+
+    try:
+        session = _stripe_api_request_form(
+            method="POST",
+            path="checkout/sessions",
+            data=data,
+        )
+        checkout_url = str(session.get("url") or "").strip()
+        if not checkout_url:
+            return _error_response(
+                502,
+                error="Stripe checkout session did not return a URL",
+                code="STRIPE_CHECKOUT_URL_MISSING",
+                details={"routeNumber": route, "correlationId": correlation_id},
+            )
+        return StripeCheckoutSessionResponse(ok=True, url=checkout_url)
+    except AppleVerificationError:
+        raise
+    except Exception as exc:
+        logger.exception("Stripe checkout session creation failed route=%s corr=%s", route, correlation_id)
+        return _error_response(
+            500,
+            error="Failed to create Stripe checkout session",
+            code="STRIPE_CHECKOUT_CREATE_FAILED",
+            details={"routeNumber": route, "correlationId": correlation_id, "reason": str(exc)},
+        )
 
 
 @router.post(
