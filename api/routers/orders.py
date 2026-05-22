@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional, List, Dict, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -23,8 +23,14 @@ from ..models import (
     ErrorResponse,
 )
 
+try:
+    from ...scripts.finalize_rollout import api_finalize_rollout_enabled_for_route
+except ImportError:
+    from scripts.finalize_rollout import api_finalize_rollout_enabled_for_route
+
 
 router = APIRouter()
+API_FORECAST_WORKER_ID = "api-finalize"
 
 def _normalize_route_number(value: Any) -> str:
     v = str(value or "").strip()
@@ -209,7 +215,7 @@ async def create_order(
     await require_route_feature_access(payload.routeNumber, "ordering", decoded_token, db)
 
     order_id = f"order-{payload.routeNumber}-{int(datetime.utcnow().timestamp() * 1000)}"
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
 
     order_doc = {
         "id": order_id,
@@ -284,7 +290,7 @@ async def update_order(
             if abs(server_updated_at.timestamp() - payload.updatedAt.timestamp()) > 1:
                 raise HTTPException(409, "Order was modified by another session")
 
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
 
     # IMPORTANT: Clients (notably the web portal) may send a minimal item payload
     # like {sap, quantity} and omit forecast metadata fields. Because `stores` is
@@ -479,7 +485,7 @@ async def finalize_order(
     if route_number != route:
         raise HTTPException(403, "Route mismatch")
 
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     order_ref.update({
         "status": "finalized",
         "submittedAt": now,
@@ -552,9 +558,32 @@ async def finalize_order(
 
     # Trigger direct PostgreSQL sync (best-effort)
     sync_result: Dict[str, Any] = {"synced": False}
+    forecast_queue_result: Dict[str, Any] = {"enqueued": False}
     try:
         from ..dependencies import get_pg_connection, return_pg_connection
         from db_manager_pg import handle_sync_order
+        try:
+            from ...scripts.forecast_generation_queue import (
+                JOB_TYPE_FORECAST_ONLY,
+                JOB_TYPE_RETRAIN_THEN_FORECAST,
+                append_finalize_event_job_keys,
+                derive_finalize_targets,
+                enqueue_generation_job,
+                mark_finalize_event_error,
+                register_finalize_event,
+            )
+            from ...scripts.retrain_readiness import evaluate_retrain_readiness
+        except ImportError:
+            from scripts.forecast_generation_queue import (
+                JOB_TYPE_FORECAST_ONLY,
+                JOB_TYPE_RETRAIN_THEN_FORECAST,
+                append_finalize_event_job_keys,
+                derive_finalize_targets,
+                enqueue_generation_job,
+                mark_finalize_event_error,
+                register_finalize_event,
+            )
+            from scripts.retrain_readiness import evaluate_retrain_readiness
 
         conn = get_pg_connection()
         try:
@@ -566,6 +595,90 @@ async def finalize_order(
                 sync_result = {"synced": False, "error": result['error']}
             else:
                 sync_result = {"synced": True, **result}
+                finalize_key = ""
+                if not api_finalize_rollout_enabled_for_route(route_number):
+                    forecast_queue_result = {
+                        "enqueued": False,
+                        "status": "disabled",
+                    }
+                else:
+                    try:
+                        readiness = evaluate_retrain_readiness(route_number, conn=conn)
+                        job_type = (
+                            JOB_TYPE_RETRAIN_THEN_FORECAST
+                            if readiness.get("ready_for_retrain")
+                            else JOB_TYPE_FORECAST_ONLY
+                        )
+                        event_row = register_finalize_event(
+                            route_number=route_number,
+                            order_id=order_id,
+                            schedule_key=order_data.get("scheduleKey"),
+                            finalized_at_raw=now,
+                            worker_id=API_FORECAST_WORKER_ID,
+                        )
+                        finalize_key = str(event_row.get("finalize_key") or "")
+                        if event_row.get("status") == "processed":
+                            forecast_queue_result = {
+                                "enqueued": False,
+                                "status": "already_processed",
+                                "finalizeKey": finalize_key,
+                            }
+                        else:
+                            targets = derive_finalize_targets(route_number, order_data.get("scheduleKey"))
+                            if not targets:
+                                if finalize_key:
+                                    mark_finalize_event_error(finalize_key, "no_targets")
+                                forecast_queue_result = {
+                                    "enqueued": False,
+                                    "status": "no_targets",
+                                    "finalizeKey": finalize_key,
+                                    "jobType": job_type,
+                                }
+                            else:
+                                job_keys: List[str] = []
+                                for target in targets:
+                                    row = enqueue_generation_job(
+                                        route_number=route_number,
+                                        schedule_key=str(target.get("schedule_key") or ""),
+                                        delivery_date=str(target.get("delivery_date") or ""),
+                                        source="api_finalize",
+                                        job_type=job_type,
+                                        finalize_key=finalize_key or None,
+                                    )
+                                    if row and row.get("job_key"):
+                                        job_keys.append(str(row.get("job_key")))
+
+                                if finalize_key and job_keys:
+                                    append_finalize_event_job_keys(finalize_key, job_keys)
+                                elif finalize_key and not job_keys:
+                                    mark_finalize_event_error(finalize_key, "enqueue_failed")
+
+                                forecast_queue_result = {
+                                    "enqueued": bool(job_keys),
+                                    "status": "queued" if job_keys else "enqueue_failed",
+                                    "finalizeKey": finalize_key,
+                                    "jobKeys": job_keys,
+                                    "jobType": job_type,
+                                    "readiness": {
+                                        "readyForRetrain": bool(readiness.get("ready_for_retrain")),
+                                        "hasEnoughData": bool(readiness.get("has_enough_data")),
+                                        "cycleStatus": str((readiness.get("cycle") or {}).get("status") or ""),
+                                        "minNonHolidayOrdersForRetrain": int(
+                                            readiness.get("min_non_holiday_orders_for_retrain") or 0
+                                        ),
+                                    },
+                                }
+                    except Exception as exc:
+                        if finalize_key:
+                            try:
+                                mark_finalize_event_error(finalize_key, f"api_enqueue_error:{exc}")
+                            except Exception:
+                                pass
+                        print(f"[finalize_order] Forecast queue enqueue failed for {route_number}/{order_id}: {exc}")
+                        forecast_queue_result = {
+                            "enqueued": False,
+                            "status": "error",
+                        }
         finally:
             return_pg_connection(conn)
     except Exception as exc:
@@ -575,6 +688,7 @@ async def finalize_order(
         "orderId": order_id,
         "status": "finalized",
         "sync": sync_result,
+        "forecastQueue": forecast_queue_result,
     }
 
 

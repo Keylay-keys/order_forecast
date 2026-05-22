@@ -22,12 +22,22 @@ except Exception:
 
 try:
     from .forecast_engine import ForecastConfig, generate_forecast
+    from .retrain_readiness import evaluate_retrain_readiness
+    from .retrain_runner import run_retrain_for_route
 except ImportError:
     from forecast_engine import ForecastConfig, generate_forecast
+    from retrain_readiness import evaluate_retrain_readiness
+    from retrain_runner import run_retrain_for_route
 
 
 TERMINAL_JOB_STATUSES = {"done", "skipped_fresh", "error"}
 SUCCESS_JOB_STATUSES = {"done", "skipped_fresh"}
+JOB_TYPE_FORECAST_ONLY = "forecast_only"
+JOB_TYPE_RETRAIN_THEN_FORECAST = "retrain_then_forecast"
+VALID_JOB_TYPES = {
+    JOB_TYPE_FORECAST_ONLY,
+    JOB_TYPE_RETRAIN_THEN_FORECAST,
+}
 
 
 def _pg_connect(autocommit: bool = True) -> psycopg2.extensions.connection:
@@ -71,6 +81,7 @@ def ensure_forecast_queue_tables() -> None:
                     route_number VARCHAR(20) NOT NULL,
                     schedule_key VARCHAR(20) NOT NULL,
                     delivery_date DATE NOT NULL,
+                    job_type VARCHAR(32) NOT NULL DEFAULT 'forecast_only',
                     source VARCHAR(32) NOT NULL,
                     finalize_key TEXT REFERENCES forecast_finalize_events(finalize_key) ON DELETE SET NULL,
                     status VARCHAR(20) NOT NULL DEFAULT 'queued',
@@ -106,6 +117,12 @@ def ensure_forecast_queue_tables() -> None:
                 """
                 CREATE INDEX IF NOT EXISTS idx_forecast_finalize_route_status
                 ON forecast_finalize_events(route_number, status)
+                """
+            )
+            cur.execute(
+                """
+                ALTER TABLE forecast_generation_jobs
+                ADD COLUMN IF NOT EXISTS job_type VARCHAR(32) NOT NULL DEFAULT 'forecast_only'
                 """
             )
     finally:
@@ -179,6 +196,13 @@ def normalize_delivery_date(value: Any) -> Optional[str]:
     except Exception:
         return None
     return None
+
+
+def normalize_job_type(job_type: Optional[str]) -> str:
+    value = str(job_type or JOB_TYPE_FORECAST_ONLY).strip().lower()
+    if value not in VALID_JOB_TYPES:
+        return JOB_TYPE_FORECAST_ONLY
+    return value
 
 
 def build_finalize_key(route_number: str, order_id: str, finalized_at: datetime) -> str:
@@ -529,16 +553,37 @@ def enqueue_finalize_jobs(
     }
 
 
+def derive_finalize_targets(
+    route_number: str,
+    finalized_schedule_key: Optional[str],
+) -> List[Dict[str, str]]:
+    """Public wrapper for finalize-target derivation.
+
+    API finalize flow uses this to choose executable jobs explicitly while
+    keeping target selection logic centralized in the queue module.
+    """
+    ensure_forecast_queue_tables()
+    return _derive_finalize_targets(str(route_number), normalize_schedule_key(finalized_schedule_key))
+
+
+def append_finalize_event_job_keys(finalize_key: str, job_keys: Iterable[str]) -> None:
+    """Public wrapper for merging executable job keys onto a finalize event."""
+    ensure_forecast_queue_tables()
+    _append_finalize_event_job_keys(str(finalize_key), job_keys)
+
+
 def enqueue_generation_job(
     route_number: str,
     schedule_key: str,
     delivery_date: str,
     source: str,
+    job_type: str = JOB_TYPE_FORECAST_ONLY,
     finalize_key: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     ensure_forecast_queue_tables()
     sk = normalize_schedule_key(schedule_key)
     dd = normalize_delivery_date(delivery_date)
+    jt = normalize_job_type(job_type)
     if not sk or not dd:
         return None
     job_key = build_job_key(route_number, sk, dd)
@@ -550,11 +595,17 @@ def enqueue_generation_job(
                 """
                 INSERT INTO forecast_generation_jobs (
                     job_key, route_number, schedule_key, delivery_date,
-                    source, finalize_key, status, attempts, max_attempts,
+                    job_type, source, finalize_key, status, attempts, max_attempts,
                     trigger_count, available_at, updated_at, last_triggered_at
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, 'queued', 0, %s, 1, NOW(), NOW(), NOW())
+                VALUES (%s, %s, %s, %s, %s, %s, %s, 'queued', 0, %s, 1, NOW(), NOW(), NOW())
                 ON CONFLICT (job_key) DO UPDATE SET
+                    job_type = CASE
+                        WHEN forecast_generation_jobs.job_type = %s
+                          OR EXCLUDED.job_type = %s
+                            THEN %s
+                        ELSE %s
+                    END,
                     source = EXCLUDED.source,
                     finalize_key = COALESCE(forecast_generation_jobs.finalize_key, EXCLUDED.finalize_key),
                     trigger_count = forecast_generation_jobs.trigger_count + 1,
@@ -576,9 +627,22 @@ def enqueue_generation_job(
                         WHEN forecast_generation_jobs.status = 'error' THEN NULL
                         ELSE forecast_generation_jobs.last_error
                     END
-                RETURNING job_key, route_number, schedule_key, delivery_date, status, attempts, source
+                RETURNING job_key, route_number, schedule_key, delivery_date, job_type, status, attempts, source
                 """,
-                [job_key, str(route_number), sk, dd, str(source), finalize_key, max_attempts],
+                [
+                    job_key,
+                    str(route_number),
+                    sk,
+                    dd,
+                    jt,
+                    str(source),
+                    finalize_key,
+                    max_attempts,
+                    JOB_TYPE_RETRAIN_THEN_FORECAST,
+                    JOB_TYPE_RETRAIN_THEN_FORECAST,
+                    JOB_TYPE_RETRAIN_THEN_FORECAST,
+                    JOB_TYPE_FORECAST_ONLY,
+                ],
             )
             row = cur.fetchone()
             return dict(row) if row else None
@@ -651,8 +715,16 @@ def _select_latest_cached_forecast_meta(
 
 
 def _evaluate_job_freshness(
-    fb_client: firestore.Client, route_number: str, delivery_date: str, schedule_key: str
+    fb_client: firestore.Client,
+    route_number: str,
+    delivery_date: str,
+    schedule_key: str,
+    job_type: str = JOB_TYPE_FORECAST_ONLY,
 ) -> Tuple[bool, str]:
+    normalized_job_type = normalize_job_type(job_type)
+    if normalized_job_type == JOB_TYPE_RETRAIN_THEN_FORECAST:
+        return False, "retrain_then_forecast_requires_refresh"
+
     meta = _select_latest_cached_forecast_meta(fb_client, route_number, delivery_date, schedule_key)
     if not meta:
         return False, "missing"
@@ -742,15 +814,33 @@ def _process_claimed_job(
     schedule_key = normalize_schedule_key(job.get("schedule_key")) or ""
     delivery_date = normalize_delivery_date(job.get("delivery_date")) or ""
     job_key = str(job.get("job_key"))
+    job_type = normalize_job_type(job.get("job_type"))
 
     if not route_number or not schedule_key or not delivery_date:
         _finish_job(job_key, "error", error_text="invalid_job_payload")
         return "error"
 
-    is_fresh, reason = _evaluate_job_freshness(fb_client, route_number, delivery_date, schedule_key)
+    is_fresh, reason = _evaluate_job_freshness(
+        fb_client,
+        route_number,
+        delivery_date,
+        schedule_key,
+        job_type,
+    )
     if is_fresh:
         _finish_job(job_key, "skipped_fresh", skipped_reason=reason)
         return "skipped_fresh"
+
+    if job_type == JOB_TYPE_RETRAIN_THEN_FORECAST:
+        try:
+            readiness = evaluate_retrain_readiness(route_number)
+            if readiness.get("ready_for_retrain"):
+                run_retrain_for_route(route_number)
+        except Exception as exc:
+            print(
+                f"[forecast_generation_queue] retrain failed for route {route_number};"
+                f" proceeding with forecast generation: {exc}"
+            )
 
     cfg = ForecastConfig(
         route_number=route_number,

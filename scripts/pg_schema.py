@@ -785,6 +785,7 @@ def _create_forecast_queue_tables(cur) -> None:
             route_number VARCHAR(20) NOT NULL,
             schedule_key VARCHAR(20) NOT NULL,
             delivery_date DATE NOT NULL,
+            job_type VARCHAR(32) NOT NULL DEFAULT 'forecast_only',
             source VARCHAR(32) NOT NULL,
             finalize_key TEXT REFERENCES forecast_finalize_events(finalize_key) ON DELETE SET NULL,
             status VARCHAR(20) NOT NULL DEFAULT 'queued',
@@ -802,6 +803,11 @@ def _create_forecast_queue_tables(cur) -> None:
             updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
             last_triggered_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
         )
+    """)
+
+    cur.execute("""
+        ALTER TABLE forecast_generation_jobs
+        ADD COLUMN IF NOT EXISTS job_type VARCHAR(32) NOT NULL DEFAULT 'forecast_only'
     """)
 
     print("  ✓ Forecast queue tables created")

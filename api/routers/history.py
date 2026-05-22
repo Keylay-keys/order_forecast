@@ -1,10 +1,11 @@
-"""Order history router - PostgreSQL queries for historical orders.
+"""Order history router - Firestore-authoritative finalized orders.
 
 Endpoints:
     GET /api/history - Get paginated order history for a route
     GET /api/history/{order_id} - Get specific order details
     
-Performance: Uses direct PostgreSQL connections from pool (no Firestore round-trip).
+PostgreSQL remains a derived forecast/training cache, but user-facing history
+must read finalized order documents from Firebase to avoid stale sync artifacts.
 """
 
 from __future__ import annotations
@@ -12,15 +13,13 @@ from __future__ import annotations
 import base64
 import binascii
 import json
-from typing import Optional, List, Tuple
+from typing import Any, Optional, List, Tuple, Dict
 from datetime import datetime, timedelta
 from fastapi import APIRouter, Depends, Query, HTTPException, Request
 
 from ..dependencies import (
     verify_firebase_token,
     require_route_access,
-    get_pg_connection,
-    return_pg_connection,
     get_firestore
 )
 from ..models import (
@@ -56,6 +55,112 @@ def _decode_history_cursor(cursor: str) -> Tuple[str, str]:
         raise HTTPException(400, "Invalid history cursor")
 
 
+def _coerce_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return default
+
+
+def _to_datetime(value: Any) -> Optional[datetime]:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value
+    if hasattr(value, "to_datetime"):
+        try:
+            return value.to_datetime()
+        except Exception:
+            return None
+    if isinstance(value, dict):
+        seconds = value.get("seconds") or value.get("_seconds")
+        nanos = value.get("nanoseconds") or value.get("_nanoseconds") or value.get("nanos") or 0
+        if seconds is not None:
+            try:
+                return datetime.utcfromtimestamp(float(seconds) + float(nanos) / 1_000_000_000)
+            except Exception:
+                return None
+    return None
+
+
+def _date_string(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, datetime):
+        return value.date().isoformat()
+    if hasattr(value, "isoformat"):
+        try:
+            return value.isoformat()
+        except Exception:
+            pass
+    return str(value or "")[:10]
+
+
+def _fetch_firestore_products(db, route: str) -> Dict[str, Dict[str, Any]]:
+    """Return active Firestore catalog metadata keyed by SAP.
+
+    History is user-facing order truth, so it must use the same Firestore
+    catalog source that Order Entry and the History spreadsheet use.
+    """
+    products: Dict[str, Dict[str, Any]] = {}
+    try:
+        products_ref = db.collection("masterCatalog").document(route).collection("products")
+        for doc in products_ref.where("active", "==", True).stream():
+            data = doc.to_dict() or {}
+            sap = str(data.get("sap") or doc.id or "").strip()
+            if not sap:
+                continue
+            products[sap] = {
+                "casePack": _coerce_int(data.get("casePack") or data.get("case_pack")),
+                "name": (
+                    data.get("name")
+                    or data.get("fullName")
+                    or data.get("full_name")
+                    or data.get("description")
+                    or ""
+                ),
+            }
+    except Exception as e:
+        print(f"[history] Warning: Failed to fetch Firestore catalog products: {e}")
+    return products
+
+
+def _compute_firestore_order_totals(
+    order_data: Dict[str, Any],
+    products_by_sap: Dict[str, Dict[str, Any]],
+) -> Tuple[int, int]:
+    total_units = 0
+    units_by_sap: Dict[str, int] = {}
+    explicit_cases_by_sap: Dict[str, int] = {}
+
+    for store in order_data.get("stores") or []:
+        for item in store.get("items") or []:
+            sap = str(item.get("sap") or "").strip()
+            quantity = _coerce_int(item.get("quantity"))
+            if not sap or quantity <= 0:
+                continue
+            total_units += quantity
+            units_by_sap[sap] = units_by_sap.get(sap, 0) + quantity
+            explicit_cases_by_sap[sap] = explicit_cases_by_sap.get(sap, 0) + _coerce_int(item.get("cases"))
+
+    total_cases = 0
+    for sap, quantity in units_by_sap.items():
+        case_pack = _coerce_int((products_by_sap.get(sap) or {}).get("casePack"))
+        if case_pack > 0:
+            total_cases += quantity // case_pack
+        else:
+            total_cases += explicit_cases_by_sap.get(sap, 0)
+
+    return total_units, total_cases
+
+
+def _order_sort_key(order_id: str, order_data: Dict[str, Any]) -> Tuple[str, str]:
+    delivery_date = _date_string(
+        order_data.get("expectedDeliveryDate") or order_data.get("deliveryDate")
+    )
+    return delivery_date, order_id
+
+
 @router.get(
     "/history",
     response_model=OrderHistoryResponse,
@@ -86,123 +191,80 @@ async def get_order_history(
     - Verifies user has access to the route
     - All queries use parameterized statements
     
-    Performance: Direct PostgreSQL connection (no Firestore round-trip).
+    Performance: Firestore is authoritative for user-facing order history.
     """
     # Verify route access
     await require_route_access(route, decoded_token, db)
     
     # Calculate date range
     cutoff_date = (datetime.utcnow() - timedelta(weeks=weeks)).strftime('%Y-%m-%d')
-    
-    conn = None
-    try:
-        conn = get_pg_connection()
-        cur = conn.cursor()
-        
-        # Count total matching orders
-        cur.execute("""
-            SELECT COUNT(*) as total
-            FROM orders_historical
-            WHERE route_number = %s
-              AND delivery_date >= %s
-        """, [route, cutoff_date])
-        count_result = cur.fetchone()
-        total = count_result[0] if count_result else 0
 
-        cursor_clause = ""
-        query_params = [route, cutoff_date, route, cutoff_date]
+    try:
+        products_by_sap = _fetch_firestore_products(db, route)
+        orders_ref = db.collection("routes").document(route).collection("orders")
+        snaps = list(orders_ref.where("status", "==", "finalized").stream())
+
+        filtered: List[Tuple[str, Dict[str, Any]]] = []
+        for snap in snaps:
+            data = snap.to_dict() or {}
+            delivery_date = _date_string(data.get("expectedDeliveryDate") or data.get("deliveryDate"))
+            if delivery_date and delivery_date < cutoff_date:
+                continue
+            filtered.append((snap.id, data))
+
+        filtered.sort(key=lambda item: _order_sort_key(item[0], item[1]), reverse=True)
+
         if cursor:
             cursor_date, cursor_order_id = _decode_history_cursor(cursor)
-            cursor_clause = "AND (o.delivery_date, o.order_id) < (%s::date, %s)"
-            query_params.extend([cursor_date, cursor_order_id])
+            filtered = [
+                item for item in filtered
+                if _order_sort_key(item[0], item[1]) < (cursor_date, cursor_order_id)
+            ]
+            page_orders = filtered[:limit]
+            effective_offset = 0
+        else:
+            page_orders = filtered[offset:offset + limit]
+            effective_offset = offset
 
-        pagination_clause = "LIMIT %s"
-        query_params.append(limit)
-        if not cursor and offset > 0:
-            pagination_clause += " OFFSET %s"
-            query_params.append(offset)
-
-        # Fetch orders with pagination (derive total_cases when missing)
-        cur.execute(f"""
-            WITH cases_by_order AS (
-                SELECT
-                    li.order_id,
-                    SUM(
-                        CASE
-                            WHEN pc.case_pack > 0 THEN FLOOR(li.quantity::numeric / pc.case_pack)
-                            ELSE 0
-                        END
-                    ) AS total_cases
-                FROM order_line_items li
-                LEFT JOIN product_catalog pc
-                    ON li.sap = pc.sap AND li.route_number = pc.route_number
-                WHERE li.route_number = %s
-                  AND li.delivery_date >= %s
-                GROUP BY li.order_id
-            )
-            SELECT 
-                o.order_id,
-                o.route_number,
-                o.schedule_key,
-                o.delivery_date,
-                o.order_date,
-                o.finalized_at,
-                COALESCE(c.total_cases, o.total_cases, 0) AS total_cases,
-                o.total_units,
-                o.store_count,
-                o.status
-            FROM orders_historical o
-            LEFT JOIN cases_by_order c
-                ON c.order_id = o.order_id
-            WHERE o.route_number = %s
-              AND o.delivery_date >= %s
-              {cursor_clause}
-            ORDER BY o.delivery_date DESC, o.order_id DESC
-            {pagination_clause}
-        """, query_params)
-        rows = cur.fetchall()
-        
-        cur.close()
-        return_pg_connection(conn)
-        conn = None
-        
-        # Convert to response models
         items: List[OrderHistoryItem] = []
-        for row in rows:
+        for order_id, data in page_orders:
+            total_units, total_cases = _compute_firestore_order_totals(data, products_by_sap)
+            finalized_at = _to_datetime(data.get("submittedAt") or data.get("finalizedAt"))
             items.append(OrderHistoryItem(
-                orderId=row[0],
-                routeNumber=row[1],
-                scheduleKey=row[2] or '',
-                deliveryDate=str(row[3]) if row[3] else '',
-                orderDate=str(row[4]) if row[4] else None,
-                finalizedAt=row[5],
-                totalCases=int(row[6] or 0),
-                totalUnits=row[7] or 0,
-                storeCount=row[8] or 0,
-                status=row[9] or 'finalized'
+                orderId=order_id,
+                routeNumber=str(data.get("routeNumber") or route),
+                scheduleKey=str(data.get("scheduleKey") or ""),
+                deliveryDate=_date_string(data.get("expectedDeliveryDate") or data.get("deliveryDate")),
+                orderDate=_date_string(data.get("orderDate")) or None,
+                finalizedAt=finalized_at,
+                totalCases=total_cases,
+                totalUnits=total_units,
+                storeCount=len(data.get("stores") or []),
+                status=str(data.get("status") or "finalized"),
             ))
         
         next_cursor = None
-        if rows and len(rows) == limit:
-            last_row = rows[-1]
-            next_cursor = _encode_history_cursor(str(last_row[3]), str(last_row[0]))
+        if page_orders and len(page_orders) == limit:
+            next_index = limit if cursor else offset + limit
+            if next_index < len(filtered):
+                last_order_id, last_data = page_orders[-1]
+                next_cursor = _encode_history_cursor(
+                    _date_string(last_data.get("expectedDeliveryDate") or last_data.get("deliveryDate")),
+                    last_order_id,
+                )
 
         return OrderHistoryResponse(
             items=items,
-            total=total,
-            offset=offset if not cursor else 0,
+            total=len(filtered),
+            offset=effective_offset,
             limit=limit,
             nextCursor=next_cursor,
         )
         
     except HTTPException:
-        if conn is not None:
-            return_pg_connection(conn)
         raise
     except Exception as e:
-        if conn is not None:
-            return_pg_connection(conn)
-        raise HTTPException(500, f"Database error: {str(e)}")
+        raise HTTPException(500, f"History error: {str(e)}")
 
 
 @router.get(
@@ -226,129 +288,89 @@ async def get_order_details(
     - Verifies user has access to the order's route
     - Double-checks route ownership on nested data
     
-    Performance: Direct PostgreSQL connection (no Firestore round-trip).
+    Firebase is authoritative for user-facing finalized order history.
     """
-    conn = None
     try:
-        conn = get_pg_connection()
-        cur = conn.cursor()
-        
-        # First get the order to find route
-        cur.execute("""
-            SELECT 
-                order_id, route_number, schedule_key, delivery_date,
-                order_date, finalized_at, total_cases, total_units,
-                store_count, status
-            FROM orders_historical
-            WHERE order_id = %s
-        """, [order_id])
-        order_row = cur.fetchone()
-        
-        if not order_row:
-            cur.close()
-            return_pg_connection(conn)
+        route_number = str(order_id.split("-")[1]) if "-" in order_id else ""
+        if not route_number:
             raise HTTPException(404, "Order not found")
-        
-        route_number = order_row[1]
-        
-        # Verify route access (before continuing with more queries)
+
+        order_ref = db.collection("routes").document(route_number).collection("orders").document(order_id)
+        order_doc = order_ref.get()
+        if not order_doc.exists:
+            raise HTTPException(404, "Order not found")
+
+        order_data = order_doc.to_dict() or {}
+        if str(order_data.get("routeNumber") or route_number) != route_number:
+            raise HTTPException(403, "Route mismatch")
+
         await require_route_access(route_number, decoded_token, db)
-        
-        # Fetch line items with calculated cases from product catalog
-        # Join with stores table to get user-defined store_number
-        cur.execute("""
-            SELECT 
-                oli.store_id, 
-                oli.store_name, 
-                oli.sap, 
-                COALESCE(oli.product_name, pc.full_name) as product_name,
-                oli.quantity, 
-                CASE 
-                    WHEN oli.cases > 0 THEN oli.cases
-                    WHEN pc.case_pack > 0 THEN CAST(FLOOR(oli.quantity::numeric / pc.case_pack) AS INTEGER)
-                    ELSE 0 
-                END as cases,
-                oli.promo_active,
-                COALESCE(pc.case_pack, 0) as case_pack,
-                s.store_number
-            FROM order_line_items oli
-            LEFT JOIN product_catalog pc ON oli.sap = pc.sap AND oli.route_number = pc.route_number
-            LEFT JOIN stores s ON oli.store_id = s.store_id
-            WHERE oli.order_id = %s AND oli.route_number = %s
-            ORDER BY oli.store_name, oli.sap ASC
-        """, [order_id, route_number])
-        line_items = cur.fetchall()
-        
-        cur.close()
-        return_pg_connection(conn)
-        conn = None
-        
-        # Group by store
-        stores_dict = {}
-        total_calculated_cases = 0
-        stores_needing_number = []  # Track stores where PostgreSQL didn't have the number
-        
-        for row in line_items:
-            store_id = row[0]
-            cases = row[5] or 0
-            store_number = row[8] or None  # User-defined store number from PostgreSQL
-            total_calculated_cases += cases
-            if store_id not in stores_dict:
-                stores_dict[store_id] = {
-                    "storeId": store_id,
-                    "storeName": row[1] or '',
-                    "storeNumber": store_number,  # User-defined number for display
-                    "items": []
-                }
-                if store_number is None:
-                    stores_needing_number.append(store_id)
-            stores_dict[store_id]["items"].append({
-                "sap": row[2],
-                "productName": row[3] or '',
-                "quantity": row[4] or 0,
-                "cases": cases,
-                "promoActive": bool(row[6])
+
+        products_by_sap = _fetch_firestore_products(db, route_number)
+        total_units, total_cases = _compute_firestore_order_totals(order_data, products_by_sap)
+
+        store_numbers: Dict[str, Any] = {}
+        try:
+            stores_ref = db.collection("routes").document(route_number).collection("stores")
+            for store_doc in stores_ref.stream():
+                store_data = store_doc.to_dict() or {}
+                store_num = store_data.get("number") or store_data.get("storeNumber")
+                if store_num:
+                    store_numbers[str(store_doc.id)] = store_num
+                    alt_id = store_data.get("id") or store_data.get("storeId")
+                    if alt_id:
+                        store_numbers[str(alt_id)] = store_num
+        except Exception as e:
+            print(f"[history] Warning: Failed to fetch store numbers from Firestore: {e}")
+
+        stores = []
+        for store in order_data.get("stores") or []:
+            store_id = str(store.get("storeId") or store.get("id") or "")
+            store_name = str(store.get("storeName") or store.get("name") or "")
+            items = []
+            for item in store.get("items") or []:
+                sap = str(item.get("sap") or "").strip()
+                quantity = _coerce_int(item.get("quantity"))
+                if not sap or quantity <= 0:
+                    continue
+                product_meta = products_by_sap.get(sap) or {}
+                case_pack = _coerce_int(product_meta.get("casePack"))
+                cases = _coerce_int(item.get("cases"))
+                if cases <= 0 and case_pack > 0:
+                    cases = quantity // case_pack
+                items.append({
+                    "sap": sap,
+                    "productName": item.get("productName") or product_meta.get("name") or "",
+                    "quantity": quantity,
+                    "cases": cases,
+                    "promoActive": bool(item.get("promoActive", False)),
+                    "priorOrderContext": item.get("priorOrderContext"),
+                })
+
+            stores.append({
+                "storeId": store_id,
+                "storeName": store_name,
+                "storeNumber": store.get("storeNumber") or store_numbers.get(store_id),
+                "items": items,
             })
-        
-        # Fallback: fetch store numbers from Firestore if PostgreSQL didn't have them
-        if stores_needing_number:
-            try:
-                stores_ref = db.collection('routes').document(route_number).collection('stores')
-                for store_id in stores_needing_number:
-                    store_doc = stores_ref.document(store_id).get()
-                    if store_doc.exists:
-                        store_data = store_doc.to_dict()
-                        # Mobile app saves as 'number', not 'storeNumber'
-                        store_num = store_data.get('number')
-                        if store_num and store_id in stores_dict:
-                            stores_dict[store_id]["storeNumber"] = store_num
-            except Exception as e:
-                # Non-fatal: just log and continue without store numbers
-                print(f"[history] Warning: Failed to fetch store numbers from Firestore: {e}")
-        
-        # Use calculated cases if stored value is 0
-        final_total_cases = order_row[6] if order_row[6] else total_calculated_cases
-        
+
+        finalized_at = _to_datetime(order_data.get("submittedAt") or order_data.get("finalizedAt"))
+
         return {
-            "orderId": order_row[0],
-            "routeNumber": order_row[1],
-            "scheduleKey": order_row[2] or '',
-            "deliveryDate": str(order_row[3]) if order_row[3] else '',
-            "orderDate": str(order_row[4]) if order_row[4] else None,
-            "finalizedAt": order_row[5].isoformat() if order_row[5] else None,
-            "totalCases": final_total_cases,
-            "totalUnits": order_row[7] or 0,
-            "storeCount": order_row[8] or 0,
-            "status": order_row[9] or 'finalized',
-            "stores": list(stores_dict.values())
+            "orderId": order_id,
+            "routeNumber": route_number,
+            "scheduleKey": str(order_data.get("scheduleKey") or ""),
+            "deliveryDate": _date_string(order_data.get("expectedDeliveryDate") or order_data.get("deliveryDate")),
+            "orderDate": _date_string(order_data.get("orderDate")) or None,
+            "finalizedAt": finalized_at.isoformat() if finalized_at else None,
+            "totalCases": total_cases,
+            "totalUnits": total_units,
+            "storeCount": len(order_data.get("stores") or []),
+            "status": str(order_data.get("status") or "finalized"),
+            "stores": stores,
         }
         
     except HTTPException:
-        # Re-raise HTTP exceptions (like 404)
-        if conn is not None:
-            return_pg_connection(conn)
         raise
     except Exception as e:
-        if conn is not None:
-            return_pg_connection(conn)
-        raise HTTPException(500, f"Database error: {str(e)}")
+        raise HTTPException(500, f"History error: {str(e)}")

@@ -22,6 +22,10 @@ from ..utils.security_logger import security_logger
 from ..utils.blocklist import blocklist, WHITELISTED_IPS
 from ..utils.client_ip import get_client_ip
 
+UNBLOCKABLE_HEALTH_PATHS = {
+    "/api/health",
+}
+
 
 # Patterns that indicate enumeration attempts
 # These are NOT honeypots (which are fake paths), but suspicious patterns
@@ -80,6 +84,11 @@ class BlocklistMiddleware(BaseHTTPMiddleware):
     """Middleware that checks blocklist before processing requests."""
     
     async def dispatch(self, request: Request, call_next):
+        # Keep the primary uptime/readiness probe available even if a client IP
+        # was previously blocklisted by honeypot or enumeration controls.
+        if request.url.path in UNBLOCKABLE_HEALTH_PATHS:
+            return await call_next(request)
+
         ip = get_client_ip(request)
         
         # Skip whitelist

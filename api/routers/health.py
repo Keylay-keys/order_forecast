@@ -6,6 +6,7 @@ Endpoints:
     GET /api/health/firebase - Firebase/Firestore connectivity (auth required)
     GET /api/health/services - Supervisor/service heartbeat status (auth required)
     POST /api/health/sync - Best-effort manual sync (Firebase -> PostgreSQL)
+    POST /api/health/sync-order - Replay one finalized order into PostgreSQL
 """
 
 from __future__ import annotations
@@ -36,6 +37,61 @@ logger = logging.getLogger(__name__)
 
 # Only expose detailed errors in debug mode
 DEBUG_MODE = os.environ.get("DEBUG", "false").lower() == "true"
+
+
+def _resolve_route_for_manual_sync(
+    db: firestore.Client,
+    decoded_token: dict,
+    route: Optional[str],
+) -> str:
+    """Resolve the effective route for support/debug sync endpoints."""
+    if route:
+        return route
+
+    uid = decoded_token.get("uid")
+    user_doc = db.collection("users").document(uid).get()
+    if not user_doc.exists:
+        raise HTTPException(403, "Access denied")
+    profile = (user_doc.to_dict() or {}).get("profile", {})
+    derived = profile.get("currentRoute") or profile.get("routeNumber")
+    derived = str(derived) if derived is not None else ""
+    if not derived.isdigit():
+        raise HTTPException(400, "No route selected")
+    return derived
+
+
+def _sync_single_finalized_order(
+    *,
+    conn,
+    db: firestore.Client,
+    route: str,
+    order_id: str,
+) -> Dict[str, Any]:
+    """Replay a single finalized Firebase order into PostgreSQL."""
+    order_doc = (
+        db.collection("routes")
+        .document(route)
+        .collection("orders")
+        .document(order_id)
+        .get()
+    )
+    if not order_doc.exists:
+        raise HTTPException(404, "Order not found")
+
+    order_data = order_doc.to_dict() or {}
+    if str(order_data.get("status") or "").strip().lower() != "finalized":
+        raise HTTPException(409, "Only finalized orders can be replayed")
+
+    from db_manager_pg import handle_sync_order  # loaded via dependencies.py sys.path injection
+
+    result = handle_sync_order(conn, db, {"orderId": order_id, "routeNumber": route})
+    if result.get("error"):
+        logger.error("Manual single-order sync failed for %s/%s: %s", route, order_id, result.get("error"))
+        raise HTTPException(
+            500,
+            result.get("error") if DEBUG_MODE else "Order replay failed",
+        )
+    return result
 
 
 @router.get("/health")
@@ -172,19 +228,7 @@ async def trigger_sync(
     This exists primarily to back the web-portal "Sync Now" button.
     It scans recent finalized orders in Firestore and upserts them into PostgreSQL.
     """
-    uid = decoded_token.get("uid")
-
-    # If route not provided, derive from user doc (currentRoute, then primary routeNumber).
-    if not route:
-        user_doc = db.collection("users").document(uid).get()
-        if not user_doc.exists:
-            raise HTTPException(403, "Access denied")
-        profile = (user_doc.to_dict() or {}).get("profile", {})
-        derived = profile.get("currentRoute") or profile.get("routeNumber")
-        derived = str(derived) if derived is not None else ""
-        if not derived.isdigit():
-            raise HTTPException(400, "No route selected")
-        route = derived
+    route = _resolve_route_for_manual_sync(db, decoded_token, route)
 
     await require_route_access(route, decoded_token, db)
 
@@ -230,6 +274,40 @@ async def trigger_sync(
     return {
         "status": status,
         "message": f"Synced {ok}/{len(order_ids)} orders for route {route} (failed: {failed}).",
+    }
+
+
+@router.post("/health/sync-order")
+@rate_limit_write
+async def trigger_sync_order(
+    request: Request,
+    orderId: str = Query(..., min_length=8, max_length=128, pattern=r"^order-[A-Za-z0-9\-]+$", description="Order ID"),
+    route: Optional[str] = Query(default=None, pattern=r"^\d{1,10}$", description="Route number (optional)"),
+    decoded_token: dict = Depends(verify_firebase_token),
+    db: firestore.Client = Depends(get_firestore),
+) -> Dict[str, Any]:
+    """Replay one finalized Firebase order into PostgreSQL."""
+    route = _resolve_route_for_manual_sync(db, decoded_token, route)
+    await require_route_access(route, decoded_token, db)
+
+    conn = None
+    try:
+        conn = get_pg_connection()
+        result = _sync_single_finalized_order(
+            conn=conn,
+            db=db,
+            route=route,
+            order_id=orderId,
+        )
+    finally:
+        if conn is not None:
+            return_pg_connection(conn)
+
+    return {
+        "status": "ok",
+        "routeNumber": route,
+        "orderId": orderId,
+        "sync": result,
     }
 
 

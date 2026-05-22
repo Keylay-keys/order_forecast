@@ -20,6 +20,7 @@ import os
 import socket
 import time
 from datetime import datetime, timezone, timedelta
+from pathlib import Path
 from typing import Optional, Dict, List
 
 import psycopg2
@@ -58,6 +59,11 @@ except ImportError:
     )
 
 try:
+    from .finalize_rollout import api_finalize_rollout_enabled_for_route
+except ImportError:
+    from finalize_rollout import api_finalize_rollout_enabled_for_route
+
+try:
     from google.cloud.firestore_v1.base_query import FieldFilter
 except Exception:
     FieldFilter = None  # type: ignore
@@ -67,6 +73,26 @@ except Exception:
 # =============================================================================
 
 _pg_conn: Optional[psycopg2.extensions.connection] = None
+LOCAL_FIREBASE_SA_FALLBACK = (
+    Path.home() / "Desktop" / "dev" / "firebase-tools" / "routespark-1f47d-firebase-adminsdk-tnv5k-b259331cbc.json"
+)
+SERVER_FIREBASE_SA_FALLBACK = Path("/srv/routespark/config/serviceAccountKey.json")
+
+
+def resolve_firebase_sa_path() -> str:
+    """Resolve a usable Firebase service account path for forecast generation."""
+    from_env = os.environ.get("FIREBASE_SA_PATH", "").strip()
+    if from_env:
+        return from_env
+
+    for candidate in (SERVER_FIREBASE_SA_FALLBACK, LOCAL_FIREBASE_SA_FALLBACK):
+        if candidate.exists():
+            return str(candidate)
+
+    raise RuntimeError(
+        "FIREBASE_SA_PATH is not set and no default service account path exists. "
+        "Set FIREBASE_SA_PATH explicitly for this runtime."
+    )
 
 
 def get_pg_connection() -> psycopg2.extensions.connection:
@@ -763,6 +789,10 @@ def handle_finalized_order(fb_client: firestore.Client, order_id: str, data: dic
             
             # Update Firebase sync status so app knows data is current
             update_firebase_sync_status(fb_client, route_number, True)
+
+            if api_finalize_rollout_enabled_for_route(str(route_number)):
+                print(f"     ℹ️  API finalize rollout owns forecast enqueue for route {route_number}; listener standing down")
+                return
             
             # NOTE: Removed auto-regeneration - was causing duplicate forecasts on every order sync.
             # Forecasts should only be generated:
@@ -898,11 +928,7 @@ def regenerate_forecasts_after_finalization(
         try:
             from forecast_engine import ForecastConfig, generate_forecast
             
-            import os
-            sa_path = os.environ.get(
-                'FIREBASE_SA_PATH',
-                '/Users/kylemacmini/Desktop/routespark/routespark-1f47d-firebase-adminsdk-tnv5k-b259331cbc.json'
-            )
+            sa_path = resolve_firebase_sa_path()
             
             print(f"     🔮 Generating forecast for {delivery_date} ({schedule_key})...")
             

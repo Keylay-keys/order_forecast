@@ -393,6 +393,12 @@ def handle_sync_order(conn: psycopg2.extensions.connection, db: firestore.Client
             holiday_week,
             now
         ])
+
+        # Rebuild the derived snapshot from Firebase order truth. Upsert-only
+        # leaves removed items/corrections behind forever, so clear existing
+        # rows for this order before inserting the current projection.
+        cur.execute("DELETE FROM order_line_items WHERE order_id = %s", [order_id])
+        cur.execute("DELETE FROM forecast_corrections WHERE order_id = %s", [order_id])
         
         # Get forecast ID
         forecast_id = (

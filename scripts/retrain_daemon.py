@@ -24,13 +24,13 @@ import argparse
 import os
 import socket
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 from google.cloud import firestore
 
 try:
-    from .pg_utils import execute, fetch_all, fetch_one
+    from .pg_utils import fetch_all, fetch_one
     from .band_calibration import calibrate_route_if_due
     from .forecast_generation_queue import (
         enqueue_generation_job,
@@ -38,8 +38,12 @@ try:
         process_generation_jobs_for_route,
     )
     from .learning_snapshot_refresh import refresh_learning_snapshots
+    from .retrain_readiness import (
+        evaluate_retrain_readiness,
+    )
+    from .retrain_runner import run_retrain_for_route
 except ImportError:
-    from pg_utils import execute, fetch_all, fetch_one
+    from pg_utils import fetch_all, fetch_one
     from band_calibration import calibrate_route_if_due
     from forecast_generation_queue import (
         enqueue_generation_job,
@@ -47,6 +51,10 @@ except ImportError:
         process_generation_jobs_for_route,
     )
     from learning_snapshot_refresh import refresh_learning_snapshots
+    from retrain_readiness import (
+        evaluate_retrain_readiness,
+    )
+    from retrain_runner import run_retrain_for_route
 
 DEFAULT_INTERVAL = 86400  # 24 hours (once per day)
 DEFAULT_SA_PATH = '/Users/kylemacmini/Desktop/dev/firebase-tools/routespark-1f47d-firebase-adminsdk-tnv5k-b259331cbc.json'
@@ -116,111 +124,6 @@ def get_synced_routes() -> list[str]:
         return []
 
 
-def check_cycle_complete(route_number: str) -> dict:
-    """Check if the current order cycle is complete for a route."""
-    try:
-        # Get schedules for this route
-        schedules = fetch_all("""
-            SELECT schedule_key, order_day, delivery_day
-            FROM user_schedules
-            WHERE route_number = %s AND is_active = TRUE
-        """, [route_number])
-        if not schedules:
-            return {'status': 'no_schedules', 'schedules': [], 'completed': [], 'missing': []}
-        
-        # For each schedule, check if we have a recent order
-        one_week_ago = (datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d')
-        
-        completed = []
-        missing = []
-        
-        for sched in schedules:
-            schedule_key = sched['schedule_key']
-            
-            # Check for recent orders with this schedule key
-            order_result = fetch_one("""
-                SELECT COUNT(*) as cnt
-                FROM orders_historical
-                WHERE route_number = %s
-                  AND schedule_key = %s
-                  AND order_date >= %s
-            """, [route_number, schedule_key, one_week_ago])
-            
-            cnt = order_result.get('cnt', 0) if order_result else 0
-            
-            if cnt > 0:
-                completed.append(schedule_key)
-            else:
-                missing.append(schedule_key)
-        
-        all_schedule_keys = [s['schedule_key'] for s in schedules]
-        
-        return {
-            'status': 'complete' if not missing else 'incomplete',
-            'schedules': all_schedule_keys,
-            'completed': completed,
-            'missing': missing,
-        }
-        
-    except Exception as e:
-        log(f"⚠️  Error checking cycle: {e}")
-        return {'status': 'error', 'error': str(e)}
-
-
-def get_total_order_count(route_number: str, exclude_holidays: bool = True) -> int:
-    """Get total order count across all schedules for a route."""
-    try:
-        if exclude_holidays:
-            result = fetch_one("""
-                SELECT COUNT(*) as cnt
-                FROM orders_historical
-                WHERE route_number = %s
-                  AND COALESCE(is_holiday_week, FALSE) = FALSE
-            """, [route_number])
-        else:
-            result = fetch_one("""
-                SELECT COUNT(*) as cnt
-                FROM orders_historical
-                WHERE route_number = %s
-            """, [route_number])
-        return result.get('cnt', 0) if result else 0
-    except Exception:
-        return 0
-
-
-def get_order_count(route_number: str, schedule_key: str, exclude_holidays: bool = True) -> int:
-    """Get total order count for a route/schedule.
-    
-    Args:
-        route_number: Route to check
-        schedule_key: Schedule to check (monday, tuesday, etc.)
-        exclude_holidays: If True, don't count holiday week orders (they're anomalies)
-    
-    Returns:
-        Count of orders (excluding holiday weeks if exclude_holidays=True)
-    """
-    try:
-        if exclude_holidays:
-            # Don't count holiday weeks toward training minimum
-            result = fetch_one("""
-                SELECT COUNT(*) as cnt
-                FROM orders_historical
-                WHERE route_number = %s
-                  AND schedule_key = %s
-                  AND COALESCE(is_holiday_week, FALSE) = FALSE
-            """, [route_number, schedule_key])
-        else:
-            result = fetch_one("""
-                SELECT COUNT(*) as cnt
-                FROM orders_historical
-                WHERE route_number = %s
-                  AND schedule_key = %s
-            """, [route_number, schedule_key])
-        return result.get('cnt', 0) if result else 0
-    except Exception:
-        return 0
-
-
 def get_upcoming_delivery_dates(route_number: str) -> list:
     """Get the SINGLE next unordered delivery date across ALL schedules.
     
@@ -242,7 +145,7 @@ def get_upcoming_delivery_dates(route_number: str) -> list:
             return []
         
         candidates = []
-        today = datetime.now().date()
+        today = datetime.now(timezone.utc).date()
         
         for sched in schedules:
             delivery_dow = sched['delivery_day']  # 1=Mon, 7=Sun
@@ -379,24 +282,24 @@ def run_retrain_check(fb_client: firestore.Client, route_number: str, sa_path: s
     its own fallback (copy last matching order) for low-data routes.  Retraining
     only happens when a full cycle is complete AND enough historical data exists.
     """
-    # Minimum non-holiday orders required per schedule for training
-    # 7 gives us ~2 months of data (minus holidays) which is reasonable
-    MIN_ORDERS_FOR_TRAINING = 7
-    
     log(f"  Checking route {route_number}...")
-    
-    # Get total order count for status reporting
-    total_orders = get_total_order_count(route_number, exclude_holidays=True)
-    
+
     # Check if a trained model exists for this route
     has_trained_model = _check_trained_model(route_number)
     
     # Check cycle status
-    cycle = check_cycle_complete(route_number)
+    readiness = evaluate_retrain_readiness(route_number)
+    cycle = readiness['cycle']
+    min_orders_for_training = int(readiness['min_non_holiday_orders_for_retrain'])
+    total_orders = int(readiness['total_non_holiday_orders'])
     
     if cycle['status'] == 'no_schedules':
         log(f"    No schedules configured")
-        write_forecast_status(fb_client, route_number, total_orders, MIN_ORDERS_FOR_TRAINING, has_trained_model)
+        write_forecast_status(fb_client, route_number, total_orders, min_orders_for_training, has_trained_model)
+        return False
+    if cycle['status'] == 'error':
+        log(f"    ⚠️  Error checking cycle: {cycle.get('error', 'unknown')}")
+        write_forecast_status(fb_client, route_number, total_orders, min_orders_for_training, has_trained_model)
         return False
     
     log(f"    📅 Schedules: {', '.join(cycle['schedules'])}")
@@ -404,55 +307,36 @@ def run_retrain_check(fb_client: firestore.Client, route_number: str, sa_path: s
     log(f"    ⏳ Missing: {', '.join(cycle['missing']) or 'none'}")
     
     # Always update forecast status for app to read
-    write_forecast_status(fb_client, route_number, total_orders, MIN_ORDERS_FOR_TRAINING, has_trained_model)
+    write_forecast_status(fb_client, route_number, total_orders, min_orders_for_training, has_trained_model)
     
-    # --- Retraining: only when cycle complete + enough data ---
-    retrained = False
-    if cycle['status'] == 'complete':
-        # Check if we have enough data for each schedule (excluding holiday weeks)
-        has_enough_data = True
+    def _log_schedule_shortfalls() -> None:
         for schedule_key in cycle['schedules']:
-            count = get_order_count(route_number, schedule_key, exclude_holidays=True)
-            total_count = get_order_count(route_number, schedule_key, exclude_holidays=False)
-            holiday_count = total_count - count
-            
-            if count < MIN_ORDERS_FOR_TRAINING:
-                msg = f"  📊 Route {route_number}: Only {count} non-holiday orders for {schedule_key} (need {MIN_ORDERS_FOR_TRAINING})"
+            counts = readiness['schedule_counts'].get(schedule_key, {})
+            count = counts.get('non_holiday_orders', 0)
+            holiday_count = counts.get('holiday_excluded_orders', 0)
+            if not counts.get('meets_minimum', False):
+                msg = f"  📊 Route {route_number}: Only {count} non-holiday orders for {schedule_key} (need {min_orders_for_training})"
                 if holiday_count > 0:
                     msg += f" [+{holiday_count} holiday weeks excluded]"
                 log(msg)
-                has_enough_data = False
-        
-        if has_enough_data:
-            if not FORECAST_RETRAIN_ENABLED:
-                log(f"  ℹ️  FORECAST_RETRAIN_ENABLED=false; skipped retraining for {route_number}")
-            else:
-                log(f"  🚀 Route {route_number}: Cycle complete! Retraining model...")
-                
-                # Trigger model retrain via training_pipeline.py
-                try:
-                    try:
-                        from .training_pipeline import run_pipeline  # type: ignore
-                    except Exception:
-                        from training_pipeline import run_pipeline  # type: ignore
-                    metrics = run_pipeline(
-                        orders_csv=None,
-                        stock_csv=None,
-                        promos=None,
-                        corrections_csv=None,
-                        calendar_csv=None,
-                        mae_threshold=5.0,
-                        rmse_threshold=8.0,
-                        use_postgres=True,
-                        route_number=route_number,
-                        since_days=365,
-                    )
-                    log(f"    ✅ Training complete for {route_number}: {metrics}")
-                    retrained = True
-                except Exception as e:
-                    log(f"    ⚠️  Training failed for {route_number}: {e}")
+
+    # --- Retraining: only when cycle complete + enough data ---
+    retrained = False
+    if readiness['ready_for_retrain']:
+        if not FORECAST_RETRAIN_ENABLED:
+            log(f"  ℹ️  FORECAST_RETRAIN_ENABLED=false; skipped retraining for {route_number}")
         else:
-            log(f"  ⏳ Route {route_number}: Cycle complete but not enough data for retrain")
+            log(f"  🚀 Route {route_number}: Cycle complete! Retraining model...")
+            
+            try:
+                metrics = run_retrain_for_route(route_number)
+                log(f"    ✅ Training complete for {route_number}: {metrics}")
+                retrained = True
+            except Exception as e:
+                log(f"    ⚠️  Training failed for {route_number}: {e}")
+    elif cycle['status'] == 'complete':
+        _log_schedule_shortfalls()
+        log(f"  ⏳ Route {route_number}: Cycle complete but not enough data for retrain")
     else:
         log(f"  ⏳ Route {route_number}: Cycle not complete, skipping retrain")
     
