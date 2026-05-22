@@ -13,6 +13,8 @@ data/historical/
 # Local workstation artifacts
 .DS_Store
 .widget_settings.json
+.widget_settings.local.json
+.widget_settings.cluster.local.json
 RouteSpark.app/
 data/ip_blocklist.json
 data/latest_forecast.json

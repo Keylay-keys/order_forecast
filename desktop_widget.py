@@ -45,6 +45,16 @@ ARCHIVE_SSH_HOST = "keylay@100.64.201.120"
 ARCHIVE_PURGE_SERVICE_NAME = "Archive Purge Worker"
 logger = logging.getLogger("routespark_widget")
 
+TELEGRAM_INCIDENT_ROUTING = {
+    "API + PostgreSQL": {
+        "incident_code": "API_DOWN",
+        "runbook": "OCCODEX_API_INCIDENT_RUNBOOK.md",
+        "target": "CLUSTER",
+        "severity": "high",
+        "service": "api.routespark.pro",
+    },
+}
+
 # Server API URL (default; can be overridden in .widget_settings.json)
 SERVER_API_URL = 'https://api.routespark.pro'
 
@@ -54,6 +64,21 @@ DEFAULT_SETTINGS = {
     'ntfy': {
         'enabled': True,
         'topic': 'routespark-down-detection',
+    },
+    'telegram': {
+        'enabled': False,
+        'bot_token': '',
+        'chat_id': '',
+        'message_thread_id': '',
+        'disable_notification': False,
+    },
+    'openclaw_incident': {
+        'enabled': False,
+        'ssh_host': '',
+        'session_key': '',
+        'session_id': '',
+        'thinking': 'low',
+        'timeout_seconds': 45,
     },
     # Require N consecutive failures before marking server down
     'server_failure_threshold': 3,
@@ -127,24 +152,280 @@ def send_ntfy_notification(title: str, message: str, settings: dict):
         logger.warning("ntfy notification error: %s", e)
 
 
+def send_telegram_notification(title: str, message: str, settings: dict):
+    """Send push notification to Telegram Bot API."""
+    telegram_config = settings.get('telegram', {})
+    if not telegram_config.get('enabled'):
+        return
+
+    bot_token = str(telegram_config.get('bot_token', '')).strip()
+    chat_id = str(telegram_config.get('chat_id', '')).strip()
+    if not bot_token or not chat_id:
+        return
+
+    payload = {
+        'chat_id': chat_id,
+        'text': format_telegram_notification(title, message, settings),
+        'disable_notification': bool(telegram_config.get('disable_notification', False)),
+    }
+
+    message_thread_id = str(telegram_config.get('message_thread_id', '')).strip()
+    if message_thread_id:
+        payload['message_thread_id'] = message_thread_id
+
+    try:
+        url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+        data = json.dumps(payload).encode('utf-8')
+        req = urllib.request.Request(url, data=data, method='POST')
+        req.add_header('Content-Type', 'application/json')
+
+        with urllib.request.urlopen(req, timeout=10) as response:
+            if response.status != 200:
+                raise RuntimeError(f"unexpected status {response.status}")
+    except Exception as e:
+        logger.warning("Telegram notification error: %s", e)
+
+
 def send_notification(title: str, message: str, settings: dict):
     """Send notifications via all enabled channels."""
     if settings.get('macos_notifications', True):
         send_macos_notification(title, message)
     if settings.get('ntfy', {}).get('enabled'):
         send_ntfy_notification(title, message, settings)
+    if settings.get('telegram', {}).get('enabled'):
+        send_telegram_notification(title, message, settings)
+
+
+def widget_alert_source() -> str:
+    """Return the alert source identifier for the active widget mode."""
+    if "cluster" in SETTINGS_FILE.name:
+        return "ROUTESPARK_WIDGET_CLUSTER"
+    return "ROUTESPARK_WIDGET_MAC"
+
+
+def _build_incident_payload(service_name: str, settings: dict) -> dict | None:
+    """Return a structured incident payload for a supported service."""
+    routing = TELEGRAM_INCIDENT_ROUTING.get(service_name)
+    if not routing:
+        return None
+
+    if routing['incident_code'] == "API_DOWN":
+        threshold = int(settings.get('server_failure_threshold', 3))
+        summary = f"Public API health check failed {threshold} consecutive probes."
+    else:
+        summary = f"{service_name} reported an operational failure."
+
+    return {
+        "incident_code": routing["incident_code"],
+        "source": widget_alert_source(),
+        "severity": routing["severity"],
+        "action": "START_TRIAGE",
+        "runbook": routing["runbook"],
+        "target": routing["target"],
+        "service": routing["service"],
+        "summary": summary,
+    }
+
+
+def format_telegram_notification(title: str, message: str, settings: dict) -> str:
+    """Return Telegram text, upgrading actionable alerts to INCIDENT format."""
+    if title != "RouteSpark Service Down":
+        return f"{title}\n{message}"
+
+    match = re.match(r"^(.*?) stopped at (.+)$", message)
+    if not match:
+        return f"{title}\n{message}"
+
+    service_name = match.group(1).strip()
+    payload = _build_incident_payload(service_name, settings)
+    if not payload:
+        return f"{title}\n{message}"
+
+    return "\n".join([
+        f"INCIDENT: {payload['incident_code']}",
+        f"SOURCE: {payload['source']}",
+        f"SEVERITY: {payload['severity']}",
+        f"ACTION: {payload['action']}",
+        f"RUNBOOK: {payload['runbook']}",
+        f"TARGET: {payload['target']}",
+        f"SERVICE: {payload['service']}",
+        f"SUMMARY: {payload['summary']}",
+    ])
+
+
+def trigger_openclaw_incident(title: str, message: str, settings: dict):
+    """Inject a real incident into the current ocCodex Telegram session."""
+    config = settings.get('openclaw_incident', {})
+    if not config.get('enabled'):
+        return
+
+    if title != "RouteSpark Service Down":
+        return
+
+    match = re.match(r"^(.*?) stopped at (.+)$", message)
+    if not match:
+        return
+
+    service_name = match.group(1).strip()
+    payload = _build_incident_payload(service_name, settings)
+    if not payload:
+        return
+
+    if payload["action"] != "START_TRIAGE":
+        return
+
+    ssh_host = str(config.get('ssh_host', '')).strip()
+    session_key = str(config.get('session_key', '')).strip()
+    session_id = str(config.get('session_id', '')).strip()
+    thinking = str(config.get('thinking', 'low')).strip() or 'low'
+    timeout_seconds = int(config.get('timeout_seconds', 45))
+    if not ssh_host:
+        logger.warning("OpenClaw incident injection skipped: missing ssh_host")
+        return
+
+    incident_message = "\n".join([
+        f"INCIDENT: {payload['incident_code']}",
+        f"SOURCE: {payload['source']}",
+        f"SEVERITY: {payload['severity']}",
+        f"ACTION: {payload['action']}",
+        f"RUNBOOK: {payload['runbook']}",
+        f"TARGET: {payload['target']}",
+        f"SERVICE: {payload['service']}",
+        f"SUMMARY: {payload['summary']}",
+    ])
+
+    remote_script = f"""import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+SESSION_KEY = {json.dumps(session_key)}
+SESSION_ID = {json.dumps(session_id)}
+MESSAGE = {json.dumps(incident_message)}
+THINKING = {json.dumps(thinking)}
+OPENCLAW_TIMEOUT = {json.dumps(timeout_seconds)}
+
+env = os.environ.copy()
+env["PATH"] = os.path.expanduser("~/.npm-global/bin") + ":" + env.get("PATH", "")
+
+def run(args):
+    return subprocess.run(
+        args,
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=max(int(OPENCLAW_TIMEOUT), 5) + 5,
+    )
+
+resolved_session_id = SESSION_ID
+if SESSION_KEY:
+    store = Path("/home/keylay/.openclaw/agents/main/sessions/sessions.json")
+    data = json.loads(store.read_text())
+    session = data.get(SESSION_KEY) or {{}}
+    resolved_session_id = session.get("sessionId", "")
+
+if not resolved_session_id:
+    sys.stderr.write("Unable to resolve OpenClaw session id\\n")
+    sys.exit(2)
+
+cmd = [
+    "openclaw", "agent",
+    "--session-id", resolved_session_id,
+    "--message", MESSAGE,
+    "--deliver",
+    "--json",
+    "--timeout", str(max(int(OPENCLAW_TIMEOUT), 5)),
+]
+if THINKING:
+    cmd.extend(["--thinking", THINKING])
+
+result = run(cmd)
+if result.returncode != 0:
+    sys.stdout.write(result.stdout)
+    sys.stderr.write(result.stderr)
+    sys.exit(result.returncode)
+
+raw = result.stdout.strip()
+if not raw:
+    sys.stderr.write("OpenClaw returned empty stdout\\n")
+    sys.exit(3)
+
+payload = json.loads(raw)
+summary = {{
+    "resolvedSessionId": resolved_session_id,
+    "runId": payload.get("runId"),
+    "status": payload.get("status"),
+    "summary": payload.get("summary"),
+    "durationMs": (((payload.get("result") or {{}}).get("meta") or {{}}).get("durationMs")),
+    "payloadCount": len(((payload.get("result") or {{}}).get("payloads") or [])),
+}}
+sys.stdout.write(json.dumps(summary))
+"""
+
+    try:
+        result = subprocess.run(
+            [
+                "ssh",
+                "-o", "ConnectTimeout=5",
+                "-o", "BatchMode=yes",
+                ssh_host,
+                "python3",
+                "-",
+            ],
+            input=remote_script,
+            text=True,
+            capture_output=True,
+            timeout=timeout_seconds,
+        )
+        if result.returncode != 0:
+            logger.warning(
+                "OpenClaw incident injection failed: %s",
+                result.stderr.strip() or result.stdout.strip() or f"rc={result.returncode}",
+            )
+        else:
+            try:
+                payload = json.loads(result.stdout or "{}")
+                logger.info(
+                    "OpenClaw incident injected for %s (status=%s runId=%s durationMs=%s)",
+                    service_name,
+                    payload.get("status"),
+                    payload.get("runId"),
+                    payload.get("durationMs"),
+                )
+            except Exception:
+                logger.info("OpenClaw incident injected for %s", service_name)
+    except Exception as e:
+        logger.warning("OpenClaw incident injection error: %s", e)
+
+
+def current_local_settings_file() -> Path:
+    """Return the local override path for the current settings file."""
+    return SETTINGS_FILE.with_name(f'{SETTINGS_FILE.stem}.local{SETTINGS_FILE.suffix}')
+
+
+def _merge_widget_settings(settings: dict, override: dict):
+    """Merge persisted widget settings into the current settings object."""
+    for key, value in override.items():
+        if key in {'ntfy', 'telegram', 'openclaw_incident'} and isinstance(value, dict):
+            settings[key].update(value)
+        else:
+            settings[key] = value
 
 
 def load_settings() -> dict:
     """Load widget settings (merge with defaults)."""
     settings = json.loads(json.dumps(DEFAULT_SETTINGS))
+    local_settings_file = current_local_settings_file()
     try:
         if SETTINGS_FILE.exists():
             saved = json.loads(SETTINGS_FILE.read_text())
             if isinstance(saved, dict):
-                settings.update(saved)
-                if isinstance(saved.get('ntfy'), dict):
-                    settings['ntfy'].update(saved['ntfy'])
+                _merge_widget_settings(settings, saved)
+        if local_settings_file.exists():
+            saved = json.loads(local_settings_file.read_text())
+            if isinstance(saved, dict):
+                _merge_widget_settings(settings, saved)
     except Exception:
         pass
     return settings
@@ -663,6 +944,7 @@ class RouteSparkWidget(QWidget):
             logger.warning("%s", message)
             if self._notification_allowed(service_name):
                 send_notification(title, message, self.settings)
+                trigger_openclaw_incident(title, message, self.settings)
             else:
                 logger.info("Suppressed %s alert (cooldown)", service_name)
 

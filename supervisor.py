@@ -295,6 +295,7 @@ def create_services(route: str, sa_path: str, db_path: str) -> List[Service]:
                 'api.main:app',
                 '--host', '127.0.0.1',
                 '--port', '8000',
+                '--timeout-keep-alive', '95',
             ],
             log_file=LOG_DIR / 'web_api.log',
             cwd=BASE_DIR,  # Run from order_forecast directory
