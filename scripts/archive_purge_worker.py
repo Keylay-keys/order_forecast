@@ -14,8 +14,10 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
+import re
 import shutil
 import socket
 import time
@@ -38,6 +40,7 @@ MAX_DELIVERIES_PER_ROUTE_PER_CYCLE = int(os.environ.get("ARCHIVE_PURGE_ROUTE_BAT
 DEFAULT_RETENTION_DAYS = int(os.environ.get("ARCHIVE_PURGE_RETENTION_DAYS_DEFAULT", "90"))
 ARCHIVE_PURGE_ENABLED = os.environ.get("ARCHIVE_PURGE_ENABLED", "false").lower() == "true"
 HDD_ARCHIVE_BASE = Path(os.environ.get("PCF_ARCHIVE_PATH", "/mnt/archive/pcf/pcf_archive"))
+ARCHIVE_RUN_DIR_RE = re.compile(r"^\d{8}_\d{6}$")
 
 logger = logging.getLogger("archive_purge_worker")
 
@@ -113,20 +116,63 @@ def _bucket() -> storage.bucket:
     return bucket
 
 
+def _date_from_run_id(run_id: str) -> Optional[date]:
+    if not ARCHIVE_RUN_DIR_RE.fullmatch(str(run_id or "")):
+        return None
+    try:
+        return datetime.strptime(str(run_id)[:8], "%Y%m%d").date()
+    except ValueError:
+        return None
+
+
+def _latest_manifest_source_run_date(manifest: Dict[str, Any]) -> Optional[date]:
+    source_run_ids = manifest.get("sourceRunIds")
+    if not isinstance(source_run_ids, list):
+        return None
+    dates = [_date_from_run_id(str(run_id)) for run_id in source_run_ids]
+    valid_dates = [value for value in dates if value is not None]
+    return max(valid_dates) if valid_dates else None
+
+
+def _canonical_manifest_date(delivery_dir: Path) -> Optional[date]:
+    manifest_path = delivery_dir / "manifest.json"
+    if not manifest_path.exists():
+        return None
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(manifest, dict):
+        return None
+
+    source_run_date = _latest_manifest_source_run_date(manifest)
+    if source_run_date:
+        return source_run_date
+
+    generated_at = _normalize_iso_date(manifest.get("generatedAt"))
+    if generated_at:
+        try:
+            return date.fromisoformat(generated_at)
+        except ValueError:
+            return None
+    return None
+
+
 def _latest_hdd_run_date(route_number: str, delivery_number: str) -> Optional[date]:
     delivery_dir = HDD_ARCHIVE_BASE / route_number / delivery_number
     if not delivery_dir.exists() or not delivery_dir.is_dir():
         return None
-    runs = [p for p in delivery_dir.iterdir() if p.is_dir()]
-    if not runs:
-        return None
-    latest = sorted(runs, key=lambda p: p.name, reverse=True)[0]
-    if len(latest.name) < 8 or not latest.name[:8].isdigit():
-        return None
-    try:
-        return datetime.strptime(latest.name[:8], "%Y%m%d").date()
-    except ValueError:
-        return None
+    runs = [
+        p
+        for p in delivery_dir.iterdir()
+        if p.is_dir() and ARCHIVE_RUN_DIR_RE.fullmatch(p.name)
+    ]
+    if runs:
+        for latest in sorted(runs, key=lambda p: p.name, reverse=True):
+            latest_date = _date_from_run_id(latest.name)
+            if latest_date:
+                return latest_date
+    return _canonical_manifest_date(delivery_dir)
 
 
 def _is_route_locked(db: admin_firestore.client, route_number: str) -> bool:
