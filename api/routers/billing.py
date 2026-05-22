@@ -44,6 +44,16 @@ APPLE_KEY_ID = str(os.environ.get("APPLE_KEY_ID", "")).strip()
 APPLE_BUNDLE_ID = str(os.environ.get("APPLE_BUNDLE_ID", "")).strip()
 APPLE_PRIVATE_KEY = str(os.environ.get("APPLE_PRIVATE_KEY", "")).strip()
 APPLE_API_TIMEOUT_SEC = float(os.environ.get("APPLE_API_TIMEOUT_SEC", "8"))
+APPLE_SANDBOX_BILLING_ALLOWED_UIDS = {
+    uid.strip()
+    for uid in str(os.environ.get("APPLE_SANDBOX_BILLING_ALLOWED_UIDS", "")).split(",")
+    if uid.strip()
+}
+APPLE_SANDBOX_BILLING_ALLOWED_ROUTES = {
+    route.strip()
+    for route in str(os.environ.get("APPLE_SANDBOX_BILLING_ALLOWED_ROUTES", "")).split(",")
+    if route.strip()
+}
 GOOGLE_BILLING_VERIFICATION_ENABLED = _bool_env("GOOGLE_BILLING_VERIFICATION_ENABLED", False)
 GOOGLE_PLAY_PACKAGE_NAME = str(os.environ.get("GOOGLE_PLAY_PACKAGE_NAME", "")).strip()
 GOOGLE_API_TIMEOUT_SEC = float(os.environ.get("GOOGLE_API_TIMEOUT_SEC", "8"))
@@ -933,6 +943,40 @@ def _normalize_provider(value: Any) -> Optional[str]:
     return provider_aliases.get(normalized, normalized)
 
 
+def _normalize_apple_environment(value: Any) -> Optional[Literal["Sandbox", "Production"]]:
+    normalized = str(value or "").strip().lower()
+    if normalized == "sandbox":
+        return "Sandbox"
+    if normalized == "production":
+        return "Production"
+    return None
+
+
+def _is_apple_sandbox_document(doc_data: Dict[str, Any]) -> bool:
+    provider = _normalize_provider(doc_data.get("provider")) or _normalize_provider(doc_data.get("source"))
+    return provider == "apple" and _normalize_apple_environment(doc_data.get("appleEnvironment")) == "Sandbox"
+
+
+def _is_apple_sandbox_billing_allowed(*, owner_uid: str, route_number: str) -> bool:
+    return (
+        bool(owner_uid and owner_uid in APPLE_SANDBOX_BILLING_ALLOWED_UIDS)
+        or bool(route_number and route_number in APPLE_SANDBOX_BILLING_ALLOWED_ROUTES)
+    )
+
+
+def _apple_sandbox_block_response(*, correlation_id: str, route_number: str) -> JSONResponse:
+    return _error_response(
+        403,
+        error="Apple sandbox purchases do not grant production access",
+        code="APPLE_SANDBOX_ENTITLEMENT_NOT_ALLOWED",
+        details={
+            "correlationId": correlation_id,
+            "route": route_number,
+            "environment": "Sandbox",
+        },
+    )
+
+
 def _check_entitlement_provider_conflict(
     *,
     db: firestore.Client,
@@ -1039,6 +1083,8 @@ def _coerce_entitlement_from_route_doc(
     interval = _normalize_interval(doc_data.get("interval"))
     active = bool(doc_data.get("active"))
     provider = _normalize_provider(doc_data.get("provider")) or _normalize_provider(doc_data.get("source"))
+    if active and _is_apple_sandbox_document(doc_data):
+        active = False
     features = doc_data.get("features") if isinstance(doc_data.get("features"), dict) else {}
     if not features and plan:
         features = _feature_payload_for_plan(plan)
@@ -1225,6 +1271,7 @@ def _write_legacy_subscription_shadow_from_apple(
                         "currentPeriodEnd": current_period_end,
                         "appStoreTransactionId": meta.get("appStoreTransactionId"),
                         "appleOriginalTransactionId": meta.get("appleOriginalTransactionId"),
+                        "appleEnvironment": meta.get("environment"),
                         "updatedAt": firestore.SERVER_TIMESTAMP,
                     }
                 }
@@ -1678,6 +1725,25 @@ async def get_billing_entitlement(
                 ok=True,
                 entitlement=_finalize_entitlement(route_doc_entitlement, resolved_from="route_entitlements"),
             )
+        if _is_apple_sandbox_document(ent_data):
+            return BillingEntitlementResponse(
+                ok=True,
+                entitlement=_finalize_entitlement(
+                    route_doc_entitlement
+                    or BillingEntitlement(
+                        routeNumber=route,
+                        active=False,
+                        plan=_normalize_plan(ent_data.get("plan")),
+                        provider="apple",
+                        interval=_normalize_interval(ent_data.get("interval")),
+                        currentPeriodEndMs=_to_epoch_millis(ent_data.get("currentPeriodEnd")),
+                        source="route_entitlements",
+                        updatedAtMs=_to_epoch_millis(ent_data.get("updatedAt")),
+                        features={},
+                    ),
+                    resolved_from="route_entitlements",
+                ),
+            )
 
     owner_uid = _resolve_owner_uid_for_route(
         db=db,
@@ -1797,6 +1863,32 @@ async def create_stripe_checkout_session(
         )
 
     owner_data = owner_doc.to_dict() or {}
+    provider_gate = _check_entitlement_provider_conflict(
+        db=db,
+        route_number=route,
+        incoming_provider="stripe",
+    )
+    if provider_gate.get("conflict"):
+        return _error_response(
+            409,
+            error="Active entitlement is managed by another provider",
+            code="ENTITLEMENT_PROVIDER_CONFLICT",
+            details={
+                "routeNumber": route,
+                "existingProvider": provider_gate.get("existingProvider"),
+                "incomingProvider": "stripe",
+                "correlationId": correlation_id,
+                "overrideEnabled": ENTITLEMENT_PROVIDER_OVERRIDE,
+            },
+        )
+    if provider_gate.get("existingActive") and provider_gate.get("existingProvider") == "stripe":
+        return _error_response(
+            409,
+            error="Stripe subscription is already active for this route",
+            code="STRIPE_SUBSCRIPTION_ALREADY_ACTIVE",
+            details={"routeNumber": route, "correlationId": correlation_id},
+        )
+
     route_sub = (
         owner_data.get("subscriptions", {})
         .get("routes", {})
@@ -2135,6 +2227,17 @@ async def verify_apple_subscription(
         requester_uid=decoded_token["uid"],
         requester_data=user_data,
     )
+    if (
+        _normalize_apple_environment(meta.get("environment")) == "Sandbox"
+        and not _is_apple_sandbox_billing_allowed(owner_uid=owner_uid, route_number=route)
+    ):
+        logger.warning(
+            "Blocked Apple sandbox entitlement write route=%s uid=%s corr=%s",
+            route,
+            owner_uid,
+            correlation_id,
+        )
+        return _apple_sandbox_block_response(correlation_id=correlation_id, route_number=route)
     provider_gate = _check_entitlement_provider_conflict(
         db=db,
         route_number=route,
@@ -2306,6 +2409,17 @@ async def restore_apple_subscription(
         requester_uid=decoded_token["uid"],
         requester_data=user_data,
     )
+    if (
+        _normalize_apple_environment(meta.get("environment")) == "Sandbox"
+        and not _is_apple_sandbox_billing_allowed(owner_uid=owner_uid, route_number=route)
+    ):
+        logger.warning(
+            "Blocked Apple sandbox restore write route=%s uid=%s corr=%s",
+            route,
+            owner_uid,
+            correlation_id,
+        )
+        return _apple_sandbox_block_response(correlation_id=correlation_id, route_number=route)
     provider_gate = _check_entitlement_provider_conflict(
         db=db,
         route_number=route,

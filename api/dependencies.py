@@ -521,6 +521,10 @@ def _has_route_entitlement_feature(
     data = ent_doc.to_dict() or {}
     if not bool(data.get("active")):
         return False
+    provider = str(data.get("provider") or data.get("source") or "").strip().lower()
+    apple_environment = str(data.get("appleEnvironment") or "").strip().lower()
+    if provider in ("apple", "app_store", "appstore", "ios") and apple_environment == "sandbox":
+        return False
     features = data.get("features") if isinstance(data.get("features"), dict) else {}
     if feature_key in features:
         return bool(features.get(feature_key))
