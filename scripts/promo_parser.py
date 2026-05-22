@@ -17,17 +17,22 @@ except ImportError:  # pragma: no cover
 def parse_excel(path: str | Path) -> List[Dict]:
     import re
     from datetime import datetime
-    
-    # Try reading with header row 0 first to see the structure
-    df = pd.read_excel(path, header=0)
-    
-    # Check if first row contains actual headers like "Account", "SAP Codes"
-    # (Weekly Executables format has merged header cells, real headers in row 1)
-    first_row = df.iloc[0].astype(str).str.lower().tolist() if len(df) > 0 else []
-    if any("account" in val or "sap" in val for val in first_row):
-        # Real headers are in the first data row - use row 1 as header
-        df = pd.read_excel(path, header=1)
-    
+
+    # Weekly executable workbooks often have banner rows before the real headers.
+    # Scan the first few rows first, then re-read using the actual header row.
+    preview = pd.read_excel(path, header=None, nrows=8)
+    header_row_index = 0
+    for idx in range(min(len(preview), 8)):
+        row_values = [str(v).strip().lower() for v in preview.iloc[idx].tolist()]
+        has_account = any("account" == v or v.startswith("account") for v in row_values)
+        has_sap = any("sap codes" in v or v == "sap" for v in row_values)
+        has_items = any("items on promo" in v or ("item" in v and "promo" in v) for v in row_values)
+        if has_account and has_sap and has_items:
+            header_row_index = idx
+            break
+
+    df = pd.read_excel(path, header=header_row_index)
+
     if df is None or df.empty:
         return []
     
@@ -119,6 +124,8 @@ def parse_excel(path: str | Path) -> List[Dict]:
         for sap in sap_codes:
             items.append({
                 "sap_raw": sap,
+                "sap_cell_raw": sap_raw,
+                "sap_count_in_cell": len(sap_codes),
                 "sap_code": sap,
                 "description": desc if desc.lower() != 'nan' else "",
                 "price": price if price.lower() != 'nan' else "",
@@ -201,6 +208,8 @@ def parse_pdf(path: str | Path) -> List[Dict]:
                                 for sap, variant_desc in zip(sap_codes, variants):
                                     items.append({
                                         "sap_raw": sap,
+                                        "sap_cell_raw": sap_raw,
+                                        "sap_count_in_cell": len(sap_codes),
                                         "sap_code": sap,
                                         "description": variant_desc,
                                         "price": price,
@@ -213,6 +222,8 @@ def parse_pdf(path: str | Path) -> List[Dict]:
                                 for sap in sap_codes:
                                     items.append({
                                         "sap_raw": sap,
+                                        "sap_cell_raw": sap_raw,
+                                        "sap_count_in_cell": len(sap_codes),
                                         "sap_code": sap,
                                         "description": desc,
                                         "price": price,
@@ -226,6 +237,8 @@ def parse_pdf(path: str | Path) -> List[Dict]:
                             for variant_desc in variants:
                                 items.append({
                                     "sap_raw": "",
+                                    "sap_cell_raw": sap_raw,
+                                    "sap_count_in_cell": 0,
                                     "sap_code": "",
                                     "description": variant_desc,
                                     "price": price,
@@ -562,4 +575,3 @@ def parse_promo_attachment(path: str | Path) -> List[Dict]:
     if suffix == ".pdf":
         return parse_pdf(path)
     raise ValueError(f"Unsupported promo attachment type: {suffix}")
-
