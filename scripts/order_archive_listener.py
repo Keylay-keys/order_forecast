@@ -13,7 +13,6 @@ import argparse
 import os
 import socket
 import time
-from datetime import datetime, timezone
 
 from google.cloud import firestore  # type: ignore
 
@@ -57,8 +56,7 @@ def get_firestore_client(sa_path: str) -> firestore.Client:
 def handle_list_dates(route_number: str) -> dict:
     """Handle request to list archived order dates."""
     try:
-        dates = get_archived_dates(route_number)
-        return {'dates': dates}
+        return {'dates': get_archived_dates(route_number)}
     except Exception as e:
         return {'error': str(e)}
 

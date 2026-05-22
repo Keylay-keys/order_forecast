@@ -169,7 +169,7 @@ FLOW 3: Feedback Loop
 #!/bin/bash
 # start_listeners.sh
 
-cd /Users/kylemacmini/Desktop/routespark/restore-2025-09-24/order_forecast
+cd /Users/kylemacmini/projects/routespark/restore-2025-09-24/order_forecast
 source venv/bin/activate
 
 # Start archive listener in background

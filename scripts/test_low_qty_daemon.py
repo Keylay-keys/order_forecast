@@ -5,7 +5,7 @@ Tests each component without sending real notifications.
 Only tests route 989262.
 
 Usage:
-    cd /Users/kylemacmini/Desktop/routespark/restore-2025-09-24/order_forecast
+    cd /Users/kylemacmini/projects/routespark/restore-2025-09-24/order_forecast
     source venv/bin/activate
     python scripts/test_low_qty_daemon.py
 """

@@ -6,7 +6,7 @@ entry using the owner's current timezone and the current clock time, then runs
 the daemon's normal `check_and_notify()` path in dry-run mode.
 
 Usage:
-    cd /Users/kylemacmini/Desktop/routespark/restore-2025-09-24/order_forecast
+    cd /Users/kylemacmini/projects/routespark/restore-2025-09-24/order_forecast
     source venv/bin/activate
     python scripts/test_low_qty_send_now.py --serviceAccount /path/to/sa.json --route 989262
 """

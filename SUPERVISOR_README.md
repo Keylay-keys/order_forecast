@@ -29,7 +29,7 @@ One script to rule them all. Manages all background services for the RouteSpark 
 ## Quick Start
 
 ```bash
-cd /Users/kylemacmini/Desktop/routespark/restore-2025-09-24/order_forecast
+cd /Users/kylemacmini/projects/routespark/restore-2025-09-24/order_forecast
 source venv/bin/activate
 
 # Check what's running
