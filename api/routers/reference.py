@@ -46,28 +46,6 @@ async def get_products(
     return {"routeNumber": route, "products": items}
 
 
-@router.get("/stores")
-@rate_limit_history
-async def get_stores(
-    request: Request,
-    route: str = Query(..., pattern=r"^\d{1,10}$", description="Route number"),
-    decoded_token: dict = Depends(verify_firebase_token),
-    db: firestore.Client = Depends(get_firestore),
-) -> Dict[str, Any]:
-    """Return stores for a route."""
-    await require_route_access(route, decoded_token, db)
-
-    stores_ref = db.collection("routes").document(route).collection("stores")
-    q = stores_ref.order_by("name")
-    stores = []
-    for doc in q.stream():
-        data = doc.to_dict() or {}
-        data["id"] = data.get("id") or doc.id
-        stores.append(data)
-
-    return {"routeNumber": route, "stores": stores}
-
-
 @router.get("/schedule")
 @rate_limit_history
 async def get_schedule(

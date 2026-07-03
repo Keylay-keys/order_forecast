@@ -267,7 +267,7 @@ async def update_order(
     decoded_token: dict = Depends(verify_firebase_token),
     db: firestore.Client = Depends(get_firestore),
 ) -> Order:
-    """Update an order's stores/items with optimistic locking."""
+    """Merge draft order store/item patches into the current Firestore order."""
     await require_route_feature_access(route, "ordering", decoded_token, db)
 
     order_ref = _order_ref(db, route, order_id)
@@ -283,45 +283,61 @@ async def update_order(
     if order_data.get("status") != "draft":
         raise HTTPException(400, "Order is not editable")
 
-    # Optimistic locking: compare updatedAt if provided
-    if payload.updatedAt:
-        server_updated_at = _to_datetime(order_data.get("updatedAt"))
-        if server_updated_at:
-            if abs(server_updated_at.timestamp() - payload.updatedAt.timestamp()) > 1:
-                raise HTTPException(409, "Order was modified by another session")
-
     now = datetime.now(timezone.utc)
 
-    # IMPORTANT: Clients (notably the web portal) may send a minimal item payload
-    # like {sap, quantity} and omit forecast metadata fields. Because `stores` is
-    # stored as an ARRAY of MAPs in Firestore, a full `stores` replacement would
-    # otherwise drop those omitted keys. We merge against the existing order doc
-    # to preserve forecast metadata when the client didn't explicitly change it.
+    # Clients send quantity patches. Because `stores` is stored as an ARRAY of
+    # MAPs in Firestore, merge into the current document instead of replacing the
+    # array; otherwise a web draft save can erase mobile edits from Firebase.
     existing_stores: List[Dict[str, Any]] = order_data.get("stores") or []
     existing_store_by_id: Dict[str, Dict[str, Any]] = {
         str(s.get("storeId")): s for s in existing_stores if s.get("storeId") is not None
     }
+    merged_store_by_id: Dict[str, Dict[str, Any]] = {
+        store_id: {
+            **store,
+            "items": list(store.get("items") or []),
+        }
+        for store_id, store in existing_store_by_id.items()
+    }
 
-    merged_stores: List[Dict[str, Any]] = []
     for store in payload.stores:
         incoming_store = store.dict(exclude_unset=True)
         store_id = str(incoming_store.get("storeId", ""))
-        existing_store = existing_store_by_id.get(store_id, {})
+        if not store_id:
+            continue
+        existing_store = merged_store_by_id.get(store_id) or existing_store_by_id.get(store_id, {})
 
         existing_items = existing_store.get("items") or []
         existing_item_by_sap: Dict[str, Dict[str, Any]] = {
             str(it.get("sap")): it for it in existing_items if it.get("sap") is not None
         }
 
-        merged_items: List[Dict[str, Any]] = []
         for item in store.items:
             incoming_item = item.dict(exclude_unset=True, by_alias=False)
             sap = str(incoming_item.get("sap", "")).strip()
+            if not sap:
+                continue
+            quantity = int(incoming_item.get("quantity") or 0)
+            if quantity <= 0:
+                existing_item_by_sap.pop(sap, None)
+                continue
             base = existing_item_by_sap.get(sap, {})
-            merged_items.append({**base, **incoming_item})
+            existing_item_by_sap[sap] = {**base, **incoming_item}
 
-        merged_store = {**existing_store, **incoming_store, "items": merged_items}
-        merged_stores.append(merged_store)
+        merged_store_by_id[store_id] = {
+            **existing_store,
+            **{k: v for k, v in incoming_store.items() if k != "items"},
+            "items": list(existing_item_by_sap.values()),
+        }
+
+    existing_order = [str(s.get("storeId")) for s in existing_stores if s.get("storeId") is not None]
+    incoming_order = [str(s.storeId) for s in payload.stores if s.storeId]
+    ordered_store_ids = list(dict.fromkeys([*existing_order, *incoming_order]))
+    merged_stores = [
+        merged_store_by_id[store_id]
+        for store_id in ordered_store_ids
+        if merged_store_by_id.get(store_id, {}).get("items")
+    ]
 
     update_data = {
         "stores": merged_stores,

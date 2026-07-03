@@ -23,7 +23,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from .dependencies import get_firebase_app, get_pg_pool, get_firestore
-from .routers import auth, history, health, orders, forecast, reference, low_quantity, settings, schedule, credits, pos, deliveries, transfers, team, billing, archive_exports
+from .routers import auth, history, health, orders, forecast, reference, stores, catalog, low_quantity, settings, schedule, credits, pos, deliveries, transfers, team, billing, archive_exports
 from .middleware.rate_limit import setup_rate_limiting
 from .middleware.honeypots import setup_honeypots
 from .middleware.brute_force import setup_brute_force_protection
@@ -217,6 +217,8 @@ app.include_router(health.router, prefix="/api", tags=["Health"])
 app.include_router(transfers.router, prefix="/api", tags=["Transfers"])
 app.include_router(orders.router, prefix="/api", tags=["Orders"])
 app.include_router(forecast.router, prefix="/api", tags=["Forecast"])
+app.include_router(stores.router, prefix="/api", tags=["Stores"])
+app.include_router(catalog.router, prefix="/api", tags=["Catalog"])
 app.include_router(reference.router, prefix="/api", tags=["Reference"])
 app.include_router(low_quantity.router, prefix="/api", tags=["Low Quantity"])
 app.include_router(settings.router, prefix="/api", tags=["Settings"])
