@@ -84,6 +84,10 @@ DEFAULT_SETTINGS = {
     'server_failure_threshold': 3,
     # Require N consecutive successes before marking server up
     'server_recovery_threshold': 2,
+    # Require N consecutive misses before marking local Mac services down
+    'mac_service_failure_threshold': 3,
+    # Require N consecutive hits before marking local Mac services recovered
+    'mac_service_recovery_threshold': 2,
     # Suppress repeat notifications for the same service within this window
     'notification_cooldown_minutes': 30,
     # Server health check timeout in seconds
@@ -727,6 +731,8 @@ class ServiceRow(QFrame):
         self.is_running = False
         self.was_running = False
         self.first_check = True
+        self._down_observations = 0
+        self._up_observations = 0
         
         layout = QHBoxLayout(self)
         layout.setContentsMargins(8, 3, 8, 3)
@@ -752,15 +758,46 @@ class ServiceRow(QFrame):
         self.info_label.setFixedWidth(self.info_width)
         layout.addWidget(self.info_label)
     
-    def update_status(self, running: bool = None, info: str = "") -> bool:
+    def update_status(
+        self,
+        running: bool = None,
+        info: str = "",
+        down_threshold: int = 1,
+        up_threshold: int = 1,
+    ) -> bool:
         """Update the status display. Returns True if service went down."""
         self.was_running = self.is_running
         
         if running is not None:
-            self.is_running = running
+            detected_running = running
         elif self.pattern:
-            self.is_running, pid = check_process_running(self.pattern)
-            info = str(pid) if self.is_running else ""
+            detected_running, pid = check_process_running(self.pattern)
+            info = str(pid) if detected_running else ""
+        else:
+            detected_running = self.is_running
+
+        down_threshold = max(1, int(down_threshold or 1))
+        up_threshold = max(1, int(up_threshold or 1))
+
+        if self.first_check:
+            self.is_running = detected_running
+            self._down_observations = 0
+            self._up_observations = 0
+        elif detected_running == self.is_running:
+            self._down_observations = 0
+            self._up_observations = 0
+        elif detected_running:
+            self._up_observations += 1
+            self._down_observations = 0
+            if self._up_observations >= up_threshold:
+                self.is_running = True
+                self._up_observations = 0
+        else:
+            self._down_observations += 1
+            self._up_observations = 0
+            if self._down_observations >= down_threshold:
+                self.is_running = False
+                self._down_observations = 0
         
         if self.is_running:
             self.indicator.setStyleSheet(f"color: {COLORS['green']};")
@@ -1312,10 +1349,15 @@ class RouteSparkWidget(QWidget):
         
         # Check Mac services
         mac_running = 0
+        mac_down_threshold = int(self.settings.get('mac_service_failure_threshold', 3) or 3)
+        mac_up_threshold = int(self.settings.get('mac_service_recovery_threshold', 2) or 2)
         for row in self.mac_rows:
             was_first_check = row.first_check
             prev_running = row.is_running
-            row.update_status()
+            row.update_status(
+                down_threshold=mac_down_threshold,
+                up_threshold=mac_up_threshold,
+            )
             if row.is_running:
                 mac_running += 1
             if prev_running and not row.is_running:
