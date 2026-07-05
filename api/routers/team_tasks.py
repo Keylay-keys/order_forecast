@@ -410,7 +410,12 @@ async def complete_team_task(
             title="Team task completed",
             body=body,
             notification_type="team_task_completed",
-            data={"routeNumber": route_number, "taskId": task_id, "teamMemberUid": requester_uid},
+            data={
+                "routeNumber": route_number,
+                "taskId": task_id,
+                "teamMemberUid": requester_uid,
+                "target": "teamTasks",
+            },
         )
 
     return {"ok": True}

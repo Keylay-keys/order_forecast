@@ -221,6 +221,7 @@ class TeamTasksApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Assigned by: Owner Name", notification["body"])
         send_push.assert_called_once()
         self.assertEqual(send_push.call_args.kwargs["data"]["type"], "team_task_assigned")
+        self.assertEqual(send_push.call_args.kwargs["data"]["target"], "teamTasks")
 
     async def test_non_owner_cannot_create_task(self):
         db = _build_db()
@@ -350,6 +351,8 @@ class TeamTasksApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Team Member: Member Name", notification["body"])
         self.assertIn("Marked Complete.", notification["body"])
         send_push.assert_called_once()
+        self.assertEqual(send_push.call_args.kwargs["data"]["type"], "team_task_completed")
+        self.assertEqual(send_push.call_args.kwargs["data"]["target"], "teamTasks")
 
     async def test_unassigned_member_cannot_complete_task(self):
         db = _build_db()
