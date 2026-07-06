@@ -33,6 +33,7 @@ LEGACY_CLUSTER_API_URLS = {
 CLUSTER_SNAPSHOT_TTL_SECONDS = 10
 BACKUP_TIMESTAMP_TTL_SECONDS = 60
 ARCHIVE_FRESHNESS_TTL_SECONDS = 60
+POSTGRES_HEALTH_TTL_SECONDS = 30
 
 _original_check_server_health = base.check_server_health
 _cluster_snapshot_cache: dict | None = None
@@ -41,6 +42,8 @@ _backup_timestamp_cache: str | None = None
 _backup_timestamp_checked_at = 0.0
 _archive_freshness_cache: str | None = None
 _archive_freshness_checked_at = 0.0
+_postgres_health_cache: tuple[bool, str] | None = None
+_postgres_health_checked_at = 0.0
 
 
 base.SETTINGS_FILE = base.APP_DIR / ".widget_settings.cluster.json"
@@ -172,6 +175,64 @@ def _deployment_running(snapshot: dict | None, namespace: str, name: str) -> tup
     if desired <= 0:
         return False, "0/0"
     return available >= desired, f"{available}/{desired}"
+
+
+def _get_cluster_postgres_health(force: bool = False) -> tuple[bool, str]:
+    global _postgres_health_cache, _postgres_health_checked_at
+
+    now = time.time()
+    if (
+        not force
+        and _postgres_health_cache is not None
+        and (now - _postgres_health_checked_at) < POSTGRES_HEALTH_TTL_SECONDS
+    ):
+        return _postgres_health_cache
+
+    remote_script = (
+        "kubectl -n routespark-edge exec deploy/web-api -- python -c "
+        "'import os, psycopg2; "
+        "conn=psycopg2.connect("
+        "host=os.environ[\"POSTGRES_HOST\"], "
+        "port=os.environ.get(\"POSTGRES_PORT\", \"5432\"), "
+        "dbname=os.environ[\"POSTGRES_DB\"], "
+        "user=os.environ[\"POSTGRES_USER\"], "
+        "password=os.environ[\"POSTGRES_PASSWORD\"], "
+        "connect_timeout=5"
+        "); "
+        "cur=conn.cursor(); "
+        "cur.execute(\"select 1\"); "
+        "print(cur.fetchone()[0]); "
+        "conn.close()'"
+    )
+
+    for ssh_host in _ordered_cluster_ssh_hosts():
+        try:
+            result = subprocess.run(
+                [
+                    "ssh",
+                    "-o", "ConnectTimeout=3",
+                    "-o", "BatchMode=yes",
+                    ssh_host,
+                    remote_script,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=12,
+            )
+            if result.returncode == 0 and result.stdout.strip() == "1":
+                _postgres_health_cache = (True, "OK")
+                _postgres_health_checked_at = now
+                return _postgres_health_cache
+            info = (result.stderr or result.stdout or "SELECT failed").strip().splitlines()[-1:]
+            _postgres_health_cache = (False, (info[0] if info else "DOWN")[:40])
+            _postgres_health_checked_at = now
+            return _postgres_health_cache
+        except Exception as exc:
+            base.logger.debug("Cluster Postgres health check failed via %s: %s", ssh_host, exc)
+
+    _postgres_health_cache = (False, "UNREACH")
+    _postgres_health_checked_at = now
+    return _postgres_health_cache
 
 
 def _cronjob_state(snapshot: dict | None, namespace: str, name: str) -> tuple[bool, str]:
@@ -320,6 +381,18 @@ def check_cluster_server_health(server_api_url: str, timeout_seconds: int) -> di
     snapshot = _fetch_cluster_snapshot()
     health["_clusterSnapshot"] = snapshot
 
+    api_running, api_info = _deployment_running(snapshot, "routespark-edge", "web-api")
+    health["apiContainerHealth"] = {
+        "status": "healthy" if api_running else "unhealthy",
+        "info": api_info,
+    }
+
+    postgres_running, postgres_info = _get_cluster_postgres_health()
+    health["postgresHealth"] = {
+        "status": "healthy" if postgres_running else "unhealthy",
+        "info": postgres_info,
+    }
+
     firebase_running, firebase_info = _deployment_running(snapshot, "routespark-admin", "firebase-tools")
     health["firebaseHealth"] = {
         "status": "healthy" if firebase_running else "unhealthy",
@@ -407,14 +480,30 @@ class ClusterWidget(base.RouteSparkWidget):
         self.reconciler_row.name = "Low-Qty"
         self.reconciler_row.label.setText("Low-Qty")
 
+    def _server_down_service_name(self) -> str:
+        api_health = self.server_health.get("apiContainerHealth", {})
+        postgres_health = self.server_health.get("postgresHealth", {})
+        api_status = api_health.get("status")
+        postgres_status = postgres_health.get("status")
+
+        if api_status == "unhealthy" and postgres_status == "unhealthy":
+            return "API + PostgreSQL"
+        if api_status == "unhealthy":
+            return "API Container"
+        if postgres_status == "unhealthy":
+            return "PostgreSQL"
+        return "Public API Probe"
+
     def refresh_status(self):
         super().refresh_status()
 
         snapshot = self.server_health.get("_clusterSnapshot") or _fetch_cluster_snapshot()
         if snapshot:
             snapshot_host = snapshot.get("_ssh_host", "").split("@")[-1] if snapshot.get("_ssh_host") else "cluster"
+            api_info = (self.server_health.get("apiContainerHealth") or {}).get("info", "?")
+            pg_info = (self.server_health.get("postgresHealth") or {}).get("info", "?")
             self.server_stats.setText(
-                f"Cluster OK via {self.server_health.get('_sourceUrl', CLUSTER_PUBLIC_API_URL)} · {snapshot_host}"
+                f"Public {self.server_health.get('_sourceUrl', CLUSTER_PUBLIC_API_URL)} · API {api_info} · PG {pg_info} · {snapshot_host}"
             )
         else:
             self.server_stats.setText("Cluster snapshot unavailable")

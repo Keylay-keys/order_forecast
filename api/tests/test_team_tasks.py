@@ -1,5 +1,7 @@
 import inspect
 import unittest
+from datetime import datetime, time
+from zoneinfo import ZoneInfo
 from unittest.mock import patch
 
 from fastapi import HTTPException
@@ -157,6 +159,7 @@ def _owner_user():
             "routeNumber": "989567",
             "email": "owner@example.com",
             "personalName": "Owner Name",
+            "timezone": "America/Denver",
         },
         "fcmTokens": ["ExponentPushToken[owner]"],
     }
@@ -182,6 +185,18 @@ def _build_db():
     db.root["routes"]["989567"] = {"ownerUid": "owner-1"}
     db.root["users"]["owner-1"] = _owner_user()
     db.root["users"]["member-1"] = _member_user()
+    db.root["users"]["member-2"] = {
+        "profile": {"role": "team_member", "email": "member2@example.com", "personalName": "Second Member"},
+        "routeAssignments": {
+            "989567": {
+                "role": "team_member",
+                "needsApproval": False,
+                "verified": True,
+                "assignedTo": "owner-1",
+            }
+        },
+        "fcmTokens": ["ExponentPushToken[member2]"],
+    }
     db.root["users"]["pending-1"] = _member_user(needs_approval=True)
     db.root["users"]["outsider-1"] = {
         "profile": {"role": "team_member", "email": "outsider@example.com"},
@@ -222,6 +237,204 @@ class TeamTasksApiTests(unittest.IsolatedAsyncioTestCase):
         send_push.assert_called_once()
         self.assertEqual(send_push.call_args.kwargs["data"]["type"], "team_task_assigned")
         self.assertEqual(send_push.call_args.kwargs["data"]["target"], "teamTasks")
+
+    async def test_owner_can_create_date_only_task_with_route_timezone_end_of_day(self):
+        db = _build_db()
+        payload = team_tasks.TeamTaskCreateRequest(
+            routeNumber="989567",
+            teamMemberUid="member-1",
+            task="Check display",
+            dueDate="2026-07-06",
+        )
+
+        with patch.object(team_tasks, "require_route_access", return_value=_owner_user()), patch.object(
+            team_tasks, "_send_expo_push", return_value={"sent": 1, "failed": 0}
+        ):
+            response = await _unwrap(team_tasks.create_team_task)(
+                request=None,
+                payload=payload,
+                decoded_token={"uid": "owner-1"},
+                db=db,
+            )
+
+        task = db.root["routes"]["989567"]["_subcollections"]["teamTasks"][response["taskId"]]
+        expected = datetime.combine(
+            datetime(2026, 7, 6).date(),
+            time(23, 59, 59, 999000),
+            tzinfo=ZoneInfo("America/Denver"),
+        )
+        self.assertEqual(task["dueDate"], "2026-07-06")
+        self.assertIsNone(task["dueTime"])
+        self.assertEqual(task["timezone"], "America/Denver")
+        self.assertEqual(task["dueAtMs"], int(expected.timestamp() * 1000))
+        self.assertEqual(task["reminderStatus"], "none")
+        notification = next(iter(db.root["users"]["member-1"]["_subcollections"]["notifications"].values()))
+        self.assertIn("Due: 2026-07-06", notification["body"])
+
+    async def test_due_time_requires_due_date(self):
+        db = _build_db()
+        payload = team_tasks.TeamTaskCreateRequest(
+            routeNumber="989567",
+            teamMemberUid="member-1",
+            task="Check display",
+            dueTime=team_tasks.TeamTaskDueTime(hour=3, minute=30, period="PM"),
+        )
+
+        with patch.object(team_tasks, "require_route_access", return_value=_owner_user()):
+            with self.assertRaises(HTTPException) as ctx:
+                await _unwrap(team_tasks.create_team_task)(
+                    request=None,
+                    payload=payload,
+                    decoded_token={"uid": "owner-1"},
+                    db=db,
+                )
+
+        self.assertEqual(ctx.exception.status_code, 400)
+
+    async def test_owner_can_patch_task_and_reassignment_notifies_new_member(self):
+        db = _build_db()
+        db.collection("routes").document("989567").collection("teamTasks").document("task-a").set(
+            {
+                "routeNumber": "989567",
+                "ownerUid": "owner-1",
+                "teamMemberUid": "member-1",
+                "teamMemberDisplay": "Member Name",
+                "task": "Old task",
+                "status": "open",
+            }
+        )
+        payload = team_tasks.TeamTaskUpdateRequest(
+            routeNumber="989567",
+            teamMemberUid="member-2",
+            task="Updated task",
+            dueDate="2026-07-06",
+            dueTime=team_tasks.TeamTaskDueTime(hour=4, minute=15, period="PM"),
+        )
+
+        with patch.object(team_tasks, "require_route_access", return_value=_owner_user()), patch.object(
+            team_tasks, "_send_expo_push", return_value={"sent": 1, "failed": 0}
+        ) as send_push:
+            response = await _unwrap(team_tasks.update_team_task)(
+                request=None,
+                task_id="task-a",
+                payload=payload,
+                decoded_token={"uid": "owner-1"},
+                db=db,
+            )
+
+        self.assertTrue(response["ok"])
+        self.assertTrue(response["reassigned"])
+        task = db.root["routes"]["989567"]["_subcollections"]["teamTasks"]["task-a"]
+        self.assertEqual(task["teamMemberUid"], "member-2")
+        self.assertEqual(task["teamMemberDisplay"], "Second Member")
+        self.assertEqual(task["task"], "Updated task")
+        self.assertEqual(task["dueTime"], {"hour": 4, "minute": 15, "period": "PM"})
+        notifications = db.root["users"]["member-2"]["_subcollections"]["notifications"]
+        self.assertEqual(len(notifications), 1)
+        self.assertIn("Due: 2026-07-06 4:15 PM", next(iter(notifications.values()))["body"])
+        send_push.assert_called_once()
+
+    async def test_patch_clearing_due_date_clears_due_time_and_reminder_fields(self):
+        db = _build_db()
+        db.collection("routes").document("989567").collection("teamTasks").document("task-a").set(
+            {
+                "routeNumber": "989567",
+                "ownerUid": "owner-1",
+                "teamMemberUid": "member-1",
+                "teamMemberDisplay": "Member Name",
+                "task": "Scheduled task",
+                "status": "open",
+                "dueDate": "2026-07-06",
+                "dueTime": {"hour": 4, "minute": 15, "period": "PM"},
+                "timezone": "America/Denver",
+                "dueAtMs": 1783376100000,
+                "reminderEnabled": True,
+                "reminderOffsetMinutes": 15,
+                "reminderAtMs": 1783375200000,
+                "reminderStatus": "pending",
+            }
+        )
+        payload = team_tasks.TeamTaskUpdateRequest(routeNumber="989567", dueDate=None)
+
+        with patch.object(team_tasks, "require_route_access", return_value=_owner_user()):
+            response = await _unwrap(team_tasks.update_team_task)(
+                request=None,
+                task_id="task-a",
+                payload=payload,
+                decoded_token={"uid": "owner-1"},
+                db=db,
+            )
+
+        self.assertTrue(response["ok"])
+        task = db.root["routes"]["989567"]["_subcollections"]["teamTasks"]["task-a"]
+        self.assertIsNone(task["dueDate"])
+        self.assertIsNone(task["dueTime"])
+        self.assertIsNone(task["timezone"])
+        self.assertIsNone(task["dueAtMs"])
+        self.assertFalse(task["reminderEnabled"])
+        self.assertIsNone(task["reminderOffsetMinutes"])
+        self.assertIsNone(task["reminderAtMs"])
+        self.assertEqual(task["reminderStatus"], "none")
+
+    async def test_list_sorts_open_due_tasks_before_no_due_and_completed_newest_first(self):
+        db = _build_db()
+        tasks = db.collection("routes").document("989567").collection("teamTasks")
+        now_ms = int(datetime.now(ZoneInfo("UTC")).timestamp() * 1000)
+        tasks.document("no-due-new").set(
+            {"routeNumber": "989567", "teamMemberUid": "member-1", "task": "No due", "status": "open", "createdAt": 300}
+        )
+        tasks.document("upcoming").set(
+            {
+                "routeNumber": "989567",
+                "teamMemberUid": "member-1",
+                "task": "Upcoming",
+                "status": "open",
+                "dueAtMs": now_ms + 1_000_000,
+                "createdAt": 100,
+            }
+        )
+        tasks.document("overdue").set(
+            {
+                "routeNumber": "989567",
+                "teamMemberUid": "member-1",
+                "task": "Overdue",
+                "status": "open",
+                "dueAtMs": now_ms - 1_000_000,
+                "createdAt": 200,
+            }
+        )
+        tasks.document("completed-old").set(
+            {
+                "routeNumber": "989567",
+                "teamMemberUid": "member-1",
+                "task": "Completed old",
+                "status": "completed",
+                "completedAt": 100,
+            }
+        )
+        tasks.document("completed-new").set(
+            {
+                "routeNumber": "989567",
+                "teamMemberUid": "member-1",
+                "task": "Completed new",
+                "status": "completed",
+                "completedAt": 200,
+            }
+        )
+
+        with patch.object(team_tasks, "require_route_access", return_value=_owner_user()):
+            response = await _unwrap(team_tasks.list_team_tasks)(
+                request=None,
+                route="989567",
+                limit=100,
+                decoded_token={"uid": "owner-1"},
+                db=db,
+            )
+
+        self.assertEqual(
+            [task["id"] for task in response["tasks"]],
+            ["overdue", "upcoming", "no-due-new", "completed-new", "completed-old"],
+        )
 
     async def test_non_owner_cannot_create_task(self):
         db = _build_db()

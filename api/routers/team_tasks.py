@@ -8,8 +8,9 @@ directly, and no route entitlement gate is applied to collaboration data.
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, time, timezone
 from typing import Any, Dict, List, Literal, Optional
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from google.cloud import firestore
@@ -18,6 +19,7 @@ from pydantic import BaseModel, Field
 from ..dependencies import (
     _resolve_owner_uid_for_route,
     get_firestore,
+    get_route_timezone,
     require_route_access,
     verify_firebase_token,
 )
@@ -30,12 +32,40 @@ logger = logging.getLogger("api.team_tasks")
 
 TEAM_TASK_LIMIT_DEFAULT = 100
 TEAM_TASK_LIMIT_MAX = 100
+DEFAULT_ROUTE_TIMEZONE = "America/Denver"
+
+
+class TeamTaskDueTime(BaseModel):
+    hour: int = Field(..., ge=1, le=12)
+    minute: int = Field(..., ge=0, le=59)
+    period: Literal["AM", "PM"]
+
+
+class TeamTaskScheduleFields(BaseModel):
+    dueDate: Optional[str] = Field(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$")
+    dueTime: Optional[TeamTaskDueTime] = None
+    reminderEnabled: Optional[bool] = False
+    reminderOffsetMinutes: Optional[int] = Field(default=None, ge=0, le=1440)
 
 
 class TeamTaskCreateRequest(BaseModel):
     routeNumber: str = Field(..., pattern=r"^\d{1,10}$")
     teamMemberUid: str = Field(..., min_length=1, max_length=128)
     task: str = Field(..., min_length=1, max_length=500)
+    dueDate: Optional[str] = Field(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$")
+    dueTime: Optional[TeamTaskDueTime] = None
+    reminderEnabled: Optional[bool] = False
+    reminderOffsetMinutes: Optional[int] = Field(default=None, ge=0, le=1440)
+
+
+class TeamTaskUpdateRequest(BaseModel):
+    routeNumber: str = Field(..., pattern=r"^\d{1,10}$")
+    teamMemberUid: Optional[str] = Field(default=None, min_length=1, max_length=128)
+    task: Optional[str] = Field(default=None, min_length=1, max_length=500)
+    dueDate: Optional[str] = Field(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$")
+    dueTime: Optional[TeamTaskDueTime] = None
+    reminderEnabled: Optional[bool] = False
+    reminderOffsetMinutes: Optional[int] = Field(default=None, ge=0, le=1440)
 
 
 class TeamTaskCompleteRequest(BaseModel):
@@ -50,6 +80,14 @@ class TeamTaskResponse(BaseModel):
     teamMemberDisplay: str
     task: str
     status: Literal["open", "completed"]
+    dueDate: Optional[str] = None
+    dueTime: Optional[TeamTaskDueTime] = None
+    timezone: Optional[str] = None
+    dueAtMs: Optional[int] = None
+    reminderEnabled: bool = False
+    reminderOffsetMinutes: Optional[int] = None
+    reminderAtMs: Optional[int] = None
+    reminderStatus: Literal["none", "pending", "sending", "sent", "skipped", "failed"] = "none"
     createdAtMs: Optional[int] = None
     updatedAtMs: Optional[int] = None
     completedAtMs: Optional[int] = None
@@ -101,6 +139,148 @@ def _safe_text(value: Any, max_len: int) -> str:
     return str(value or "").strip()[:max_len]
 
 
+def _normalize_due_time(value: Any) -> Optional[Dict[str, Any]]:
+    if value is None:
+        return None
+    if isinstance(value, TeamTaskDueTime):
+        return value.model_dump()
+    if not isinstance(value, dict):
+        return None
+    try:
+        return TeamTaskDueTime(**value).model_dump()
+    except Exception:
+        return None
+
+
+def _route_timezone(db: firestore.Client, route_number: str) -> str:
+    tz_name = str(get_route_timezone(db, route_number) or "").strip() or DEFAULT_ROUTE_TIMEZONE
+    try:
+        ZoneInfo(tz_name)
+        return tz_name
+    except ZoneInfoNotFoundError:
+        return DEFAULT_ROUTE_TIMEZONE
+
+
+def _due_datetime_ms(due_date: str, due_time: Optional[TeamTaskDueTime], tz_name: str) -> int:
+    try:
+        parsed_date = datetime.strptime(due_date, "%Y-%m-%d").date()
+    except ValueError:
+        raise HTTPException(400, "Invalid due date")
+
+    if due_time:
+        hour = due_time.hour % 12
+        if due_time.period == "PM":
+            hour += 12
+        due_clock = time(hour=hour, minute=due_time.minute)
+        due_dt = datetime.combine(parsed_date, due_clock, tzinfo=ZoneInfo(tz_name))
+    else:
+        due_dt = datetime.combine(parsed_date, time(23, 59, 59, 999000), tzinfo=ZoneInfo(tz_name))
+    return int(due_dt.timestamp() * 1000)
+
+
+def _schedule_fields(
+    db: firestore.Client,
+    route_number: str,
+    payload: TeamTaskScheduleFields,
+) -> Dict[str, Any]:
+    due_date = str(payload.dueDate or "").strip() or None
+    due_time = payload.dueTime
+    reminder_enabled = bool(payload.reminderEnabled)
+    reminder_offset = payload.reminderOffsetMinutes
+
+    if due_time and not due_date:
+        raise HTTPException(400, "Due time requires a due date")
+    if reminder_enabled and not due_date:
+        raise HTTPException(400, "Reminder requires a due date")
+    if reminder_enabled and not due_time:
+        raise HTTPException(400, "Reminder requires a due time")
+    if reminder_enabled and reminder_offset is None:
+        raise HTTPException(400, "Reminder timeframe is required")
+
+    if not due_date:
+        return {
+            "dueDate": None,
+            "dueTime": None,
+            "timezone": None,
+            "dueAtMs": None,
+            "reminderEnabled": False,
+            "reminderOffsetMinutes": None,
+            "reminderAtMs": None,
+            "reminderStatus": "none",
+        }
+
+    tz_name = _route_timezone(db, route_number)
+    due_at_ms = _due_datetime_ms(due_date, due_time, tz_name)
+    reminder_at_ms = None
+    reminder_status = "none"
+    if reminder_enabled and due_time:
+        reminder_at_ms = due_at_ms - int(reminder_offset or 0) * 60 * 1000
+        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        reminder_status = "skipped" if reminder_at_ms <= now_ms or now_ms >= due_at_ms else "pending"
+
+    return {
+        "dueDate": due_date,
+        "dueTime": due_time.model_dump() if due_time else None,
+        "timezone": tz_name,
+        "dueAtMs": due_at_ms,
+        "reminderEnabled": bool(reminder_enabled and due_time),
+        "reminderOffsetMinutes": reminder_offset if reminder_enabled and due_time else None,
+        "reminderAtMs": reminder_at_ms,
+        "reminderStatus": reminder_status,
+    }
+
+
+def _assignment_notification_body(route_number: str, task_text: str, owner_display: str, schedule: Dict[str, Any]) -> str:
+    lines = [f"Route: {route_number}", f"Task: {task_text}"]
+    if schedule.get("dueDate"):
+        due_line = f"Due: {schedule['dueDate']}"
+        due_time = _normalize_due_time(schedule.get("dueTime"))
+        if due_time:
+            due_line += f" {due_time['hour']}:{str(due_time['minute']).zfill(2)} {due_time['period']}"
+        lines.append(due_line)
+    lines.append(f"Assigned by: {owner_display}")
+    return "\n".join(lines)
+
+
+def _schedule_from_update_payload(
+    db: firestore.Client,
+    route_number: str,
+    payload: TeamTaskUpdateRequest,
+    current: Dict[str, Any],
+) -> Dict[str, Any]:
+    fields_set = payload.model_fields_set
+    existing_due_time = _normalize_due_time(current.get("dueTime"))
+    existing_offset = current.get("reminderOffsetMinutes")
+    due_date = payload.dueDate if "dueDate" in fields_set else current.get("dueDate")
+    due_time = (
+        payload.dueTime
+        if "dueTime" in fields_set
+        else (TeamTaskDueTime(**existing_due_time) if existing_due_time else None)
+    )
+    reminder_enabled = payload.reminderEnabled if "reminderEnabled" in fields_set else bool(current.get("reminderEnabled"))
+    reminder_offset = (
+        payload.reminderOffsetMinutes
+        if "reminderOffsetMinutes" in fields_set
+        else (existing_offset if isinstance(existing_offset, int) else None)
+    )
+
+    if "dueDate" in fields_set and not payload.dueDate and "dueTime" not in fields_set:
+        due_time = None
+    if due_time is None and "reminderEnabled" not in fields_set:
+        reminder_enabled = False
+    if not due_date:
+        reminder_enabled = False
+        reminder_offset = None
+
+    schedule_payload = TeamTaskScheduleFields(
+        dueDate=due_date,
+        dueTime=due_time,
+        reminderEnabled=reminder_enabled,
+        reminderOffsetMinutes=reminder_offset,
+    )
+    return _schedule_fields(db, route_number, schedule_payload)
+
+
 def _display_for_user(uid: str, user_data: Dict[str, Any]) -> str:
     profile = user_data.get("profile", {}) or {}
     return (
@@ -146,6 +326,14 @@ def _serialize_task(route_number: str, doc: Any) -> Dict[str, Any]:
         "teamMemberDisplay": str(data.get("teamMemberDisplay") or ""),
         "task": str(data.get("task") or ""),
         "status": "completed" if str(data.get("status") or "").strip() == "completed" else "open",
+        "dueDate": data.get("dueDate") if isinstance(data.get("dueDate"), str) else None,
+        "dueTime": _normalize_due_time(data.get("dueTime")),
+        "timezone": data.get("timezone") if isinstance(data.get("timezone"), str) else None,
+        "dueAtMs": _to_millis(data.get("dueAtMs")),
+        "reminderEnabled": bool(data.get("reminderEnabled")),
+        "reminderOffsetMinutes": data.get("reminderOffsetMinutes") if isinstance(data.get("reminderOffsetMinutes"), int) else None,
+        "reminderAtMs": _to_millis(data.get("reminderAtMs")),
+        "reminderStatus": str(data.get("reminderStatus") or "none"),
         "createdAtMs": _to_millis(data.get("createdAt")),
         "updatedAtMs": _to_millis(data.get("updatedAt")),
         "completedAtMs": _to_millis(data.get("completedAt")),
@@ -231,8 +419,21 @@ async def list_team_tasks(
             continue
         tasks.append(task)
 
-    tasks.sort(key=lambda task: (task.get("status") == "completed", -(task.get("createdAtMs") or 0)))
+    tasks.sort(key=_task_sort_key)
     return {"ok": True, "tasks": tasks}
+
+
+def _task_sort_key(task: Dict[str, Any]):
+    status_completed = task.get("status") == "completed"
+    if status_completed:
+        return (1, -(task.get("completedAtMs") or task.get("updatedAtMs") or task.get("createdAtMs") or 0))
+
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    due_at = task.get("dueAtMs")
+    if isinstance(due_at, int):
+        bucket = 0 if due_at < now_ms else 1
+        return (0, bucket, due_at, -(task.get("createdAtMs") or 0))
+    return (0, 2, 0, -(task.get("createdAtMs") or 0))
 
 
 @router.get(
@@ -307,6 +508,7 @@ async def create_team_task(
 
     owner_display = _display_for_user(owner_uid, owner_data)
     member_display = _display_for_user(team_member_uid, member_data)
+    schedule = _schedule_fields(db, route_number, payload)
     task_ref = _team_tasks_collection(db, route_number).document()
     task_ref.set(
         {
@@ -318,11 +520,12 @@ async def create_team_task(
             "status": "open",
             "createdAt": firestore.SERVER_TIMESTAMP,
             "updatedAt": firestore.SERVER_TIMESTAMP,
+            **schedule,
         },
         merge=False,
     )
 
-    body = f"Route: {route_number}\nTask: {task_text}\nAssigned by: {owner_display}"
+    body = _assignment_notification_body(route_number, task_text, owner_display, schedule)
     notification = _notify_user(
         db,
         uid=team_member_uid,
@@ -333,6 +536,75 @@ async def create_team_task(
         user_data=member_data,
     )
     return {"ok": True, "taskId": task_ref.id, "notification": notification}
+
+
+@router.patch(
+    "/team-tasks/{task_id}",
+    responses={400: {"model": ErrorResponse}, 401: {"model": ErrorResponse}, 403: {"model": ErrorResponse}, 404: {"model": ErrorResponse}, 409: {"model": ErrorResponse}},
+)
+@rate_limit_write
+async def update_team_task(
+    request: Request,
+    task_id: str,
+    payload: TeamTaskUpdateRequest,
+    decoded_token: dict = Depends(verify_firebase_token),
+    db: firestore.Client = Depends(get_firestore),
+) -> Dict[str, Any]:
+    """Update a Team Task. Owner-only."""
+    route_number = payload.routeNumber
+    owner_uid = decoded_token["uid"]
+    owner_data = await require_route_access(route_number, decoded_token, db)
+    if not _is_owner_for_route(owner_data, route_number):
+        raise HTTPException(403, "Owner access required")
+
+    task_ref = _team_task_ref(db, route_number, task_id)
+    snap = task_ref.get()
+    if not snap.exists:
+        raise HTTPException(404, "Team task not found")
+    current = snap.to_dict() or {}
+    if str(current.get("routeNumber") or route_number) != route_number:
+        raise HTTPException(404, "Team task not found")
+
+    task_text = _safe_text(payload.task if payload.task is not None else current.get("task"), 500)
+    if not task_text:
+        raise HTTPException(400, "Task text is required")
+
+    previous_member_uid = str(current.get("teamMemberUid") or "")
+    team_member_uid = payload.teamMemberUid.strip() if payload.teamMemberUid is not None else previous_member_uid
+    if not team_member_uid or team_member_uid == owner_uid:
+        raise HTTPException(409, "Assign the task to an approved team member")
+
+    member_data = _user_doc_data(db, team_member_uid)
+    if not member_data or not _is_approved_team_member(member_data, route_number):
+        raise HTTPException(403, "Approved team member required")
+    member_display = _display_for_user(team_member_uid, member_data)
+    schedule = _schedule_from_update_payload(db, route_number, payload, current)
+
+    update_payload = {
+        "teamMemberUid": team_member_uid,
+        "teamMemberDisplay": member_display,
+        "task": task_text,
+        "updatedAt": firestore.SERVER_TIMESTAMP,
+        **schedule,
+    }
+    task_ref.set(update_payload, merge=True)
+
+    reassigned = team_member_uid != previous_member_uid
+    notification = None
+    if reassigned:
+        owner_display = _display_for_user(owner_uid, owner_data)
+        body = _assignment_notification_body(route_number, task_text, owner_display, schedule)
+        notification = _notify_user(
+            db,
+            uid=team_member_uid,
+            title="New team task assigned",
+            body=body,
+            notification_type="team_task_assigned",
+            data={"routeNumber": route_number, "taskId": task_id, "target": "teamTasks"},
+            user_data=member_data,
+        )
+
+    return {"ok": True, "taskId": task_id, "reassigned": reassigned, "notification": notification}
 
 
 @router.post(

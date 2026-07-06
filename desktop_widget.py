@@ -41,17 +41,42 @@ WIDGET_LOG_FILE = Path.home() / 'Library' / 'Logs' / 'routespark-widget.log'
 BACKUP_LOG_FILE = Path.home() / 'Library' / 'Logs' / 'routespark-critical-backup.log'
 ARCHIVE_SYNC_LOG_FILE = Path.home() / 'Library' / 'Logs' / 'routespark-pcf-archive-sync.log'
 PCF_RECONCILER_HEARTBEAT_FILE = Path.home() / 'projects' / 'pcf_pipeline' / 'logs' / 'reconciler' / 'archive_selector_heartbeat.json'
-ARCHIVE_SSH_HOST = "keylay@100.64.201.120"
+ARCHIVE_SSH_HOST = "keylay@192.168.1.42"
 ARCHIVE_PURGE_SERVICE_NAME = "Archive Purge Worker"
 logger = logging.getLogger("routespark_widget")
 
 TELEGRAM_INCIDENT_ROUTING = {
+    "Public API Probe": {
+        "incident_code": "PUBLIC_API_PROBE_DOWN",
+        "runbook": "OCCODEX_API_INCIDENT_RUNBOOK.md",
+        "target": "CLUSTER",
+        "severity": "high",
+        "service": "api.routespark.pro",
+        "summary": "Public API health probe failed, but direct API/PostgreSQL checks did not corroborate a full outage.",
+    },
+    "API Container": {
+        "incident_code": "API_CONTAINER_DOWN",
+        "runbook": "OCCODEX_API_INCIDENT_RUNBOOK.md",
+        "target": "CLUSTER",
+        "severity": "high",
+        "service": "web-api",
+        "summary": "web-api deployment health check failed.",
+    },
+    "PostgreSQL": {
+        "incident_code": "POSTGRES_DOWN",
+        "runbook": "OCCODEX_API_INCIDENT_RUNBOOK.md",
+        "target": "CLUSTER",
+        "severity": "high",
+        "service": "postgresql",
+        "summary": "PostgreSQL SELECT 1 health check failed.",
+    },
     "API + PostgreSQL": {
         "incident_code": "API_DOWN",
         "runbook": "OCCODEX_API_INCIDENT_RUNBOOK.md",
         "target": "CLUSTER",
         "severity": "high",
         "service": "api.routespark.pro",
+        "summary": "Public API health probe failed and direct API/PostgreSQL checks also failed.",
     },
 }
 
@@ -96,7 +121,7 @@ DEFAULT_SETTINGS = {
     'refresh_interval_ms': 5000,
     # Optional: notify when a service recovers
     'notify_recovery': False,
-    # Optional override for server API base URL (e.g., http://100.64.201.120:8000)
+    # Optional override for server API base URL (e.g., http://192.168.1.42:8000)
     'server_api_url': SERVER_API_URL,
     # Log level (INFO, WARNING, ERROR)
     'log_level': 'INFO',
@@ -213,7 +238,9 @@ def _build_incident_payload(service_name: str, settings: dict) -> dict | None:
     if not routing:
         return None
 
-    if routing['incident_code'] == "API_DOWN":
+    if "summary" in routing:
+        summary = routing["summary"]
+    elif routing['incident_code'] == "API_DOWN":
         threshold = int(settings.get('server_failure_threshold', 3))
         summary = f"Public API health check failed {threshold} consecutive probes."
     else:
@@ -879,6 +906,10 @@ class RouteSparkWidget(QWidget):
             return True
         return False
 
+    def _server_down_service_name(self) -> str:
+        """Return the service label to use when the public probe goes down."""
+        return self.server_row.name
+
     def _probe_server_health(self) -> ProbeResult:
         """Return a timestamped server health probe result."""
         timeout_seconds = int(self.settings.get('server_check_timeout_seconds', 5))
@@ -974,7 +1005,7 @@ class RouteSparkWidget(QWidget):
         logger.info("Server transition %s -> %s", transition.old_status, transition.new_status)
 
         if transition.should_notify_down:
-            service_name = self.server_row.name
+            service_name = self._server_down_service_name()
             timestamp = datetime.now().strftime('%H:%M:%S')
             title = "RouteSpark Service Down"
             message = f"{service_name} stopped at {timestamp}"
@@ -1100,7 +1131,7 @@ class RouteSparkWidget(QWidget):
         layout.addLayout(server_header)
         
         # Server info rows
-        self.server_row = ServiceRow("API + PostgreSQL", is_server=True)
+        self.server_row = ServiceRow("Public API Probe", is_server=True)
         layout.addWidget(self.server_row)
 
         self.firebase_row = ServiceRow("Firebase", is_server=True)

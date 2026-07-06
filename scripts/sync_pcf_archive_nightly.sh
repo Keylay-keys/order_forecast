@@ -17,7 +17,7 @@ PCF_VENV_PYTHON="$PCF_DIR/.venv/bin/python"
 
 echo "$(date): Starting PCF archive sync" >> "$LOG_FILE"
 
-export PCF_ARCHIVE_REMOTE="keylay@100.64.201.120:/mnt/archive/pcf/pcf_archive"
+export PCF_ARCHIVE_REMOTE="keylay@192.168.1.42:/mnt/archive/pcf/pcf_archive"
 
 # Run the sync script
 cd "$PCF_DIR"
