@@ -36,6 +36,10 @@ EXPO_PUSH_URL = "https://exp.host/--/api/v2/push/send"
 LOW_QTY_NOTIFICATIONS_ENABLED = os.environ.get("LOW_QTY_NOTIFICATIONS_ENABLED", "true").lower() == "true"
 LOW_QTY_NOTIFICATION_DRY_RUN = os.environ.get("LOW_QTY_NOTIFICATION_DRY_RUN", "false").lower() == "true"
 CHECK_INTERVAL_SECONDS = int(os.environ.get("LOW_QTY_NOTIFICATION_CHECK_INTERVAL_SECONDS", "60"))
+DEFAULT_REMINDER_TOLERANCE_MINUTES = int(os.environ.get("LOW_QTY_NOTIFICATION_TOLERANCE_MINUTES", "2"))
+DEFAULT_ONCE_LATE_TOLERANCE_MINUTES = int(
+    os.environ.get("LOW_QTY_NOTIFICATION_ONCE_LATE_TOLERANCE_MINUTES", "20")
+)
 
 # In-memory cache of users with reminders enabled
 # Updated by snapshot listener
@@ -246,6 +250,31 @@ def is_reminder_time_now(reminder_time: Dict, timezone: str, tolerance_minutes: 
     return abs(current_minutes - target_minutes) <= tolerance_minutes
 
 
+def is_reminder_time_due(
+    reminder_time: Dict,
+    timezone: str,
+    *,
+    early_tolerance_minutes: int = 2,
+    late_tolerance_minutes: int = 2,
+) -> bool:
+    """Check whether the reminder is due in the user's local day.
+
+    CronJob mode uses a larger late tolerance so a delayed or skipped run can
+    still send the reminder once. The sent-table dedupe prevents repeat sends.
+    """
+    try:
+        tz = pytz.timezone(timezone)
+    except pytz.UnknownTimeZoneError:
+        tz = pytz.timezone("America/Denver")
+
+    now = datetime.now(tz)
+    current_minutes = now.hour * 60 + now.minute
+    target_minutes = reminder_time_to_minutes(reminder_time)
+    delta = current_minutes - target_minutes
+
+    return -early_tolerance_minutes <= delta <= late_tolerance_minutes
+
+
 def get_fcm_tokens(db: firestore.Client, user_id: str) -> List[str]:
     """Get FCM tokens for a user."""
     user_doc = db.collection("users").document(user_id).get()
@@ -360,7 +389,12 @@ def send_push_notification(fcm_tokens: List[str], title: str, body: str, data: D
     return total_success > 0
 
 
-def check_and_notify(db: firestore.Client) -> None:
+def check_and_notify(
+    db: firestore.Client,
+    *,
+    early_tolerance_minutes: int = DEFAULT_REMINDER_TOLERANCE_MINUTES,
+    late_tolerance_minutes: int = DEFAULT_REMINDER_TOLERANCE_MINUTES,
+) -> None:
     """Check all users and send notifications if it's their reminder time.
 
     Called every 60 seconds by the main loop.
@@ -378,7 +412,12 @@ def check_and_notify(db: firestore.Client) -> None:
             continue
         
         # Check if it's reminder time for this user
-        if not is_reminder_time_now(reminder_time, timezone):
+        if not is_reminder_time_due(
+            reminder_time,
+            timezone,
+            early_tolerance_minutes=early_tolerance_minutes,
+            late_tolerance_minutes=late_tolerance_minutes,
+        ):
             continue
         
         print(f"  [check] Reminder time for user {user_id} (route {route_number})")
@@ -453,7 +492,12 @@ def check_and_notify(db: firestore.Client) -> None:
             print(f"    ❌ Error processing user {user_id}: {e}")
 
 
-def run_daemon(sa_path: str, *, run_once: bool = False) -> None:
+def run_daemon(
+    sa_path: str,
+    *,
+    run_once: bool = False,
+    once_late_tolerance_minutes: int = DEFAULT_ONCE_LATE_TOLERANCE_MINUTES,
+) -> None:
     """Main daemon loop."""
     global _users_watcher
 
@@ -471,7 +515,11 @@ def run_daemon(sa_path: str, *, run_once: bool = False) -> None:
         loaded = load_reminder_cache_once(db)
         print(f"  [cache] {loaded} users with reminders enabled (one-time scan)")
         if LOW_QTY_NOTIFICATIONS_ENABLED:
-            check_and_notify(db)
+            check_and_notify(
+                db,
+                early_tolerance_minutes=DEFAULT_REMINDER_TOLERANCE_MINUTES,
+                late_tolerance_minutes=once_late_tolerance_minutes,
+            )
         else:
             print("  [skip] LOW_QTY_NOTIFICATIONS_ENABLED=false; notification cycle skipped")
         return
@@ -512,6 +560,16 @@ if __name__ == "__main__":
         action='store_true',
         help='Run a single reminder scan/check cycle and exit'
     )
+    parser.add_argument(
+        '--once-late-tolerance-minutes',
+        type=int,
+        default=DEFAULT_ONCE_LATE_TOLERANCE_MINUTES,
+        help='Late catch-up window for --once CronJob mode'
+    )
     
     args = parser.parse_args()
-    run_daemon(args.serviceAccount, run_once=bool(args.once))
+    run_daemon(
+        args.serviceAccount,
+        run_once=bool(args.once),
+        once_late_tolerance_minutes=args.once_late_tolerance_minutes,
+    )
