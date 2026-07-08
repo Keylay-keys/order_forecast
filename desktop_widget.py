@@ -1173,10 +1173,10 @@ class RouteSparkWidget(QWidget):
         
         # Mac section header
         mac_header = QHBoxLayout()
-        mac_label = QLabel("🍎 Mac-Only")
-        mac_label.setFont(QFont("SF Pro Display", 10, QFont.Weight.Bold))
-        mac_label.setStyleSheet(f"color: {COLORS['green']};")
-        mac_header.addWidget(mac_label)
+        self.mac_section_label = QLabel("🍎 Mac-Only")
+        self.mac_section_label.setFont(QFont("SF Pro Display", 10, QFont.Weight.Bold))
+        self.mac_section_label.setStyleSheet(f"color: {COLORS['green']};")
+        mac_header.addWidget(self.mac_section_label)
         
         self.mac_status = QLabel("")
         self.mac_status.setFont(QFont("SF Mono", 9))

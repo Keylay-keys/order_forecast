@@ -110,6 +110,7 @@ def run_json(args):
 snapshot = {
     "deployments": run_json(["k3s", "kubectl", "get", "deploy", "-A", "-o", "json"]),
     "cronjobs": run_json(["k3s", "kubectl", "get", "cronjob", "-A", "-o", "json"]),
+    "jobs": run_json(["k3s", "kubectl", "get", "jobs", "-A", "-o", "json"]),
 }
 print(json.dumps(snapshot))
 PY
@@ -160,6 +161,24 @@ def _find_cronjob(snapshot: dict | None, namespace: str, name: str) -> dict | No
         if metadata.get("namespace") == namespace and metadata.get("name") == name:
             return item
     return None
+
+
+def _jobs_for_cronjob(snapshot: dict | None, namespace: str, name: str) -> list[dict]:
+    if not snapshot:
+        return []
+    prefix = f"{name}-"
+    matches = []
+    for item in snapshot.get("jobs", {}).get("items", []):
+        metadata = item.get("metadata", {})
+        if metadata.get("namespace") != namespace:
+            continue
+        if str(metadata.get("name", "")).startswith(prefix):
+            matches.append(item)
+    return sorted(
+        matches,
+        key=lambda item: item.get("metadata", {}).get("creationTimestamp", ""),
+        reverse=True,
+    )
 
 
 def _deployment_running(snapshot: dict | None, namespace: str, name: str) -> tuple[bool, str]:
@@ -360,11 +379,24 @@ def _cronjob_info(snapshot: dict | None, namespace: str, name: str) -> tuple[boo
 
     active = len(status.get("active", []))
     if active > 0:
-        return True, "RUN"
+        return True, "CRON RUN"
+
+    latest_job = next(iter(_jobs_for_cronjob(snapshot, namespace, name)), None)
+    if latest_job:
+        latest_status = latest_job.get("status", {})
+        failed = int(latest_status.get("failed", 0) or 0)
+        succeeded = int(latest_status.get("succeeded", 0) or 0)
+        completion = latest_status.get("completionTime", "")
+        started = latest_status.get("startTime", "")
+        if failed > 0 and succeeded <= 0:
+            ts = completion or started
+            return False, f"FAIL {base.format_archive_timestamp(ts)}" if ts else "FAIL"
+        if succeeded > 0 and completion:
+            return True, f"OK {base.format_archive_timestamp(completion)}"
 
     last_successful = status.get("lastSuccessfulTime", "")
     if last_successful:
-        return True, base.format_archive_timestamp(last_successful)
+        return True, f"OK {base.format_archive_timestamp(last_successful)}"
 
     last_schedule = status.get("lastScheduleTime", "")
     if last_schedule:
@@ -477,8 +509,13 @@ class ClusterWidget(base.RouteSparkWidget):
             base.save_settings(self.settings)
         self.archive_sync_row.name = "Archive Fresh"
         self.archive_sync_row.label.setText("Archive Fresh")
-        self.reconciler_row.name = "Low-Qty"
-        self.reconciler_row.label.setText("Low-Qty")
+        if hasattr(self, "mac_section_label"):
+            self.mac_section_label.setText("🍎 Local + Cluster Jobs")
+        self.reconciler_row.name = "Low-Qty CronJob"
+        self.reconciler_row.is_server = True
+        self.reconciler_row.label.setText("Low-Qty Cron")
+        self.start_btn.setText("▶ Start Local")
+        self.stop_btn.setText("⏹ Stop Local")
 
     def _server_down_service_name(self) -> str:
         api_health = self.server_health.get("apiContainerHealth", {})
