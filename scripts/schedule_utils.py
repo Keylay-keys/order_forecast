@@ -6,6 +6,11 @@ from datetime import datetime, date
 from typing import Optional, Dict
 
 try:
+    from .schedule_cycle import get_schedule_key_for_delivery_date, normalize_order_cycle
+except ImportError:
+    from schedule_cycle import get_schedule_key_for_delivery_date, normalize_order_cycle
+
+try:
     import psycopg2
     from psycopg2.extras import RealDictCursor
     PG_AVAILABLE = True
@@ -71,14 +76,6 @@ def get_order_day_for_delivery(db, route_number: str, delivery_date_str: str) ->
     Raises:
         ValueError: If schedule data not found (no guessing/hardcoding)
     """
-    DAY_NUM_TO_NAME = {1: 'monday', 2: 'tuesday', 3: 'wednesday', 
-                       4: 'thursday', 5: 'friday', 6: 'saturday', 7: 'sunday'}
-    DAY_NAME_TO_NUM = {v: k for k, v in DAY_NUM_TO_NAME.items()}
-    
-    # Get delivery day of week (1=Monday, 7=Sunday)
-    delivery_dow = weekday_key(delivery_date_str)
-    delivery_day_num = DAY_NAME_TO_NUM.get(delivery_dow, 0)
-    
     # Get order cycles from data (PostgreSQL first, then Firebase/legacy)
     cycles = get_order_cycles(db, route_number)
     
@@ -88,19 +85,15 @@ def get_order_day_for_delivery(db, route_number: str, delivery_date_str: str) ->
             f"Check: users/{{uid}}/userSettings.notifications.scheduling.orderCycles"
         )
     
-    # Find cycle that delivers on this day (check both deliveryDay and loadDay)
-    for cycle in cycles:
-        cycle_delivery_day = cycle.get('deliveryDay')
-        cycle_load_day = cycle.get('loadDay')
-        
-        # Match if delivery date matches cycle's deliveryDay OR loadDay
-        # (loadDay match handles stores like Bowman's that get same-day delivery)
-        if delivery_day_num in (cycle_delivery_day, cycle_load_day):
-            order_day = cycle.get('orderDay', 1)
-            return DAY_NUM_TO_NAME.get(order_day, 'monday')
+    resolution = get_schedule_key_for_delivery_date(
+        normalize_delivery_date(delivery_date_str),
+        cycles,
+    )
+    if resolution:
+        return resolution["scheduleKey"]
     
     raise ValueError(
-        f"[schedule_utils] No cycle found for delivery day '{delivery_dow}' (day {delivery_day_num}). "
+        f"[schedule_utils] No cycle found for delivery date '{delivery_date_str}'. "
         f"Available cycles: {cycles}"
     )
 
@@ -128,7 +121,14 @@ def get_order_cycles_from_postgres(route_number: str) -> list:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute(
                 """
-                SELECT order_day, load_day, delivery_day
+                SELECT
+                    order_day,
+                    load_day,
+                    delivery_day,
+                    load_offset_days,
+                    delivery_offset_days,
+                    schedule_version,
+                    needs_schedule_review
                 FROM user_schedules
                 WHERE route_number = %s AND is_active = TRUE
                 ORDER BY order_day
@@ -138,11 +138,15 @@ def get_order_cycles_from_postgres(route_number: str) -> list:
             rows = cur.fetchall()
         cycles = []
         for row in rows:
-            cycles.append({
+            cycles.append(normalize_order_cycle({
                 'orderDay': row.get('order_day'),
                 'loadDay': row.get('load_day'),
                 'deliveryDay': row.get('delivery_day'),
-            })
+                'loadOffsetDays': row.get('load_offset_days'),
+                'deliveryOffsetDays': row.get('delivery_offset_days'),
+                'scheduleVersion': row.get('schedule_version'),
+                'needsScheduleReview': row.get('needs_schedule_review'),
+            }))
         return cycles
     except Exception as e:
         print(f"[schedule_utils] Warning: Could not get order cycles from PostgreSQL: {e}")
@@ -182,7 +186,7 @@ def get_order_cycles(db, route_number: str) -> list:
         
         if route_doc.exists:
             route_data = route_doc.to_dict() or {}
-            user_id = route_data.get('userId')
+            user_id = route_data.get('ownerUid') or route_data.get('userId')
         
         # If no route doc, find the OWNER user (role='owner') with this route
         if not user_id:
@@ -220,11 +224,11 @@ def get_order_cycles(db, route_number: str) -> list:
                 cycles = scheduling.get('orderCycles', [])
                 
                 if cycles:
-                    return cycles
+                    return [normalize_order_cycle(cycle) for cycle in cycles]
                 
                 # Fallback: check old path settings.orderCycles
                 settings = user_data.get('settings', {})
-                return settings.get('orderCycles', [])
+                return [normalize_order_cycle(cycle) for cycle in settings.get('orderCycles', [])]
     except Exception as e:
         print(f"[schedule_utils] Warning: Could not get order cycles from Firebase: {e}")
     return []

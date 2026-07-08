@@ -27,6 +27,11 @@ import psycopg2
 from psycopg2.extras import execute_values, RealDictCursor
 from google.cloud import firestore  # type: ignore
 
+try:
+    from .schedule_cycle import normalize_order_cycle
+except ImportError:
+    from schedule_cycle import normalize_order_cycle
+
 # Worker ID for this instance
 WORKER_ID = f"config-sync-{socket.gethostname()}-{os.getpid()}"
 
@@ -337,8 +342,8 @@ def sync_user_schedules_to_pg(route_number: str, user_id: str, order_cycles: Lis
     conn = get_pg_connection()
 
     day_names = {
-        0: 'sunday', 1: 'monday', 2: 'tuesday', 3: 'wednesday',
-        4: 'thursday', 5: 'friday', 6: 'saturday',
+        1: 'monday', 2: 'tuesday', 3: 'wednesday', 4: 'thursday',
+        5: 'friday', 6: 'saturday', 7: 'sunday',
     }
 
     try:
@@ -352,9 +357,14 @@ def sync_user_schedules_to_pg(route_number: str, user_id: str, order_cycles: Lis
 
                 # Insert/update each cycle
                 for i, cycle in enumerate(order_cycles):
-                    order_day = cycle.get('orderDay', 1)
-                    load_day = cycle.get('loadDay', 3)
-                    delivery_day = cycle.get('deliveryDay', 4)
+                    normalized_cycle = normalize_order_cycle(cycle)
+                    order_day = normalized_cycle['orderDay']
+                    load_day = normalized_cycle['loadDay']
+                    delivery_day = normalized_cycle['deliveryDay']
+                    load_offset_days = normalized_cycle['loadOffsetDays']
+                    delivery_offset_days = normalized_cycle['deliveryOffsetDays']
+                    schedule_version = normalized_cycle['scheduleVersion']
+                    needs_schedule_review = normalized_cycle['needsScheduleReview']
                     schedule_key = day_names.get(order_day, 'unknown')
 
                     schedule_id = f"{route_number}-cycle-{i}"
@@ -362,13 +372,18 @@ def sync_user_schedules_to_pg(route_number: str, user_id: str, order_cycles: Lis
                     cur.execute("""
                         INSERT INTO user_schedules (
                             id, route_number, user_id, order_day, load_day, delivery_day,
+                            load_offset_days, delivery_offset_days, schedule_version, needs_schedule_review,
                             schedule_key, is_active, synced_at
                         )
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                         ON CONFLICT (id) DO UPDATE SET
                             order_day = EXCLUDED.order_day,
                             load_day = EXCLUDED.load_day,
                             delivery_day = EXCLUDED.delivery_day,
+                            load_offset_days = EXCLUDED.load_offset_days,
+                            delivery_offset_days = EXCLUDED.delivery_offset_days,
+                            schedule_version = EXCLUDED.schedule_version,
+                            needs_schedule_review = EXCLUDED.needs_schedule_review,
                             schedule_key = EXCLUDED.schedule_key,
                             is_active = EXCLUDED.is_active,
                             synced_at = EXCLUDED.synced_at
@@ -379,6 +394,10 @@ def sync_user_schedules_to_pg(route_number: str, user_id: str, order_cycles: Lis
                         order_day,
                         load_day,
                         delivery_day,
+                        load_offset_days,
+                        delivery_offset_days,
+                        schedule_version,
+                        needs_schedule_review,
                         schedule_key,
                         True,
                         now,

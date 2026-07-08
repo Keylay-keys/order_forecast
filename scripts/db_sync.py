@@ -41,6 +41,7 @@ try:
         load_promotions,
     )
     from .models import Product, StoreConfig, Order, StoreOrder, OrderItem
+    from .schedule_cycle import normalize_order_cycle
     FIREBASE_AVAILABLE = True
 except ImportError:
     try:
@@ -53,6 +54,7 @@ except ImportError:
             load_promotions,
         )
         from models import Product, StoreConfig, Order, StoreOrder, OrderItem
+        from schedule_cycle import normalize_order_cycle
         FIREBASE_AVAILABLE = True
     except ImportError as e:
         FIREBASE_AVAILABLE = False
@@ -559,9 +561,14 @@ class DuckDBSync:
 
             # Insert each cycle
             for i, cycle in enumerate(order_cycles):
-                order_day = cycle.get('orderDay', 1)
-                load_day = cycle.get('loadDay', 1)
-                delivery_day = cycle.get('deliveryDay', 1)
+                normalized_cycle = normalize_order_cycle(cycle)
+                order_day = normalized_cycle['orderDay']
+                load_day = normalized_cycle['loadDay']
+                delivery_day = normalized_cycle['deliveryDay']
+                load_offset_days = normalized_cycle['loadOffsetDays']
+                delivery_offset_days = normalized_cycle['deliveryOffsetDays']
+                schedule_version = normalized_cycle['scheduleVersion']
+                needs_schedule_review = normalized_cycle['needsScheduleReview']
 
                 # Generate schedule_key from ORDER day (matches user mental model)
                 # The retrain scheduler maps order_day → delivery_day for ML lookups
@@ -574,12 +581,17 @@ class DuckDBSync:
                 self.conn.execute("""
                     INSERT INTO user_schedules (
                         id, route_number, user_id, order_day, load_day, delivery_day,
+                        load_offset_days, delivery_offset_days, schedule_version, needs_schedule_review,
                         schedule_key, is_active, created_at, updated_at, synced_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, TRUE, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, TRUE, ?, ?, ?)
                     ON CONFLICT (id) DO UPDATE SET
                         order_day = EXCLUDED.order_day,
                         load_day = EXCLUDED.load_day,
                         delivery_day = EXCLUDED.delivery_day,
+                        load_offset_days = EXCLUDED.load_offset_days,
+                        delivery_offset_days = EXCLUDED.delivery_offset_days,
+                        schedule_version = EXCLUDED.schedule_version,
+                        needs_schedule_review = EXCLUDED.needs_schedule_review,
                         schedule_key = EXCLUDED.schedule_key,
                         updated_at = EXCLUDED.updated_at,
                         synced_at = EXCLUDED.synced_at
@@ -590,6 +602,10 @@ class DuckDBSync:
                     order_day,
                     load_day,
                     delivery_day,
+                    load_offset_days,
+                    delivery_offset_days,
+                    schedule_version,
+                    needs_schedule_review,
                     schedule_key,
                     now,
                     now,

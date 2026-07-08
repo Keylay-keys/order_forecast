@@ -42,6 +42,7 @@ try:
         evaluate_retrain_readiness,
     )
     from .retrain_runner import run_retrain_for_route
+    from .schedule_cycle import add_days, normalize_order_cycle
 except ImportError:
     from pg_utils import fetch_all, fetch_one
     from band_calibration import calibrate_route_if_due
@@ -55,6 +56,7 @@ except ImportError:
         evaluate_retrain_readiness,
     )
     from retrain_runner import run_retrain_for_route
+    from schedule_cycle import add_days, normalize_order_cycle
 
 DEFAULT_INTERVAL = 86400  # 24 hours (once per day)
 DEFAULT_SA_PATH = '/Users/kylemacmini/Desktop/dev/firebase-tools/routespark-1f47d-firebase-adminsdk-tnv5k-b259331cbc.json'
@@ -137,7 +139,15 @@ def get_upcoming_delivery_dates(route_number: str) -> list:
     """
     try:
         schedules = fetch_all("""
-            SELECT schedule_key, order_day, delivery_day
+            SELECT
+                schedule_key,
+                order_day,
+                load_day,
+                delivery_day,
+                load_offset_days,
+                delivery_offset_days,
+                schedule_version,
+                needs_schedule_review
             FROM user_schedules
             WHERE route_number = %s AND is_active = TRUE
         """, [route_number])
@@ -148,16 +158,23 @@ def get_upcoming_delivery_dates(route_number: str) -> list:
         today = datetime.now(timezone.utc).date()
         
         for sched in schedules:
-            delivery_dow = sched['delivery_day']  # 1=Mon, 7=Sun
             schedule_key = sched['schedule_key']
+            cycle = normalize_order_cycle({
+                "orderDay": sched.get("order_day"),
+                "loadDay": sched.get("load_day"),
+                "deliveryDay": sched.get("delivery_day"),
+                "loadOffsetDays": sched.get("load_offset_days"),
+                "deliveryOffsetDays": sched.get("delivery_offset_days"),
+                "scheduleVersion": sched.get("schedule_version"),
+                "needsScheduleReview": sched.get("needs_schedule_review"),
+            })
             
-            # Find the NEXT occurrence of this delivery day that doesn't have an order
+            # Find the NEXT offset-valid delivery date that doesn't have an order
             # Look up to 14 days ahead (2 weeks) to handle case where current week is already ordered
             for days in range(1, 15):
                 check_date = today + timedelta(days=days)
-                # Python weekday: 0=Mon, 6=Sun; DB uses 1=Mon, 7=Sun
-                check_dow = check_date.weekday() + 1
-                if check_dow == delivery_dow:
+                candidate_order_date = add_days(check_date, -cycle["deliveryOffsetDays"])
+                if candidate_order_date.isoweekday() == cycle["orderDay"]:
                     delivery_date_str = check_date.strftime('%Y-%m-%d')
                     
                     # Check if an order already exists for this delivery date
@@ -178,7 +195,7 @@ def get_upcoming_delivery_dates(route_number: str) -> list:
                     candidates.append({
                         'delivery_date': delivery_date_str,
                         'schedule_key': schedule_key,
-                        'delivery_day': delivery_dow,
+                        'delivery_day': cycle["deliveryDay"],
                     })
                     break  # Found an unordered delivery for this schedule
         

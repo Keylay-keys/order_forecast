@@ -229,6 +229,10 @@ def _create_user_param_tables(cur) -> None:
             order_day INTEGER NOT NULL,
             load_day INTEGER NOT NULL,
             delivery_day INTEGER NOT NULL,
+            load_offset_days INTEGER,
+            delivery_offset_days INTEGER,
+            schedule_version INTEGER DEFAULT 2,
+            needs_schedule_review BOOLEAN DEFAULT FALSE,
             schedule_key VARCHAR(20) NOT NULL,
             is_active BOOLEAN DEFAULT TRUE,
             created_at TIMESTAMP WITH TIME ZONE,
@@ -236,6 +240,11 @@ def _create_user_param_tables(cur) -> None:
             synced_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
         )
     """)
+    cur.execute("ALTER TABLE user_schedules ADD COLUMN IF NOT EXISTS load_offset_days INTEGER")
+    cur.execute("ALTER TABLE user_schedules ADD COLUMN IF NOT EXISTS delivery_offset_days INTEGER")
+    cur.execute("ALTER TABLE user_schedules ADD COLUMN IF NOT EXISTS schedule_version INTEGER DEFAULT 2")
+    cur.execute("ALTER TABLE user_schedules ADD COLUMN IF NOT EXISTS needs_schedule_review BOOLEAN DEFAULT FALSE")
+    _backfill_user_schedule_offsets(cur)
     
     # Store configurations
     cur.execute("""
@@ -308,6 +317,73 @@ def _create_user_param_tables(cur) -> None:
     """)
     
     print("  ✓ User parameter tables created")
+
+
+def _backfill_user_schedule_offsets(cur) -> None:
+    """Backfill additive schedule offset columns from legacy weekday fields."""
+    cur.execute("""
+        WITH normalized AS (
+            SELECT
+                id,
+                CASE
+                    WHEN load_day - order_day < 0 THEN load_day - order_day + 7
+                    ELSE load_day - order_day
+                END AS load_offset,
+                CASE
+                    WHEN delivery_day - order_day <= 0 THEN delivery_day - order_day + 7
+                    ELSE delivery_day - order_day
+                END AS delivery_base
+            FROM user_schedules
+            WHERE load_offset_days IS NULL
+               OR delivery_offset_days IS NULL
+               OR schedule_version IS NULL
+               OR needs_schedule_review IS NULL
+        ),
+        final_offsets AS (
+            SELECT
+                id,
+                load_offset,
+                CASE
+                    WHEN delivery_base < load_offset THEN delivery_base + 7
+                    ELSE delivery_base
+                END AS delivery_offset
+            FROM normalized
+        )
+        UPDATE user_schedules AS us
+        SET
+            load_offset_days = COALESCE(us.load_offset_days, fo.load_offset),
+            delivery_offset_days = COALESCE(us.delivery_offset_days, fo.delivery_offset),
+            schedule_version = COALESCE(us.schedule_version, 2),
+            needs_schedule_review = COALESCE(us.needs_schedule_review, FALSE)
+        FROM final_offsets fo
+        WHERE us.id = fo.id
+    """)
+
+
+def find_schedule_offset_mismatches(conn: psycopg2.extensions.connection) -> list[dict]:
+    """Return active schedules where derived weekday mirrors disagree with offsets."""
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("""
+            SELECT
+                id,
+                route_number,
+                user_id,
+                order_day,
+                load_day,
+                delivery_day,
+                load_offset_days,
+                delivery_offset_days
+            FROM user_schedules
+            WHERE is_active = TRUE
+              AND load_offset_days IS NOT NULL
+              AND delivery_offset_days IS NOT NULL
+              AND (
+                  ((((order_day - 1 + load_offset_days) % 7) + 1) <> load_day)
+                  OR ((((order_day - 1 + delivery_offset_days) % 7) + 1) <> delivery_day)
+              )
+            ORDER BY route_number, user_id, order_day
+        """)
+        return [dict(row) for row in cur.fetchall()]
 
 
 # =============================================================================

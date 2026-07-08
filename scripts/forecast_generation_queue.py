@@ -24,10 +24,12 @@ try:
     from .forecast_engine import ForecastConfig, generate_forecast
     from .retrain_readiness import evaluate_retrain_readiness
     from .retrain_runner import run_retrain_for_route
+    from .schedule_cycle import add_days, normalize_order_cycle
 except ImportError:
     from forecast_engine import ForecastConfig, generate_forecast
     from retrain_readiness import evaluate_retrain_readiness
     from retrain_runner import run_retrain_for_route
+    from schedule_cycle import add_days, normalize_order_cycle
 
 
 TERMINAL_JOB_STATUSES = {"done", "skipped_fresh", "error"}
@@ -366,13 +368,35 @@ def _get_route_last_finalized_at(route_number: str) -> Optional[datetime]:
         conn.close()
 
 
+def _delivery_date_matches_schedule(delivery_date: date, sched: Dict[str, Any]) -> bool:
+    cycle = normalize_order_cycle({
+        "orderDay": sched.get("order_day"),
+        "loadDay": sched.get("load_day"),
+        "deliveryDay": sched.get("delivery_day"),
+        "loadOffsetDays": sched.get("load_offset_days"),
+        "deliveryOffsetDays": sched.get("delivery_offset_days"),
+        "scheduleVersion": sched.get("schedule_version"),
+        "needsScheduleReview": sched.get("needs_schedule_review"),
+    })
+    order_date = add_days(delivery_date, -cycle["deliveryOffsetDays"])
+    return order_date.isoweekday() == cycle["orderDay"]
+
+
 def _get_next_unordered_delivery_global(route_number: str, lookahead_days: int = 21) -> Optional[Dict[str, str]]:
     conn = _pg_connect(autocommit=True)
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute(
                 """
-                SELECT schedule_key, delivery_day
+                SELECT
+                    schedule_key,
+                    order_day,
+                    load_day,
+                    delivery_day,
+                    load_offset_days,
+                    delivery_offset_days,
+                    schedule_version,
+                    needs_schedule_review
                 FROM user_schedules
                 WHERE route_number = %s AND is_active = TRUE
                 """,
@@ -384,12 +408,11 @@ def _get_next_unordered_delivery_global(route_number: str, lookahead_days: int =
             today = datetime.now(timezone.utc).date()
             for sched in schedules:
                 sk = normalize_schedule_key(sched.get("schedule_key"))
-                delivery_dow = int(sched.get("delivery_day") or 0)  # 1=Mon ... 7=Sun
-                if not sk or delivery_dow <= 0:
+                if not sk:
                     continue
                 for days in range(1, max(2, int(lookahead_days)) + 1):
                     check_date = today + timedelta(days=days)
-                    if (check_date.weekday() + 1) != delivery_dow:
+                    if not _delivery_date_matches_schedule(check_date, sched):
                         continue
                     delivery_str = check_date.strftime("%Y-%m-%d")
                     cur.execute(
@@ -429,7 +452,15 @@ def _get_next_unordered_delivery_for_schedule(
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute(
                 """
-                SELECT delivery_day
+                SELECT
+                    schedule_key,
+                    order_day,
+                    load_day,
+                    delivery_day,
+                    load_offset_days,
+                    delivery_offset_days,
+                    schedule_version,
+                    needs_schedule_review
                 FROM user_schedules
                 WHERE route_number = %s
                   AND schedule_key = %s
@@ -444,12 +475,9 @@ def _get_next_unordered_delivery_for_schedule(
             candidates: List[str] = []
             today = datetime.now(timezone.utc).date()
             for row in rows:
-                delivery_dow = int(row.get("delivery_day") or 0)
-                if delivery_dow <= 0:
-                    continue
                 for days in range(1, max(2, int(lookahead_days)) + 1):
                     check_date = today + timedelta(days=days)
-                    if (check_date.weekday() + 1) != delivery_dow:
+                    if not _delivery_date_matches_schedule(check_date, row):
                         continue
                     delivery_str = check_date.strftime("%Y-%m-%d")
                     cur.execute(

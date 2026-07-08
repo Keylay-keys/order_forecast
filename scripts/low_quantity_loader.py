@@ -29,8 +29,10 @@ except ImportError:
 
 try:
     from .schedule_utils import get_order_cycles, normalize_delivery_date
+    from .schedule_cycle import normalize_order_cycle
 except ImportError:
     from schedule_utils import get_order_cycles, normalize_delivery_date
+    from schedule_cycle import normalize_order_cycle
 
 try:
     from .pg_utils import fetch_all
@@ -63,7 +65,29 @@ def get_user_timezone(db, route_number: str) -> Optional[str]:
             return None
 
         route_data = route_doc.to_dict() or {}
-        user_id = route_data.get('userId')
+        user_id = route_data.get('ownerUid') or route_data.get('userId')
+
+        if not user_id:
+            users_ref = db.collection('users')
+            query = users_ref.where(
+                filter=FieldFilter('profile.routeNumber', '==', route_number)
+            ).where(
+                filter=FieldFilter('profile.role', '==', 'owner')
+            ).limit(1)
+            docs = list(query.stream())
+            if docs:
+                user_id = docs[0].id
+
+        if not user_id:
+            users_ref = db.collection('users')
+            query = users_ref.where(
+                filter=FieldFilter('profile.currentRoute', '==', route_number)
+            ).where(
+                filter=FieldFilter('profile.role', '==', 'owner')
+            ).limit(1)
+            docs = list(query.stream())
+            if docs:
+                user_id = docs[0].id
 
         if not user_id:
             return None
@@ -285,8 +309,9 @@ def calculate_next_viable_cycle(
     computed_cycles: List[ViableCycle] = []
 
     for config in order_cycles:
-        order_day = config.get('orderDay', 1)
-        delivery_day = config.get('deliveryDay', 4)
+        normalized_config = normalize_order_cycle(config)
+        order_day = normalized_config.get('orderDay', 1)
+        delivery_offset_days = normalized_config.get('deliveryOffsetDays', 3)
 
         # Start from today's order date for this cycle
         order_date = get_next_order_date(today, order_day)
@@ -294,12 +319,7 @@ def calculate_next_viable_cycle(
         for week in range(max_weeks):
             current_order_date = order_date + timedelta(weeks=week)
 
-            # Calculate delivery date
-            days_until_delivery = delivery_day - order_day
-            if days_until_delivery <= 0:
-                days_until_delivery += 7
-
-            delivery_date = current_order_date + timedelta(days=days_until_delivery)
+            delivery_date = current_order_date + timedelta(days=delivery_offset_days)
 
             # Normalize times for comparison
             current_order_date = current_order_date.replace(hour=0, minute=0, second=0, microsecond=0)

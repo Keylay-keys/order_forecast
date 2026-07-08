@@ -987,9 +987,21 @@ def _resolve_store_context_for_fold(train_orders, allow_store_context: bool) -> 
 def _load_order_cycles_for_route(route_number: str) -> List[dict]:
     """Load order cycle configuration from PostgreSQL user_schedules."""
     try:
+        from schedule_cycle import normalize_order_cycle
+    except ImportError:
+        from .schedule_cycle import normalize_order_cycle
+
+    try:
         rows = fetch_all(
             """
-            SELECT order_day, delivery_day, load_day
+            SELECT
+                order_day,
+                delivery_day,
+                load_day,
+                load_offset_days,
+                delivery_offset_days,
+                schedule_version,
+                needs_schedule_review
             FROM user_schedules
             WHERE route_number = %s
               AND is_active = TRUE
@@ -1004,13 +1016,15 @@ def _load_order_cycles_for_route(route_number: str) -> List[dict]:
             ld = r.get("load_day")
             if od is None or dd is None or ld is None:
                 continue
-            out.append(
-                {
-                    "orderDay": int(od),
-                    "deliveryDay": int(dd),
-                    "loadDay": int(ld),
-                }
-            )
+            out.append(normalize_order_cycle({
+                "orderDay": int(od),
+                "deliveryDay": int(dd),
+                "loadDay": int(ld),
+                "loadOffsetDays": r.get("load_offset_days"),
+                "deliveryOffsetDays": r.get("delivery_offset_days"),
+                "scheduleVersion": r.get("schedule_version"),
+                "needsScheduleReview": r.get("needs_schedule_review"),
+            }))
         return out
     except Exception:
         return []

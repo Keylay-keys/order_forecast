@@ -191,6 +191,10 @@ def _create_user_param_tables(conn: duckdb.DuckDBPyConnection) -> None:
             order_day INTEGER NOT NULL,             -- 1=Mon, 7=Sun
             load_day INTEGER NOT NULL,
             delivery_day INTEGER NOT NULL,
+            load_offset_days INTEGER,
+            delivery_offset_days INTEGER,
+            schedule_version INTEGER DEFAULT 2,
+            needs_schedule_review BOOLEAN DEFAULT FALSE,
             schedule_key VARCHAR NOT NULL,          -- 'monday', 'thursday'
             is_active BOOLEAN DEFAULT TRUE,
             created_at TIMESTAMP,
@@ -198,6 +202,11 @@ def _create_user_param_tables(conn: duckdb.DuckDBPyConnection) -> None:
             synced_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
+    conn.execute("ALTER TABLE user_schedules ADD COLUMN IF NOT EXISTS load_offset_days INTEGER")
+    conn.execute("ALTER TABLE user_schedules ADD COLUMN IF NOT EXISTS delivery_offset_days INTEGER")
+    conn.execute("ALTER TABLE user_schedules ADD COLUMN IF NOT EXISTS schedule_version INTEGER DEFAULT 2")
+    conn.execute("ALTER TABLE user_schedules ADD COLUMN IF NOT EXISTS needs_schedule_review BOOLEAN DEFAULT FALSE")
+    _backfill_user_schedule_offsets(conn)
     
     # Store configurations
     conn.execute("""
@@ -270,6 +279,90 @@ def _create_user_param_tables(conn: duckdb.DuckDBPyConnection) -> None:
     """)
     
     print("  ✓ User parameter tables created")
+
+
+def _backfill_user_schedule_offsets(conn: duckdb.DuckDBPyConnection) -> None:
+    """Backfill additive schedule offset columns from legacy weekday fields."""
+    conn.execute("""
+        UPDATE user_schedules
+        SET
+            load_offset_days = COALESCE(
+                load_offset_days,
+                CASE
+                    WHEN load_day - order_day < 0 THEN load_day - order_day + 7
+                    ELSE load_day - order_day
+                END
+            ),
+            delivery_offset_days = COALESCE(
+                delivery_offset_days,
+                CASE
+                    WHEN (
+                        CASE
+                            WHEN delivery_day - order_day <= 0 THEN delivery_day - order_day + 7
+                            ELSE delivery_day - order_day
+                        END
+                    ) < (
+                        CASE
+                            WHEN load_day - order_day < 0 THEN load_day - order_day + 7
+                            ELSE load_day - order_day
+                        END
+                    )
+                    THEN (
+                        CASE
+                            WHEN delivery_day - order_day <= 0 THEN delivery_day - order_day + 7
+                            ELSE delivery_day - order_day
+                        END
+                    ) + 7
+                    ELSE (
+                        CASE
+                            WHEN delivery_day - order_day <= 0 THEN delivery_day - order_day + 7
+                            ELSE delivery_day - order_day
+                        END
+                    )
+                END
+            ),
+            schedule_version = COALESCE(schedule_version, 2),
+            needs_schedule_review = COALESCE(needs_schedule_review, FALSE)
+        WHERE load_offset_days IS NULL
+           OR delivery_offset_days IS NULL
+           OR schedule_version IS NULL
+           OR needs_schedule_review IS NULL
+    """)
+
+
+def find_schedule_offset_mismatches(conn: duckdb.DuckDBPyConnection) -> list[dict]:
+    """Return active schedules where derived weekday mirrors disagree with offsets."""
+    rows = conn.execute("""
+        SELECT
+            id,
+            route_number,
+            user_id,
+            order_day,
+            load_day,
+            delivery_day,
+            load_offset_days,
+            delivery_offset_days
+        FROM user_schedules
+        WHERE is_active = TRUE
+          AND load_offset_days IS NOT NULL
+          AND delivery_offset_days IS NOT NULL
+          AND (
+              ((((order_day - 1 + load_offset_days) % 7) + 1) <> load_day)
+              OR ((((order_day - 1 + delivery_offset_days) % 7) + 1) <> delivery_day)
+          )
+        ORDER BY route_number, user_id, order_day
+    """).fetchall()
+    columns = [
+        "id",
+        "route_number",
+        "user_id",
+        "order_day",
+        "load_day",
+        "delivery_day",
+        "load_offset_days",
+        "delivery_offset_days",
+    ]
+    return [dict(zip(columns, row)) for row in rows]
 
 
 # =============================================================================

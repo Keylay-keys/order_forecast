@@ -28,6 +28,10 @@ def get_pg_connection() -> psycopg2.extensions.connection:
         user=os.environ.get("POSTGRES_USER", "routespark"),
         password=os.environ.get("POSTGRES_PASSWORD", ""),
     )
+    # This module keeps a cached connection in long-running daemons. Without
+    # autocommit, even plain SELECT helpers leave the session "idle in
+    # transaction" and can hold AccessShareLock until the process exits.
+    _pg_conn.autocommit = True
     return _pg_conn
 
 

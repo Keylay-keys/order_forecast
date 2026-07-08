@@ -33,6 +33,11 @@ except ImportError:
     from db_manager_pg import handle_sync_order
 
 try:
+    from .schedule_cycle import add_days, normalize_order_cycle, schedule_key_for_day
+except ImportError:
+    from schedule_cycle import add_days, normalize_order_cycle, schedule_key_for_day
+
+try:
     from .forecast_engine import ForecastConfig, generate_forecast
 except ImportError:
     from forecast_engine import ForecastConfig, generate_forecast
@@ -233,13 +238,35 @@ def _forecast_exists(
         return False
 
 
+def _delivery_date_matches_schedule(delivery_date, schedule: Dict) -> bool:
+    cycle = normalize_order_cycle({
+        'orderDay': schedule.get('orderDay', schedule.get('order_day')),
+        'loadDay': schedule.get('loadDay', schedule.get('load_day')),
+        'deliveryDay': schedule.get('deliveryDay', schedule.get('delivery_day')),
+        'loadOffsetDays': schedule.get('loadOffsetDays', schedule.get('load_offset_days')),
+        'deliveryOffsetDays': schedule.get('deliveryOffsetDays', schedule.get('delivery_offset_days')),
+        'scheduleVersion': schedule.get('scheduleVersion', schedule.get('schedule_version')),
+        'needsScheduleReview': schedule.get('needsScheduleReview', schedule.get('needs_schedule_review')),
+    })
+    order_date = add_days(delivery_date, -cycle['deliveryOffsetDays'])
+    return order_date.isoweekday() == cycle['orderDay']
+
+
 def _get_next_unordered_delivery(route_number: str) -> Optional[Dict[str, str]]:
     """Pick the single next delivery across all active schedules that doesn't already have a finalized order."""
     conn = get_pg_connection()
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute(
             """
-            SELECT schedule_key, delivery_day
+            SELECT
+                schedule_key,
+                order_day,
+                load_day,
+                delivery_day,
+                load_offset_days,
+                delivery_offset_days,
+                schedule_version,
+                needs_schedule_review
             FROM user_schedules
             WHERE route_number = %s AND is_active = TRUE
             """,
@@ -253,14 +280,12 @@ def _get_next_unordered_delivery(route_number: str) -> Optional[Dict[str, str]]:
         today = datetime.now(timezone.utc).date()
         for sched in schedules:
             schedule_key = (sched.get('schedule_key') or '').lower()
-            delivery_dow = int(sched.get('delivery_day') or 0)  # 1=Mon ... 7=Sun
-            if not schedule_key or delivery_dow <= 0:
+            if not schedule_key:
                 continue
 
             for days in range(1, 15):
                 check_date = today + timedelta(days=days)
-                check_dow = check_date.weekday() + 1
-                if check_dow != delivery_dow:
+                if not _delivery_date_matches_schedule(check_date, sched):
                     continue
 
                 delivery_date_str = check_date.strftime('%Y-%m-%d')
@@ -620,13 +645,18 @@ def sync_schedules_from_firebase(fb_client: firestore.Client, route_number: str,
     count = 0
     now = datetime.now(timezone.utc).isoformat()
     day_names = {1: 'monday', 2: 'tuesday', 3: 'wednesday', 4: 'thursday', 
-                 5: 'friday', 6: 'saturday', 0: 'sunday'}
+                 5: 'friday', 6: 'saturday', 7: 'sunday'}
     
     rows = []
     for i, cycle in enumerate(cycles):
-        order_day = cycle.get('orderDay', 1)
-        load_day = cycle.get('loadDay', 3)
-        delivery_day = cycle.get('deliveryDay', 4)
+        normalized_cycle = normalize_order_cycle(cycle)
+        order_day = normalized_cycle['orderDay']
+        load_day = normalized_cycle['loadDay']
+        delivery_day = normalized_cycle['deliveryDay']
+        load_offset_days = normalized_cycle['loadOffsetDays']
+        delivery_offset_days = normalized_cycle['deliveryOffsetDays']
+        schedule_version = normalized_cycle['scheduleVersion']
+        needs_schedule_review = normalized_cycle['needsScheduleReview']
         # schedule_key based on ORDER day (user's mental model)
         schedule_key = day_names.get(order_day, 'unknown')
         
@@ -639,6 +669,10 @@ def sync_schedules_from_firebase(fb_client: firestore.Client, route_number: str,
             order_day,
             load_day,
             delivery_day,
+            load_offset_days,
+            delivery_offset_days,
+            schedule_version,
+            needs_schedule_review,
             schedule_key,
             True,
             now,
@@ -653,12 +687,20 @@ def sync_schedules_from_firebase(fb_client: firestore.Client, route_number: str,
             execute_values(
                 cur,
                 """
-                INSERT INTO user_schedules (id, route_number, user_id, order_day, load_day, delivery_day, schedule_key, is_active, synced_at)
+                INSERT INTO user_schedules (
+                    id, route_number, user_id, order_day, load_day, delivery_day,
+                    load_offset_days, delivery_offset_days, schedule_version, needs_schedule_review,
+                    schedule_key, is_active, synced_at
+                )
                 VALUES %s
                 ON CONFLICT (id) DO UPDATE SET
                     order_day = EXCLUDED.order_day,
                     load_day = EXCLUDED.load_day,
                     delivery_day = EXCLUDED.delivery_day,
+                    load_offset_days = EXCLUDED.load_offset_days,
+                    delivery_offset_days = EXCLUDED.delivery_offset_days,
+                    schedule_version = EXCLUDED.schedule_version,
+                    needs_schedule_review = EXCLUDED.needs_schedule_review,
                     schedule_key = EXCLUDED.schedule_key,
                     is_active = EXCLUDED.is_active,
                     synced_at = EXCLUDED.synced_at
@@ -874,17 +916,18 @@ def regenerate_forecasts_after_finalization(
         today = datetime.now(timezone.utc).date()
         
         for schedule in schedules:
-            order_day = schedule.get('orderDay', 1)  # 0=Sun, 1=Mon, etc.
-            delivery_day = schedule.get('deliveryDay', 4)
-            
-            # Convert to schedule_key (based on order day)
-            day_names = {0: 'sunday', 1: 'monday', 2: 'tuesday', 3: 'wednesday',
-                        4: 'thursday', 5: 'friday', 6: 'saturday'}
-            schedule_key = day_names.get(order_day, 'unknown')
-            
-            # Find next delivery date for this schedule
-            next_delivery = get_next_delivery_date(today, delivery_day)
-            next_delivery_str = next_delivery.strftime('%Y-%m-%d') if hasattr(next_delivery, 'strftime') else next_delivery.isoformat()[:10]
+            normalized_schedule = normalize_order_cycle(schedule)
+            schedule_key = schedule_key_for_day(normalized_schedule['orderDay'])
+
+            next_delivery_str = None
+            for days in range(1, 15):
+                check_date = today + timedelta(days=days)
+                if _delivery_date_matches_schedule(check_date, normalized_schedule):
+                    next_delivery_str = check_date.strftime('%Y-%m-%d')
+                    break
+
+            if not next_delivery_str:
+                continue
             
             # Check if this delivery already has a finalized order (PostgreSQL)
             try:
