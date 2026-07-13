@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timezone
 from typing import Optional, List, Dict, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from google.cloud import firestore
+from schedule_cycle import get_schedule_key_for_delivery_date
 
 from ..dependencies import (
     verify_firebase_token,
@@ -28,9 +30,12 @@ try:
 except ImportError:
     from scripts.finalize_rollout import api_finalize_rollout_enabled_for_route
 
+from .schedule import get_order_cycles_from_firestore
+
 
 router = APIRouter()
 API_FORECAST_WORKER_ID = "api-finalize"
+logger = logging.getLogger("api.orders")
 
 def _normalize_route_number(value: Any) -> str:
     v = str(value or "").strip()
@@ -77,6 +82,62 @@ def _resolve_route_group_id(
         return _normalize_route_number(owner_profile.get("routeNumber"))
     except Exception:
         return ""
+
+
+def _validate_non_holiday_schedule_key(
+    db: firestore.Client,
+    payload: OrderCreateRequest,
+) -> None:
+    """Reject normal orders whose scheduleKey disagrees with the route schedule.
+
+    Holiday/off-schedule orders are allowed to bypass this because their normal
+    route cycle may not apply.
+    """
+    if payload.isHolidaySchedule:
+        return
+
+    try:
+        cycles = get_order_cycles_from_firestore(db, payload.routeNumber)
+    except Exception as exc:
+        logger.warning(
+            "Schedule key validation skipped for route %s: failed to load cycles: %s",
+            payload.routeNumber,
+            exc,
+        )
+        return
+
+    if not cycles:
+        logger.info(
+            "Schedule key validation skipped for route %s: no configured cycles",
+            payload.routeNumber,
+        )
+        return
+
+    resolution = get_schedule_key_for_delivery_date(payload.deliveryDate, cycles)
+    if not resolution:
+        logger.info(
+            "Schedule key validation skipped for route %s delivery %s: no matching cycle",
+            payload.routeNumber,
+            payload.deliveryDate,
+        )
+        return
+
+    valid_keys = {
+        str(match.get("scheduleKey", "")).lower()
+        for match in resolution.get("matches", [])
+        if match.get("scheduleKey")
+    }
+    if not valid_keys:
+        valid_keys = {str(resolution.get("scheduleKey", "")).lower()}
+
+    if payload.scheduleKey.lower() not in valid_keys:
+        raise HTTPException(
+            400,
+            (
+                "Schedule key does not match the selected delivery date. "
+                "Refresh the page and try again."
+            ),
+        )
 
 
 def _get_local_order_date(db: firestore.Client, route_number: str) -> str:
@@ -213,6 +274,7 @@ async def create_order(
 ) -> Order:
     """Create a new draft order."""
     await require_route_feature_access(payload.routeNumber, "ordering", decoded_token, db)
+    _validate_non_holiday_schedule_key(db, payload)
 
     order_id = f"order-{payload.routeNumber}-{int(datetime.utcnow().timestamp() * 1000)}"
     now = datetime.now(timezone.utc)

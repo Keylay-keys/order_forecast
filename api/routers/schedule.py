@@ -214,7 +214,8 @@ async def get_schedule_key_for_date(
             'scheduleKey': resolution['scheduleKey'],
             'deliveryDate': deliveryDate,
             'orderDayName': get_day_name(order_day),
-            'deliveryDayName': get_day_name(delivery_dow)
+            'deliveryDayName': get_day_name(delivery_dow),
+            'matched': True,
         }
     
     # No matching cycle, use delivery day as schedule key
@@ -222,5 +223,6 @@ async def get_schedule_key_for_date(
         'scheduleKey': get_day_name(delivery_dow).lower(),
         'deliveryDate': deliveryDate,
         'orderDayName': get_day_name(delivery_dow),
-        'deliveryDayName': get_day_name(delivery_dow)
+        'deliveryDayName': get_day_name(delivery_dow),
+        'matched': False,
     }
