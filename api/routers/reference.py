@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from typing import Dict, Any, List, Optional
 
-from fastapi import APIRouter, Depends, Path, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Path, Query, Request
 from google.cloud import firestore
 from psycopg2.extras import RealDictCursor
 
@@ -235,7 +235,7 @@ async def get_reference_catalog_item(
     del request, decoded_token
     item = _fetch_reference_item_by_sap(sap.strip())
     if not item:
-        return {"catalogId": DEFAULT_REFERENCE_CATALOG_ID, "sap": sap.strip(), "item": None}
+        raise HTTPException(status_code=404, detail="Reference catalog item not found")
     return {"catalogId": DEFAULT_REFERENCE_CATALOG_ID, "sap": item["sap"], "item": item}
 
 
