@@ -292,13 +292,14 @@ def sync_product_to_pg(route_number: str, sap: str, data: dict, deleted: bool = 
 
                 cur.execute("""
                     INSERT INTO product_catalog (
-                        sap, route_number, full_name, short_name, brand, category,
+                        sap, route_number, full_name, short_name, upc, brand, category,
                         sub_category, case_pack, tray, is_active, synced_at
                     )
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     ON CONFLICT (sap, route_number) DO UPDATE SET
                         full_name = EXCLUDED.full_name,
                         short_name = EXCLUDED.short_name,
+                        upc = EXCLUDED.upc,
                         brand = EXCLUDED.brand,
                         category = EXCLUDED.category,
                         sub_category = EXCLUDED.sub_category,
@@ -311,12 +312,13 @@ def sync_product_to_pg(route_number: str, sap: str, data: dict, deleted: bool = 
                     route_number,
                     data.get('fullName', data.get('name', '')),
                     data.get('shortName', ''),
+                    data.get('upc') or data.get('sku'),
                     data.get('brand', ''),
                     data.get('category', ''),
                     data.get('subCategory', ''),
                     data.get('casePack', 1),
                     data.get('tray'),  # Can be None
-                    data.get('isActive', True),
+                    data.get('active', data.get('isActive', True)),
                     now,
                 ])
 

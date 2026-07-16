@@ -32,6 +32,7 @@ class CatalogProductPayload(BaseModel):
     displayOrder: int = Field(default=0, ge=0, le=1000000)
     active: bool = True
     pcfAbbreviation: Optional[str] = Field(None, max_length=120)
+    upc: Optional[str] = Field(None, max_length=120)
     sku: Optional[str] = Field(None, max_length=120)
     notes: Optional[str] = Field(None, max_length=1000)
 
@@ -46,7 +47,7 @@ class CatalogProductPayload(BaseModel):
     def normalize_required_text(cls, value: Any) -> str:
         return str(value or "").strip()
 
-    @validator("pcfAbbreviation", "sku", "notes", pre=True)
+    @validator("pcfAbbreviation", "upc", "sku", "notes", pre=True)
     def normalize_optional_text(cls, value: Any) -> Optional[str]:
         if value is None:
             return None
@@ -89,6 +90,7 @@ def _normalize_product(raw: Dict[str, Any], fallback_sap: str) -> Dict[str, Any]
         or _clean_text(raw.get("description"))
         or "Unnamed Product"
     )
+    upc = _clean_optional_text(raw.get("upc") or raw.get("sku"))
     return {
         "sap": sap,
         "brand": _clean_text(raw.get("brand")),
@@ -96,8 +98,9 @@ def _normalize_product(raw: Dict[str, Any], fallback_sap: str) -> Dict[str, Any]
         "fullName": full_name,
         "casePack": _clean_int(raw.get("casePack", raw.get("case_pack")), 0),
         "displayOrder": _clean_int(raw.get("displayOrder", raw.get("display_order")), 0),
-        "active": bool(raw.get("active", True)),
+        "active": bool(raw.get("active", raw.get("isActive", True))),
         "pcfAbbreviation": _clean_optional_text(raw.get("pcfAbbreviation") or raw.get("pcf_abbreviation")),
+        "upc": upc,
         "sku": _clean_optional_text(raw.get("sku")),
         "notes": _clean_optional_text(raw.get("notes")),
     }
@@ -119,6 +122,8 @@ def _payload_to_doc(payload: CatalogProductPayload, *, created_at: Optional[int]
         doc["createdAt"] = created_at
     if payload.pcfAbbreviation:
         doc["pcfAbbreviation"] = payload.pcfAbbreviation
+    if payload.upc:
+        doc["upc"] = payload.upc
     if payload.sku:
         doc["sku"] = payload.sku
     if payload.notes:

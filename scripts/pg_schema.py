@@ -285,6 +285,7 @@ def _create_user_param_tables(cur) -> None:
             route_number VARCHAR(20) NOT NULL,
             full_name VARCHAR(255) NOT NULL,
             short_name VARCHAR(100),
+            upc VARCHAR(120),
             brand VARCHAR(100),
             category VARCHAR(100),
             sub_category VARCHAR(100),
@@ -297,6 +298,27 @@ def _create_user_param_tables(cur) -> None:
             synced_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
             
             PRIMARY KEY (sap, route_number)
+        )
+    """)
+    cur.execute("ALTER TABLE product_catalog ADD COLUMN IF NOT EXISTS upc VARCHAR(120)")
+
+    # Shared reference catalog for cluster-backed item lookup/search. This is
+    # not route-private data, but API reads still require Firebase auth.
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS reference_catalog_items (
+            catalog_id VARCHAR(120) NOT NULL,
+            sap VARCHAR(20) NOT NULL,
+            upc VARCHAR(120),
+            full_name VARCHAR(255) NOT NULL,
+            brand VARCHAR(100),
+            category VARCHAR(100),
+            case_pack INTEGER NOT NULL DEFAULT 1,
+            display_order INTEGER,
+            source VARCHAR(120),
+            active BOOLEAN DEFAULT TRUE,
+            updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+
+            PRIMARY KEY (catalog_id, sap)
         )
     """)
     
@@ -1106,6 +1128,11 @@ def _create_indexes(cur) -> None:
         # Delivery allocation indexes
         ("idx_delivery_manifest", "delivery_allocations", "route_number, delivery_date, store_id"),
         ("idx_delivery_by_order", "delivery_allocations", "source_order_id"),
+
+        # Reference catalog indexes
+        ("idx_reference_catalog_sap", "reference_catalog_items", "sap"),
+        ("idx_reference_catalog_upc", "reference_catalog_items", "upc"),
+        ("idx_reference_catalog_name", "reference_catalog_items", "full_name"),
 
         # Route transfer indexes (inter-route)
         ("idx_route_transfers_group_date", "route_transfers", "route_group_id, transfer_date"),

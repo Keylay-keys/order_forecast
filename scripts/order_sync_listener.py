@@ -583,6 +583,7 @@ def sync_products_from_firebase(fb_client: firestore.Client, route_number: str) 
             route_number,
             data.get('fullName') or data.get('name') or data.get('product') or '',
             data.get('shortName', ''),
+            data.get('upc') or data.get('sku'),
             data.get('brand', ''),
             data.get('category', ''),
             data.get('casePack') or data.get('tray') or 1,
@@ -599,11 +600,12 @@ def sync_products_from_firebase(fb_client: firestore.Client, route_number: str) 
             execute_values(
                 cur,
                 """
-                INSERT INTO product_catalog (sap, route_number, full_name, short_name, brand, category, case_pack, is_active, synced_at)
+                INSERT INTO product_catalog (sap, route_number, full_name, short_name, upc, brand, category, case_pack, is_active, synced_at)
                 VALUES %s
                 ON CONFLICT (sap, route_number) DO UPDATE SET
                     full_name = EXCLUDED.full_name,
                     short_name = EXCLUDED.short_name,
+                    upc = EXCLUDED.upc,
                     brand = EXCLUDED.brand,
                     category = EXCLUDED.category,
                     case_pack = EXCLUDED.case_pack,

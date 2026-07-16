@@ -27,6 +27,7 @@ class Product:
     category: Optional[str] = None
     case_pack: Optional[int] = None  # units per case
     tray: Optional[int] = None  # pack size / tray for unit→case conversion
+    upc: Optional[str] = None
     additional: Dict[str, Any] = field(default_factory=dict)
 
 

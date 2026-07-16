@@ -81,7 +81,12 @@ def load_master_catalog(
                 category=data.get("category"),
                 case_pack=data.get("casePack") or data.get("tray"),
                 tray=data.get("tray"),
-                additional={k: v for k, v in data.items() if k not in {"sap", "name", "product", "brand", "category", "casePack", "tray"}},
+                upc=data.get("upc") or data.get("sku"),
+                additional={
+                    k: v
+                    for k, v in data.items()
+                    if k not in {"sap", "name", "product", "brand", "category", "casePack", "tray", "upc", "sku"}
+                },
             )
         )
     return products
@@ -341,7 +346,7 @@ def load_catalog_from_postgres(route_number: str) -> List[Product]:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute(
                 """
-                SELECT sap, full_name, brand, category, case_pack, tray, sub_category, unit_weight, is_active
+                SELECT sap, full_name, upc, brand, category, case_pack, tray, sub_category, unit_weight, is_active
                 FROM product_catalog
                 WHERE route_number = %s AND is_active = TRUE
                 """,
@@ -364,6 +369,7 @@ def load_catalog_from_postgres(route_number: str) -> List[Product]:
                     category=row.get("category"),
                     case_pack=row.get("case_pack"),
                     tray=row.get("tray"),
+                    upc=row.get("upc"),
                     additional=additional,
                 )
             )
