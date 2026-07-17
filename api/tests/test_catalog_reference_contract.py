@@ -6,6 +6,19 @@ from order_forecast.api.routers import catalog, reference
 from order_forecast.scripts import load_reference_catalog
 
 
+class _FakeRequest:
+    def __init__(self, headers=None, scheme="http", netloc="internal:8000", base_url="http://internal:8000/"):
+        self.headers = headers or {}
+        self.base_url = base_url
+
+        class Url:
+            pass
+
+        self.url = Url()
+        self.url.scheme = scheme
+        self.url.netloc = netloc
+
+
 class CatalogReferenceContractTests(unittest.TestCase):
     def test_catalog_payload_accepts_upc_and_preserves_legacy_sku(self):
         payload = catalog.CatalogProductPayload(
@@ -87,6 +100,17 @@ class CatalogReferenceContractTests(unittest.TestCase):
 
         self.assertIsNone(item["imageUrl"])
         self.assertIsNone(item["imageThumbUrl"])
+
+    def test_reference_public_base_url_uses_forwarded_https_headers(self):
+        request = _FakeRequest(
+            headers={
+                "x-forwarded-proto": "https",
+                "x-forwarded-host": "api.routespark.pro",
+                "host": "web-api:8000",
+            }
+        )
+
+        self.assertEqual(reference._public_base_url(request), "https://api.routespark.pro/")
 
     def test_reference_like_escape_escapes_wildcards(self):
         self.assertEqual(reference._escape_like(r"100%_chips\\"), r"100\%\_chips\\\\")

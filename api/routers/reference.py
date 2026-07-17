@@ -28,6 +28,20 @@ DEFAULT_REFERENCE_CATALOG_ID = "routespark-starter-catalog"
 IMAGE_ROUTE_PREFIX = "/api/catalog/starter/images"
 
 
+def _public_base_url(request: Request) -> str:
+    configured = os.environ.get("REFERENCE_CATALOG_PUBLIC_BASE_URL")
+    if configured:
+        return configured
+
+    forwarded_proto = _clean_text(request.headers.get("x-forwarded-proto")).split(",", 1)[0].strip()
+    forwarded_host = _clean_text(request.headers.get("x-forwarded-host")).split(",", 1)[0].strip()
+    proto = forwarded_proto or request.url.scheme
+    host = forwarded_host or _clean_text(request.headers.get("host")) or request.url.netloc
+    if host:
+        return f"{proto}://{host}/"
+    return str(request.base_url)
+
+
 def _image_root() -> FilePath:
     configured = os.environ.get("REFERENCE_CATALOG_IMAGE_ROOT")
     if configured:
@@ -253,7 +267,7 @@ async def get_starter_catalog(
 ) -> Dict[str, Any]:
     """Return the shared RouteSpark starter/reference catalog."""
     del decoded_token
-    items = _fetch_reference_catalog_items(limit=limit, base_url=str(request.base_url))
+    items = _fetch_reference_catalog_items(limit=limit, base_url=_public_base_url(request))
     return {
         "catalogId": DEFAULT_REFERENCE_CATALOG_ID,
         "items": items,
@@ -275,7 +289,7 @@ async def search_reference_catalog(
     """
     del decoded_token
     query = q.strip()
-    items = _fetch_reference_items_by_search(query, limit=limit, base_url=str(request.base_url))
+    items = _fetch_reference_items_by_search(query, limit=limit, base_url=_public_base_url(request))
     return {
         "catalogId": DEFAULT_REFERENCE_CATALOG_ID,
         "query": query,
@@ -292,7 +306,7 @@ async def get_reference_catalog_item(
 ) -> Dict[str, Any]:
     """Return one item from the shared RouteSpark reference catalog by SAP."""
     del decoded_token
-    item = _fetch_reference_item_by_sap(sap.strip(), base_url=str(request.base_url))
+    item = _fetch_reference_item_by_sap(sap.strip(), base_url=_public_base_url(request))
     if not item:
         raise HTTPException(status_code=404, detail="Reference catalog item not found")
     return {"catalogId": DEFAULT_REFERENCE_CATALOG_ID, "sap": item["sap"], "item": item}
