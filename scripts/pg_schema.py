@@ -314,6 +314,8 @@ def _create_user_param_tables(cur) -> None:
             category VARCHAR(100),
             case_pack INTEGER NOT NULL DEFAULT 1,
             display_order INTEGER,
+            image_path VARCHAR(255),
+            image_thumb_path VARCHAR(255),
             source VARCHAR(120),
             active BOOLEAN DEFAULT TRUE,
             updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
@@ -321,6 +323,8 @@ def _create_user_param_tables(cur) -> None:
             PRIMARY KEY (catalog_id, sap)
         )
     """)
+    cur.execute("ALTER TABLE reference_catalog_items ADD COLUMN IF NOT EXISTS image_path VARCHAR(255)")
+    cur.execute("ALTER TABLE reference_catalog_items ADD COLUMN IF NOT EXISTS image_thumb_path VARCHAR(255)")
     
     # User order guide preferences
     cur.execute("""

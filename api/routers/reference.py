@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import logging
+import os
+from pathlib import Path as FilePath
 from typing import Dict, Any, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Path, Query, Request
+from fastapi.responses import FileResponse
 from google.cloud import firestore
 from psycopg2.extras import RealDictCursor
 
@@ -22,6 +25,14 @@ router = APIRouter()
 logger = logging.getLogger(__name__)
 
 DEFAULT_REFERENCE_CATALOG_ID = "routespark-starter-catalog"
+IMAGE_ROUTE_PREFIX = "/api/catalog/starter/images"
+
+
+def _image_root() -> FilePath:
+    configured = os.environ.get("REFERENCE_CATALOG_IMAGE_ROOT")
+    if configured:
+        return FilePath(configured)
+    return FilePath(__file__).resolve().parents[3] / "data" / "catalogs" / "product_images"
 
 
 def _clean_text(value: Any, fallback: str = "") -> str:
@@ -50,19 +61,38 @@ def _escape_like(value: str) -> str:
     return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
-def _normalize_reference_item(row: Dict[str, Any]) -> Dict[str, Any]:
+def _reference_image_url(base_url: Optional[str], sap: str, image_path: Optional[str]) -> Optional[str]:
+    if not base_url or not image_path:
+        return None
+    return f"{base_url.rstrip('/')}{IMAGE_ROUTE_PREFIX}/{sap}.png"
+
+
+def _normalize_reference_item(row: Dict[str, Any], *, base_url: Optional[str] = None) -> Dict[str, Any]:
+    sap = _clean_text(row.get("sap"))
+    image_path = _clean_optional_text(row.get("image_path") or row.get("imagePath"))
+    image_thumb_path = _clean_optional_text(row.get("image_thumb_path") or row.get("imageThumbPath") or image_path)
     return {
         "catalogId": _clean_text(row.get("catalog_id"), DEFAULT_REFERENCE_CATALOG_ID),
-        "sap": _clean_text(row.get("sap")),
+        "sap": sap,
         "upc": _clean_optional_text(row.get("upc")),
         "brand": _clean_text(row.get("brand")),
         "category": _clean_text(row.get("category")),
         "fullName": _clean_text(row.get("full_name") or row.get("fullName"), "Unnamed Product"),
         "casePack": _clean_int(row.get("case_pack") or row.get("casePack"), 0),
         "displayOrder": _clean_int(row.get("display_order") or row.get("displayOrder"), 0),
+        "imageUrl": _reference_image_url(base_url, sap, image_path),
+        "imageThumbUrl": _reference_image_url(base_url, sap, image_thumb_path),
         "source": _clean_optional_text(row.get("source")),
         "active": bool(row.get("active", True)),
     }
+
+
+def _safe_catalog_image_file(root: FilePath, image_path: str) -> Optional[FilePath]:
+    resolved_root = root.resolve()
+    candidate = (resolved_root / image_path).resolve()
+    if resolved_root not in candidate.parents:
+        return None
+    return candidate if candidate.is_file() else None
 
 
 def _fetch_reference_items_by_search(
@@ -70,6 +100,7 @@ def _fetch_reference_items_by_search(
     *,
     catalog_id: str = DEFAULT_REFERENCE_CATALOG_ID,
     limit: int = 25,
+    base_url: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     normalized_query = query.strip()
     normalized_upc = _normalize_upc(normalized_query)
@@ -88,6 +119,8 @@ def _fetch_reference_items_by_search(
                     category,
                     case_pack,
                     display_order,
+                    image_path,
+                    image_thumb_path,
                     source,
                     active,
                     CASE
@@ -132,7 +165,7 @@ def _fetch_reference_items_by_search(
                     limit,
                 ],
             )
-            return [_normalize_reference_item(dict(row)) for row in cur.fetchall()]
+            return [_normalize_reference_item(dict(row), base_url=base_url) for row in cur.fetchall()]
     finally:
         return_pg_connection(conn)
 
@@ -141,6 +174,7 @@ def _fetch_reference_item_by_sap(
     sap: str,
     *,
     catalog_id: str = DEFAULT_REFERENCE_CATALOG_ID,
+    base_url: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     conn = get_pg_connection()
     try:
@@ -148,7 +182,8 @@ def _fetch_reference_item_by_sap(
             cur.execute(
                 """
                 SELECT catalog_id, sap, upc, full_name, brand, category,
-                       case_pack, display_order, source, active
+                       case_pack, display_order, image_path, image_thumb_path,
+                       source, active
                 FROM reference_catalog_items
                 WHERE catalog_id = %s AND sap = %s AND active = TRUE
                 LIMIT 1
@@ -156,7 +191,7 @@ def _fetch_reference_item_by_sap(
                 [catalog_id, sap],
             )
             row = cur.fetchone()
-            return _normalize_reference_item(dict(row)) if row else None
+            return _normalize_reference_item(dict(row), base_url=base_url) if row else None
     finally:
         return_pg_connection(conn)
 
@@ -165,6 +200,7 @@ def _fetch_reference_catalog_items(
     *,
     catalog_id: str = DEFAULT_REFERENCE_CATALOG_ID,
     limit: int = 250,
+    base_url: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     conn = get_pg_connection()
     try:
@@ -172,7 +208,8 @@ def _fetch_reference_catalog_items(
             cur.execute(
                 """
                 SELECT catalog_id, sap, upc, full_name, brand, category,
-                       case_pack, display_order, source, active
+                       case_pack, display_order, image_path, image_thumb_path,
+                       source, active
                 FROM reference_catalog_items
                 WHERE catalog_id = %s AND active = TRUE
                 ORDER BY display_order NULLS LAST, sap
@@ -180,7 +217,29 @@ def _fetch_reference_catalog_items(
                 """,
                 [catalog_id, limit],
             )
-            return [_normalize_reference_item(dict(row)) for row in cur.fetchall()]
+            return [_normalize_reference_item(dict(row), base_url=base_url) for row in cur.fetchall()]
+    finally:
+        return_pg_connection(conn)
+
+
+def _fetch_reference_image_path(sap: str, *, catalog_id: str = DEFAULT_REFERENCE_CATALOG_ID) -> Optional[FilePath]:
+    conn = get_pg_connection()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT image_path
+                FROM reference_catalog_items
+                WHERE catalog_id = %s AND sap = %s AND active = TRUE
+                LIMIT 1
+                """,
+                [catalog_id, sap],
+            )
+            row = cur.fetchone()
+            image_path = _clean_optional_text(dict(row).get("image_path")) if row else None
+            if not image_path:
+                return None
+            return _safe_catalog_image_file(_image_root(), image_path)
     finally:
         return_pg_connection(conn)
 
@@ -193,8 +252,8 @@ async def get_starter_catalog(
     decoded_token: dict = Depends(verify_firebase_token),
 ) -> Dict[str, Any]:
     """Return the shared RouteSpark starter/reference catalog."""
-    del request, decoded_token
-    items = _fetch_reference_catalog_items(limit=limit)
+    del decoded_token
+    items = _fetch_reference_catalog_items(limit=limit, base_url=str(request.base_url))
     return {
         "catalogId": DEFAULT_REFERENCE_CATALOG_ID,
         "items": items,
@@ -214,9 +273,9 @@ async def search_reference_catalog(
     This data is not route-private, but reads still require Firebase auth so the
     endpoint cannot be scraped anonymously.
     """
-    del request, decoded_token
+    del decoded_token
     query = q.strip()
-    items = _fetch_reference_items_by_search(query, limit=limit)
+    items = _fetch_reference_items_by_search(query, limit=limit, base_url=str(request.base_url))
     return {
         "catalogId": DEFAULT_REFERENCE_CATALOG_ID,
         "query": query,
@@ -232,11 +291,30 @@ async def get_reference_catalog_item(
     decoded_token: dict = Depends(verify_firebase_token),
 ) -> Dict[str, Any]:
     """Return one item from the shared RouteSpark reference catalog by SAP."""
-    del request, decoded_token
-    item = _fetch_reference_item_by_sap(sap.strip())
+    del decoded_token
+    item = _fetch_reference_item_by_sap(sap.strip(), base_url=str(request.base_url))
     if not item:
         raise HTTPException(status_code=404, detail="Reference catalog item not found")
     return {"catalogId": DEFAULT_REFERENCE_CATALOG_ID, "sap": item["sap"], "item": item}
+
+
+@router.get("/catalog/starter/images/{sap}.png")
+@rate_limit_history
+async def get_reference_catalog_image(
+    request: Request,
+    sap: str = Path(..., pattern=r"^[A-Za-z0-9_-]{1,20}$"),
+    decoded_token: dict = Depends(verify_firebase_token),
+) -> FileResponse:
+    """Return a reviewed reference product image by SAP."""
+    del request, decoded_token
+    image_path = _fetch_reference_image_path(sap.strip())
+    if not image_path:
+        raise HTTPException(status_code=404, detail="Reference catalog image not found")
+    return FileResponse(
+        image_path,
+        media_type="image/png",
+        headers={"Cache-Control": "private, max-age=86400"},
+    )
 
 
 @router.get("/products")
