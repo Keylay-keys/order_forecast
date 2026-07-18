@@ -1,6 +1,7 @@
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import MagicMock, patch
 
 from order_forecast.api.routers import catalog, reference
 from order_forecast.scripts import load_reference_catalog
@@ -114,6 +115,48 @@ class CatalogReferenceContractTests(unittest.TestCase):
 
     def test_reference_like_escape_escapes_wildcards(self):
         self.assertEqual(reference._escape_like(r"100%_chips\\"), r"100\%\_chips\\\\")
+
+    def test_reference_catalog_list_defaults_to_active_only(self):
+        rows = [
+            {
+                "catalog_id": "routespark-starter-catalog",
+                "sap": "31032",
+                "full_name": "Mission Yellow Corn Tortilla",
+                "case_pack": 22,
+                "active": True,
+            }
+        ]
+        conn = MagicMock()
+        cursor = conn.cursor.return_value.__enter__.return_value
+        cursor.fetchall.return_value = rows
+
+        with patch.object(reference, "get_pg_connection", return_value=conn), patch.object(reference, "return_pg_connection"):
+            items = reference._fetch_reference_catalog_items()
+
+        self.assertEqual(items[0]["sap"], "31032")
+        self.assertIn("active = TRUE", cursor.execute.call_args.args[0])
+        self.assertEqual(cursor.execute.call_args.args[1], ["routespark-starter-catalog", False, 250])
+
+    def test_reference_catalog_list_can_include_inactive_rows(self):
+        rows = [
+            {
+                "catalog_id": "routespark-starter-catalog",
+                "sap": "99999",
+                "full_name": "Inactive Reference Item",
+                "case_pack": 12,
+                "active": False,
+            }
+        ]
+        conn = MagicMock()
+        cursor = conn.cursor.return_value.__enter__.return_value
+        cursor.fetchall.return_value = rows
+
+        with patch.object(reference, "get_pg_connection", return_value=conn), patch.object(reference, "return_pg_connection"):
+            items = reference._fetch_reference_catalog_items(include_inactive=True)
+
+        self.assertFalse(items[0]["active"])
+        self.assertIn("active = TRUE", cursor.execute.call_args.args[0])
+        self.assertEqual(cursor.execute.call_args.args[1], ["routespark-starter-catalog", True, 250])
 
     def test_reference_loader_rows_require_positive_case_pack(self):
         with self.assertRaises(ValueError):

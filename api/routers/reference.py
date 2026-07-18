@@ -115,6 +115,7 @@ def _fetch_reference_items_by_search(
     catalog_id: str = DEFAULT_REFERENCE_CATALOG_ID,
     limit: int = 25,
     base_url: Optional[str] = None,
+    include_inactive: bool = False,
 ) -> List[Dict[str, Any]]:
     normalized_query = query.strip()
     normalized_upc = _normalize_upc(normalized_query)
@@ -147,7 +148,7 @@ def _fetch_reference_items_by_search(
                     END AS match_rank
                 FROM reference_catalog_items
                 WHERE catalog_id = %s
-                  AND active = TRUE
+                  AND (%s OR active = TRUE)
                   AND (
                     sap = %s
                     OR upc = %s
@@ -169,6 +170,7 @@ def _fetch_reference_items_by_search(
                     normalized_upc,
                     like_query,
                     catalog_id,
+                    include_inactive,
                     normalized_query,
                     normalized_query,
                     normalized_upc,
@@ -189,6 +191,7 @@ def _fetch_reference_item_by_sap(
     *,
     catalog_id: str = DEFAULT_REFERENCE_CATALOG_ID,
     base_url: Optional[str] = None,
+    include_inactive: bool = False,
 ) -> Optional[Dict[str, Any]]:
     conn = get_pg_connection()
     try:
@@ -199,10 +202,10 @@ def _fetch_reference_item_by_sap(
                        case_pack, display_order, image_path, image_thumb_path,
                        source, active
                 FROM reference_catalog_items
-                WHERE catalog_id = %s AND sap = %s AND active = TRUE
+                WHERE catalog_id = %s AND sap = %s AND (%s OR active = TRUE)
                 LIMIT 1
                 """,
-                [catalog_id, sap],
+                [catalog_id, sap, include_inactive],
             )
             row = cur.fetchone()
             return _normalize_reference_item(dict(row), base_url=base_url) if row else None
@@ -215,6 +218,7 @@ def _fetch_reference_catalog_items(
     catalog_id: str = DEFAULT_REFERENCE_CATALOG_ID,
     limit: int = 250,
     base_url: Optional[str] = None,
+    include_inactive: bool = False,
 ) -> List[Dict[str, Any]]:
     conn = get_pg_connection()
     try:
@@ -225,11 +229,11 @@ def _fetch_reference_catalog_items(
                        case_pack, display_order, image_path, image_thumb_path,
                        source, active
                 FROM reference_catalog_items
-                WHERE catalog_id = %s AND active = TRUE
+                WHERE catalog_id = %s AND (%s OR active = TRUE)
                 ORDER BY display_order NULLS LAST, sap
                 LIMIT %s
                 """,
-                [catalog_id, limit],
+                [catalog_id, include_inactive, limit],
             )
             return [_normalize_reference_item(dict(row), base_url=base_url) for row in cur.fetchall()]
     finally:
@@ -263,11 +267,16 @@ def _fetch_reference_image_path(sap: str, *, catalog_id: str = DEFAULT_REFERENCE
 async def get_starter_catalog(
     request: Request,
     limit: int = Query(250, ge=1, le=500),
+    includeInactive: bool = Query(False, description="Include inactive reference rows"),
     decoded_token: dict = Depends(verify_firebase_token),
 ) -> Dict[str, Any]:
     """Return the shared RouteSpark starter/reference catalog."""
     del decoded_token
-    items = _fetch_reference_catalog_items(limit=limit, base_url=_public_base_url(request))
+    items = _fetch_reference_catalog_items(
+        limit=limit,
+        base_url=_public_base_url(request),
+        include_inactive=includeInactive,
+    )
     return {
         "catalogId": DEFAULT_REFERENCE_CATALOG_ID,
         "items": items,
@@ -280,6 +289,7 @@ async def search_reference_catalog(
     request: Request,
     q: str = Query(..., min_length=1, max_length=120, description="SAP, UPC, or item description"),
     limit: int = Query(25, ge=1, le=50),
+    includeInactive: bool = Query(False, description="Include inactive reference rows"),
     decoded_token: dict = Depends(verify_firebase_token),
 ) -> Dict[str, Any]:
     """Search the shared RouteSpark reference catalog.
@@ -289,7 +299,12 @@ async def search_reference_catalog(
     """
     del decoded_token
     query = q.strip()
-    items = _fetch_reference_items_by_search(query, limit=limit, base_url=_public_base_url(request))
+    items = _fetch_reference_items_by_search(
+        query,
+        limit=limit,
+        base_url=_public_base_url(request),
+        include_inactive=includeInactive,
+    )
     return {
         "catalogId": DEFAULT_REFERENCE_CATALOG_ID,
         "query": query,
@@ -302,11 +317,16 @@ async def search_reference_catalog(
 async def get_reference_catalog_item(
     request: Request,
     sap: str = Path(..., pattern=r"^[A-Za-z0-9_-]{1,20}$"),
+    includeInactive: bool = Query(False, description="Include inactive reference rows"),
     decoded_token: dict = Depends(verify_firebase_token),
 ) -> Dict[str, Any]:
     """Return one item from the shared RouteSpark reference catalog by SAP."""
     del decoded_token
-    item = _fetch_reference_item_by_sap(sap.strip(), base_url=_public_base_url(request))
+    item = _fetch_reference_item_by_sap(
+        sap.strip(),
+        base_url=_public_base_url(request),
+        include_inactive=includeInactive,
+    )
     if not item:
         raise HTTPException(status_code=404, detail="Reference catalog item not found")
     return {"catalogId": DEFAULT_REFERENCE_CATALOG_ID, "sap": item["sap"], "item": item}
