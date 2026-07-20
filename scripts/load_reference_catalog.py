@@ -8,6 +8,7 @@ JSON. It does not touch Firebase or any route-scoped user catalog.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
@@ -107,6 +108,51 @@ def _rows(
     return rows
 
 
+def _catalog_signature(products: Iterable[Dict[str, Any]], image_paths: Dict[str, Dict[str, Optional[str]]]) -> str:
+    normalized = []
+    for product in products:
+        sap = _clean_text(product.get("sap"))
+        images = image_paths.get(sap, {})
+        normalized.append(
+            {
+                "sap": sap,
+                "upc": _clean_text(product.get("upc")),
+                "fullName": _clean_text(
+                    product.get("fullName") or product.get("itemDescription") or product.get("description")
+                ),
+                "brand": _clean_text(product.get("brand")),
+                "category": _clean_text(product.get("category")),
+                "casePack": _clean_int(product.get("casePack") or product.get("caseCount"), 0),
+                "displayOrder": _clean_int(product.get("displayOrder"), 0),
+                "imagePath": images.get("imagePath") or None,
+                "imageThumbPath": images.get("imageThumbPath") or None,
+                "active": bool(product.get("active", True)),
+            }
+        )
+    payload = json.dumps(sorted(normalized, key=lambda row: row["sap"]), sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _next_catalog_version(cur: Any, *, catalog_id: str, signature: str) -> int:
+    cur.execute(
+        """
+        SELECT version, signature
+        FROM reference_catalog_meta
+        WHERE catalog_id = %s
+        LIMIT 1
+        """,
+        [catalog_id],
+    )
+    row = cur.fetchone()
+    if not row:
+        return 1
+    existing_version = int(row[0] if not isinstance(row, dict) else row.get("version") or 0)
+    existing_signature = row[1] if not isinstance(row, dict) else row.get("signature")
+    if existing_signature == signature:
+        return max(existing_version, 1)
+    return max(existing_version, 0) + 1
+
+
 def load_reference_catalog(
     path: Path,
     *,
@@ -120,10 +166,12 @@ def load_reference_catalog(
 
     image_paths = _image_paths_by_sap(image_manifest)
     rows = _rows(products, catalog_id=catalog_id, source_label=source_label, image_paths=image_paths)
+    signature = _catalog_signature(products, image_paths)
     conn = get_connection()
     try:
         create_schema(conn)
         with conn.cursor() as cur:
+            version = _next_catalog_version(cur, catalog_id=catalog_id, signature=signature)
             execute_values(
                 cur,
                 """
@@ -147,6 +195,21 @@ def load_reference_catalog(
                     updated_at = CURRENT_TIMESTAMP
                 """,
                 rows,
+            )
+            cur.execute(
+                """
+                INSERT INTO reference_catalog_meta (
+                    catalog_id, version, product_count, signature, source, updated_at
+                )
+                VALUES (%s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
+                ON CONFLICT (catalog_id) DO UPDATE SET
+                    version = EXCLUDED.version,
+                    product_count = EXCLUDED.product_count,
+                    signature = EXCLUDED.signature,
+                    source = EXCLUDED.source,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                [catalog_id, version, len(rows), signature, source_label],
             )
         conn.commit()
         return len(rows)

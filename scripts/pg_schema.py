@@ -325,6 +325,19 @@ def _create_user_param_tables(cur) -> None:
     """)
     cur.execute("ALTER TABLE reference_catalog_items ADD COLUMN IF NOT EXISTS image_path VARCHAR(255)")
     cur.execute("ALTER TABLE reference_catalog_items ADD COLUMN IF NOT EXISTS image_thumb_path VARCHAR(255)")
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS reference_catalog_meta (
+            catalog_id VARCHAR(120) PRIMARY KEY,
+            version INTEGER NOT NULL,
+            product_count INTEGER NOT NULL DEFAULT 0,
+            signature VARCHAR(64) NOT NULL,
+            source VARCHAR(120),
+            updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    cur.execute("ALTER TABLE reference_catalog_meta ADD COLUMN IF NOT EXISTS product_count INTEGER NOT NULL DEFAULT 0")
+    cur.execute("ALTER TABLE reference_catalog_meta ADD COLUMN IF NOT EXISTS signature VARCHAR(64)")
+    cur.execute("ALTER TABLE reference_catalog_meta ADD COLUMN IF NOT EXISTS source VARCHAR(120)")
     
     # User order guide preferences
     cur.execute("""

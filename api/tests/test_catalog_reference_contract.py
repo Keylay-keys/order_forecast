@@ -102,6 +102,37 @@ class CatalogReferenceContractTests(unittest.TestCase):
         self.assertIsNone(item["imageUrl"])
         self.assertIsNone(item["imageThumbUrl"])
 
+    def test_reference_meta_normalization_uses_top_level_contract_names(self):
+        meta = reference._normalize_reference_meta(
+            {
+                "version": 12,
+                "product_count": 204,
+                "updated_at": "2026-07-20T12:00:00Z",
+            }
+        )
+
+        self.assertEqual(meta["version"], 12)
+        self.assertEqual(meta["productCount"], 204)
+        self.assertEqual(meta["updatedAt"], "2026-07-20T12:00:00Z")
+
+    def test_reference_catalog_response_adds_metadata_without_changing_items(self):
+        with patch.object(reference, "_fetch_reference_catalog_meta", return_value={
+            "version": 12,
+            "productCount": 204,
+            "updatedAt": "2026-07-20T12:00:00Z",
+        }):
+            response = reference._reference_catalog_response(
+                items=[{"sap": "31032"}],
+                extra={"query": "31032"},
+            )
+
+        self.assertEqual(response["catalogId"], "routespark-starter-catalog")
+        self.assertEqual(response["version"], 12)
+        self.assertEqual(response["productCount"], 204)
+        self.assertEqual(response["updatedAt"], "2026-07-20T12:00:00Z")
+        self.assertEqual(response["items"], [{"sap": "31032"}])
+        self.assertEqual(response["query"], "31032")
+
     def test_reference_public_base_url_uses_forwarded_https_headers(self):
         request = _FakeRequest(
             headers={
@@ -211,6 +242,57 @@ class CatalogReferenceContractTests(unittest.TestCase):
 
         self.assertEqual(rows[0][8], "routespark-starter-catalog/31032.png")
         self.assertEqual(rows[0][9], "routespark-starter-catalog/31032.png")
+
+    def test_reference_loader_signature_changes_when_upc_changes(self):
+        image_paths = {}
+        signature_a = load_reference_catalog._catalog_signature(
+            [
+                {
+                    "sap": "54511",
+                    "upc": "11110-08472",
+                    "fullName": "Kroger Zero Net Carb Street Taco",
+                    "casePack": 16,
+                }
+            ],
+            image_paths,
+        )
+        signature_b = load_reference_catalog._catalog_signature(
+            [
+                {
+                    "sap": "54511",
+                    "upc": "11110-99999",
+                    "fullName": "Kroger Zero Net Carb Street Taco",
+                    "casePack": 16,
+                }
+            ],
+            image_paths,
+        )
+
+        self.assertNotEqual(signature_a, signature_b)
+
+    def test_reference_loader_keeps_version_when_signature_is_unchanged(self):
+        cursor = MagicMock()
+        cursor.fetchone.return_value = (4, "same-signature")
+
+        version = load_reference_catalog._next_catalog_version(
+            cursor,
+            catalog_id="routespark-starter-catalog",
+            signature="same-signature",
+        )
+
+        self.assertEqual(version, 4)
+
+    def test_reference_loader_increments_version_when_signature_changes(self):
+        cursor = MagicMock()
+        cursor.fetchone.return_value = (4, "old-signature")
+
+        version = load_reference_catalog._next_catalog_version(
+            cursor,
+            catalog_id="routespark-starter-catalog",
+            signature="new-signature",
+        )
+
+        self.assertEqual(version, 5)
 
     def test_reference_loader_strips_manifest_path_to_catalog_relative_image_path(self):
         self.assertEqual(

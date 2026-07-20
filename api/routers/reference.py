@@ -101,6 +101,63 @@ def _normalize_reference_item(row: Dict[str, Any], *, base_url: Optional[str] = 
     }
 
 
+def _normalize_reference_meta(row: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    if not row:
+        return {
+            "version": None,
+            "productCount": None,
+            "updatedAt": None,
+        }
+    updated_at = row.get("updated_at") or row.get("updatedAt")
+    return {
+        "version": _clean_int(row.get("version"), 0) or None,
+        "productCount": _clean_int(row.get("product_count") or row.get("productCount"), 0) or None,
+        "updatedAt": updated_at.isoformat() if hasattr(updated_at, "isoformat") else _clean_optional_text(updated_at),
+    }
+
+
+def _fetch_reference_catalog_meta(
+    *,
+    catalog_id: str = DEFAULT_REFERENCE_CATALOG_ID,
+) -> Dict[str, Any]:
+    conn = get_pg_connection()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT catalog_id, version, product_count, updated_at
+                FROM reference_catalog_meta
+                WHERE catalog_id = %s
+                LIMIT 1
+                """,
+                [catalog_id],
+            )
+            row = cur.fetchone()
+            return _normalize_reference_meta(dict(row) if row else None)
+    finally:
+        return_pg_connection(conn)
+
+
+def _reference_catalog_response(
+    *,
+    catalog_id: str = DEFAULT_REFERENCE_CATALOG_ID,
+    items: Optional[List[Dict[str, Any]]] = None,
+    extra: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    meta = _fetch_reference_catalog_meta(catalog_id=catalog_id)
+    response: Dict[str, Any] = {
+        "catalogId": catalog_id,
+        "version": meta["version"],
+        "productCount": meta["productCount"],
+        "updatedAt": meta["updatedAt"],
+    }
+    if items is not None:
+        response["items"] = items
+    if extra:
+        response.update(extra)
+    return response
+
+
 def _safe_catalog_image_file(root: FilePath, image_path: str) -> Optional[FilePath]:
     resolved_root = root.resolve()
     candidate = (resolved_root / image_path).resolve()
@@ -277,10 +334,7 @@ async def get_starter_catalog(
         base_url=_public_base_url(request),
         include_inactive=includeInactive,
     )
-    return {
-        "catalogId": DEFAULT_REFERENCE_CATALOG_ID,
-        "items": items,
-    }
+    return _reference_catalog_response(items=items)
 
 
 @router.get("/catalog/items/search")
@@ -305,11 +359,7 @@ async def search_reference_catalog(
         base_url=_public_base_url(request),
         include_inactive=includeInactive,
     )
-    return {
-        "catalogId": DEFAULT_REFERENCE_CATALOG_ID,
-        "query": query,
-        "items": items,
-    }
+    return _reference_catalog_response(items=items, extra={"query": query})
 
 
 @router.get("/catalog/starter/items/{sap}")
@@ -329,7 +379,7 @@ async def get_reference_catalog_item(
     )
     if not item:
         raise HTTPException(status_code=404, detail="Reference catalog item not found")
-    return {"catalogId": DEFAULT_REFERENCE_CATALOG_ID, "sap": item["sap"], "item": item}
+    return _reference_catalog_response(extra={"sap": item["sap"], "item": item})
 
 
 @router.get("/catalog/starter/images/{sap}.png")
