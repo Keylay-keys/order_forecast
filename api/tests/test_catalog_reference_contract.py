@@ -1,10 +1,16 @@
+import inspect
+import json
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import MagicMock, patch
 
+from fastapi import HTTPException
+
 from order_forecast.api.routers import catalog, reference
 from order_forecast.scripts import load_reference_catalog
+
+ROOT_DIR = Path(__file__).resolve().parents[3]
 
 
 class _FakeRequest:
@@ -18,6 +24,178 @@ class _FakeRequest:
         self.url = Url()
         self.url.scheme = scheme
         self.url.netloc = netloc
+
+
+class _FakeSnapshot:
+    def __init__(self, doc_id, data):
+        self.id = doc_id
+        self._data = data
+        self.exists = data is not None
+
+    def to_dict(self):
+        return dict(self._data or {})
+
+
+class _FakeCollection:
+    def __init__(self, db, path):
+        self.db = db
+        self.path = tuple(path)
+
+    def document(self, doc_id):
+        return _FakeDocument(self.db, self.path + (doc_id,))
+
+    def stream(self):
+        data = self.db.collection_data(self.path)
+        return [_FakeSnapshot(doc_id, doc_data) for doc_id, doc_data in data.items()]
+
+
+class _FakeDocument:
+    def __init__(self, db, path):
+        self.db = db
+        self.path = tuple(path)
+        self.id = self.path[-1]
+
+    def collection(self, name):
+        return _FakeCollection(self.db, self.path + (name,))
+
+    def get(self):
+        return _FakeSnapshot(self.id, self.db.document_data(self.path))
+
+    def set(self, data, merge=False):
+        self.db.set_document(self.path, data, merge=merge)
+
+    def update(self, data):
+        self.db.update_document(self.path, data)
+
+    def delete(self):
+        self.db.delete_document(self.path)
+
+
+class _FakeBatch:
+    def __init__(self, db):
+        self.db = db
+        self.operations = []
+
+    def set(self, doc_ref, data, merge=False):
+        self.operations.append(("set", doc_ref.path, dict(data), merge))
+
+    def update(self, doc_ref, data):
+        self.operations.append(("update", doc_ref.path, dict(data), False))
+
+    def commit(self):
+        for op, path, data, merge in self.operations:
+            if op == "set":
+                self.db.set_document(path, data, merge=merge)
+            elif op == "update":
+                self.db.update_document(path, data)
+        self.db.batch_commits += 1
+        self.db.batch_write_counts.append(len(self.operations))
+
+
+class _FakeDB:
+    def __init__(self):
+        self.root = {"masterCatalog": {}, "routes": {}, "sharedCatalogs": {}}
+        self.batch_commits = 0
+        self.batch_write_counts = []
+
+    def collection(self, name):
+        self.root.setdefault(name, {})
+        return _FakeCollection(self, (name,))
+
+    def batch(self):
+        return _FakeBatch(self)
+
+    def collection_data(self, path):
+        if len(path) == 1:
+            return self.root.setdefault(path[0], {})
+        if len(path) == 3:
+            parent = self.document_data(path[:2])
+            if parent is None:
+                return {}
+            return parent.setdefault("_subcollections", {}).setdefault(path[2], {})
+        raise AssertionError(f"Unsupported collection path: {path}")
+
+    def document_data(self, path):
+        if len(path) == 2:
+            return self.root.setdefault(path[0], {}).get(path[1])
+        if len(path) == 4:
+            parent = self.document_data(path[:2])
+            if parent is None:
+                return None
+            return parent.setdefault("_subcollections", {}).setdefault(path[2], {}).get(path[3])
+        raise AssertionError(f"Unsupported document path: {path}")
+
+    def set_document(self, path, data, merge=False):
+        if len(path) == 2:
+            collection = self.root.setdefault(path[0], {})
+        elif len(path) == 4:
+            parent = self.root.setdefault(path[0], {}).setdefault(path[1], {})
+            collection = parent.setdefault("_subcollections", {}).setdefault(path[2], {})
+        else:
+            raise AssertionError(f"Unsupported document path: {path}")
+        current = collection.get(path[-1]) if merge else None
+        collection[path[-1]] = {**(current or {}), **data}
+
+    def update_document(self, path, data):
+        current = self.document_data(path)
+        if current is None:
+            raise AssertionError(f"Missing document for update: {path}")
+        current.update(data)
+
+    def delete_document(self, path):
+        if len(path) == 4:
+            parent = self.document_data(path[:2])
+            if parent is not None:
+                parent.setdefault("_subcollections", {}).setdefault(path[2], {}).pop(path[3], None)
+            return
+        if len(path) == 2:
+            self.root.setdefault(path[0], {}).pop(path[1], None)
+            return
+        raise AssertionError(f"Unsupported document path: {path}")
+
+
+def _unwrap(endpoint):
+    return inspect.unwrap(endpoint)
+
+
+def _reference_payload(version=12, items=None):
+    return {
+        "version": version,
+        "items": items
+        if items is not None
+        else [
+            {
+                "sap": "31032",
+                "upc": "73731-00328",
+                "brand": "Mission",
+                "category": "Tortillas",
+                "fullName": "Mission Yellow Corn Tortillas",
+                "casePack": 22,
+                "displayOrder": 1,
+                "active": True,
+            },
+            {
+                "sap": "54511",
+                "upc": "11110-08472",
+                "brand": "Kroger",
+                "category": "Tortillas",
+                "fullName": "Kroger Zero Net Carb Street Taco",
+                "casePack": 16,
+                "displayOrder": 2,
+                "active": True,
+            },
+            {
+                "sap": "54773",
+                "upc": "075202303167",
+                "brand": "Deli Fresh",
+                "category": "Chips",
+                "fullName": "Hint of Lime Deli Fresh Chips",
+                "casePack": 8,
+                "displayOrder": 3,
+                "active": True,
+            },
+        ],
+    }
 
 
 class CatalogReferenceContractTests(unittest.TestCase):
@@ -314,6 +492,307 @@ class CatalogReferenceContractTests(unittest.TestCase):
 
             self.assertEqual(safe, image.resolve())
             self.assertIsNone(escape)
+
+
+class SapListActivationApiTests(unittest.IsolatedAsyncioTestCase):
+    def test_python_planner_matches_shared_fixture_summary(self):
+        fixture_path = ROOT_DIR / "scripts" / "fixtures" / "sap-list-activation" / "basic-summary.json"
+        fixture = json.loads(fixture_path.read_text())
+
+        plan = catalog.build_sap_activation_plan(
+            route_number=fixture["routeNumber"],
+            reference_version=fixture["referenceVersion"],
+            reference_products=fixture["referenceProducts"],
+            route_products=fixture["routeProducts"],
+            uploaded_saps=catalog.SapListActivationRequest(saps=fixture["uploadedSaps"]).saps,
+            hide_missing_reference_items=fixture["hideMissingReferenceItems"],
+        )
+
+        self.assertEqual(plan["summary"], fixture["expectedSummary"])
+
+    async def test_preview_returns_summary_and_writes_nothing(self):
+        db = _FakeDB()
+        db.set_document(
+            ("masterCatalog", "988200", "products", "54511"),
+            {
+                "sap": "54511",
+                "fullName": "Kroger Zero Net Carb Street Taco",
+                "casePack": 16,
+                "active": True,
+                "catalogOrigin": "routespark-reference",
+                "referenceSap": "54511",
+                "referenceVersion": 11,
+            },
+        )
+        payload = catalog.SapListActivationRequest(saps=["31032", "54511", "99999"])
+
+        with patch.object(catalog, "_require_catalog_owner", return_value={"profile": {"role": "owner"}}), patch.object(
+            catalog, "fetch_reference_catalog_for_activation", return_value=_reference_payload(version=12)
+        ):
+            response = await _unwrap(catalog.preview_sap_list_activation)(
+                request=_FakeRequest(),
+                payload=payload,
+                route="988200",
+                decoded_token={"uid": "owner-1"},
+                db=db,
+            )
+
+        summary = response["summary"]
+        self.assertTrue(summary["dryRun"])
+        self.assertFalse(summary["applied"])
+        self.assertEqual(summary["addedSaps"], ["31032"])
+        self.assertEqual(summary["alreadyActiveCount"], 1)
+        self.assertEqual(summary["unknownSaps"], ["99999"])
+        self.assertEqual(db.batch_commits, 0)
+
+    async def test_apply_adds_reference_doc_with_origin_fields(self):
+        db = _FakeDB()
+        payload = catalog.SapListActivationRequest(saps=["54773"])
+
+        with patch.object(catalog, "_require_catalog_owner", return_value={"profile": {"role": "owner"}}), patch.object(
+            catalog, "fetch_reference_catalog_for_activation", return_value=_reference_payload(version=14)
+        ):
+            response = await _unwrap(catalog.apply_sap_list_activation)(
+                request=_FakeRequest(),
+                payload=payload,
+                route="988200",
+                decoded_token={"uid": "owner-1"},
+                db=db,
+            )
+
+        doc = db.document_data(("masterCatalog", "988200", "products", "54773"))
+        self.assertTrue(response["summary"]["applied"])
+        self.assertEqual(response["summary"]["addedSaps"], ["54773"])
+        self.assertEqual(doc["catalogOrigin"], "routespark-reference")
+        self.assertEqual(doc["referenceSap"], "54773")
+        self.assertEqual(doc["referenceVersion"], 14)
+        self.assertEqual(doc["casePack"], 8)
+        self.assertEqual(doc["upc"], "075202303167")
+        self.assertIn("createdAt", doc)
+        self.assertIn("updatedAt", doc)
+
+    async def test_apply_reactivates_inactive_reference_row_and_refreshes_fields(self):
+        db = _FakeDB()
+        db.set_document(
+            ("masterCatalog", "988200", "products", "54773"),
+            {
+                "sap": "54773",
+                "fullName": "Old Deli Fresh Name",
+                "casePack": 10,
+                "active": False,
+                "catalogOrigin": "routespark-reference",
+                "referenceSap": "54773",
+                "referenceVersion": 9,
+                "createdAt": 123,
+            },
+        )
+        payload = catalog.SapListActivationRequest(saps=["54773"])
+
+        with patch.object(catalog, "_require_catalog_owner", return_value={"profile": {"role": "owner"}}), patch.object(
+            catalog, "fetch_reference_catalog_for_activation", return_value=_reference_payload(version=15)
+        ):
+            response = await _unwrap(catalog.apply_sap_list_activation)(
+                request=_FakeRequest(),
+                payload=payload,
+                route="988200",
+                decoded_token={"uid": "owner-1"},
+                db=db,
+            )
+
+        doc = db.document_data(("masterCatalog", "988200", "products", "54773"))
+        self.assertEqual(response["summary"]["activatedSaps"], ["54773"])
+        self.assertTrue(doc["active"])
+        self.assertEqual(doc["fullName"], "Hint of Lime Deli Fresh Chips")
+        self.assertEqual(doc["casePack"], 8)
+        self.assertEqual(doc["referenceVersion"], 15)
+        self.assertEqual(doc["createdAt"], 123)
+
+    async def test_hide_missing_hides_only_reference_origin_and_preserves_user_product(self):
+        db = _FakeDB()
+        db.set_document(
+            ("masterCatalog", "988200", "products", "31032"),
+            {"sap": "31032", "active": True, "catalogOrigin": "routespark-reference", "referenceSap": "31032"},
+        )
+        db.set_document(
+            ("masterCatalog", "988200", "products", "54511"),
+            {"sap": "54511", "active": True, "catalogOrigin": "routespark-reference", "referenceSap": "54511"},
+        )
+        db.set_document(
+            ("masterCatalog", "988200", "products", "77777"),
+            {"sap": "77777", "active": True, "catalogOrigin": "user-added", "fullName": "Local Item"},
+        )
+        payload = catalog.SapListActivationRequest(saps=["31032"], hideMissingReferenceItems=True)
+
+        with patch.object(catalog, "_require_catalog_owner", return_value={"profile": {"role": "owner"}}), patch.object(
+            catalog, "fetch_reference_catalog_for_activation", return_value=_reference_payload(version=12)
+        ):
+            response = await _unwrap(catalog.apply_sap_list_activation)(
+                request=_FakeRequest(),
+                payload=payload,
+                route="988200",
+                decoded_token={"uid": "owner-1"},
+                db=db,
+            )
+
+        self.assertEqual(response["summary"]["hiddenReferenceSaps"], ["54511"])
+        self.assertFalse(db.document_data(("masterCatalog", "988200", "products", "54511"))["active"])
+        self.assertTrue(db.document_data(("masterCatalog", "988200", "products", "77777"))["active"])
+
+    async def test_team_member_is_rejected_before_product_writes(self):
+        db = _FakeDB()
+        payload = catalog.SapListActivationRequest(saps=["31032"])
+
+        with patch.object(catalog, "_require_catalog_owner", side_effect=HTTPException(403, "Catalog changes require route owner access")):
+            with self.assertRaises(HTTPException) as raised:
+                await _unwrap(catalog.apply_sap_list_activation)(
+                    request=_FakeRequest(),
+                    payload=payload,
+                    route="988200",
+                    decoded_token={"uid": "member-1"},
+                    db=db,
+                )
+
+        self.assertEqual(raised.exception.status_code, 403)
+        self.assertEqual(db.batch_commits, 0)
+
+    async def test_zero_match_hide_missing_is_blocked(self):
+        db = _FakeDB()
+        db.set_document(
+            ("masterCatalog", "988200", "products", "31032"),
+            {"sap": "31032", "active": True, "catalogOrigin": "routespark-reference", "referenceSap": "31032"},
+        )
+        payload = catalog.SapListActivationRequest(saps=["99999"], hideMissingReferenceItems=True)
+
+        with patch.object(catalog, "_require_catalog_owner", return_value={"profile": {"role": "owner"}}), patch.object(
+            catalog, "fetch_reference_catalog_for_activation", return_value=_reference_payload(version=12)
+        ):
+            with self.assertRaises(HTTPException) as raised:
+                await _unwrap(catalog.apply_sap_list_activation)(
+                    request=_FakeRequest(),
+                    payload=payload,
+                    route="988200",
+                    decoded_token={"uid": "owner-1"},
+                    db=db,
+                )
+
+        self.assertEqual(raised.exception.status_code, 400)
+        self.assertEqual(raised.exception.detail["code"], "hide_missing_blocked")
+        self.assertTrue(db.document_data(("masterCatalog", "988200", "products", "31032"))["active"])
+
+    async def test_empty_and_all_already_active_apply_are_no_ops(self):
+        db = _FakeDB()
+        db.set_document(
+            ("masterCatalog", "988200", "products", "31032"),
+            {"sap": "31032", "active": True, "catalogOrigin": "routespark-reference", "referenceSap": "31032"},
+        )
+
+        with patch.object(catalog, "_require_catalog_owner", return_value={"profile": {"role": "owner"}}), patch.object(
+            catalog, "fetch_reference_catalog_for_activation", return_value=_reference_payload(version=12)
+        ):
+            empty = await _unwrap(catalog.apply_sap_list_activation)(
+                request=_FakeRequest(),
+                payload=catalog.SapListActivationRequest(saps=[]),
+                route="988200",
+                decoded_token={"uid": "owner-1"},
+                db=db,
+            )
+            already = await _unwrap(catalog.apply_sap_list_activation)(
+                request=_FakeRequest(),
+                payload=catalog.SapListActivationRequest(saps=["31032"]),
+                route="988200",
+                decoded_token={"uid": "owner-1"},
+                db=db,
+            )
+
+        self.assertTrue(empty["summary"]["applied"])
+        self.assertTrue(already["summary"]["applied"])
+        self.assertEqual(already["summary"]["alreadyActiveCount"], 1)
+        self.assertEqual(db.batch_commits, 0)
+
+    async def test_chunked_apply_splits_large_write_plan(self):
+        db = _FakeDB()
+        items = [
+            {
+                "sap": str(10000 + index),
+                "fullName": f"Reference Item {index}",
+                "casePack": 12,
+                "displayOrder": index,
+                "active": True,
+            }
+            for index in range(catalog.MAX_ROUTE_CATALOG_BATCH_WRITES + 1)
+        ]
+        payload = catalog.SapListActivationRequest(saps=[item["sap"] for item in items])
+
+        with patch.object(catalog, "_require_catalog_owner", return_value={"profile": {"role": "owner"}}), patch.object(
+            catalog, "fetch_reference_catalog_for_activation", return_value=_reference_payload(version=16, items=items)
+        ):
+            response = await _unwrap(catalog.apply_sap_list_activation)(
+                request=_FakeRequest(),
+                payload=payload,
+                route="988200",
+                decoded_token={"uid": "owner-1"},
+                db=db,
+            )
+
+        self.assertEqual(len(response["summary"]["addedSaps"]), catalog.MAX_ROUTE_CATALOG_BATCH_WRITES + 1)
+        self.assertEqual(db.batch_commits, 2)
+        self.assertEqual(db.batch_write_counts, [catalog.MAX_ROUTE_CATALOG_BATCH_WRITES, 1])
+
+    async def test_adopted_route_forks_before_first_portal_write(self):
+        db = _FakeDB()
+        db.set_document(
+            ("routes", "988200"),
+            {
+                "catalog": {
+                    "mode": "adopted",
+                    "sourceCatalogId": "shared-source",
+                    "adoptedVersion": 3,
+                    "shareEligible": False,
+                    "publishRequired": False,
+                }
+            },
+        )
+        db.set_document(("sharedCatalogs", "shared-source", "adopters", "988200"), {"routeNumber": "988200"})
+        db.set_document(("sharedCatalogs", "shared-source", "adopters", "owner-1"), {"ownerUid": "owner-1"})
+        payload = catalog.SapListActivationRequest(saps=["31032"])
+
+        with patch.object(catalog, "_require_catalog_owner", return_value={"profile": {"role": "owner"}}), patch.object(
+            catalog, "fetch_reference_catalog_for_activation", return_value=_reference_payload(version=12)
+        ):
+            response = await _unwrap(catalog.apply_sap_list_activation)(
+                request=_FakeRequest(),
+                payload=payload,
+                route="988200",
+                decoded_token={"uid": "owner-1"},
+                db=db,
+            )
+
+        route_doc = db.document_data(("routes", "988200"))
+        self.assertTrue(response["summary"]["forked"])
+        self.assertEqual(route_doc["catalog"]["mode"], "forked")
+        self.assertTrue(route_doc["catalog"]["shareEligible"])
+        self.assertTrue(route_doc["catalog"]["publishRequired"])
+        self.assertIsNone(db.document_data(("sharedCatalogs", "shared-source", "adopters", "988200")))
+        self.assertIsNone(db.document_data(("sharedCatalogs", "shared-source", "adopters", "owner-1")))
+
+    async def test_source_and_forked_routes_do_not_rewrite_lineage(self):
+        for mode in ("source", "forked"):
+            db = _FakeDB()
+            db.set_document(("routes", "988200"), {"catalog": {"mode": mode, "sourceCatalogId": "988200"}})
+
+            with patch.object(catalog, "_require_catalog_owner", return_value={"profile": {"role": "owner"}}), patch.object(
+                catalog, "fetch_reference_catalog_for_activation", return_value=_reference_payload(version=12)
+            ):
+                response = await _unwrap(catalog.apply_sap_list_activation)(
+                    request=_FakeRequest(),
+                    payload=catalog.SapListActivationRequest(saps=["31032"]),
+                    route="988200",
+                    decoded_token={"uid": "owner-1"},
+                    db=db,
+                )
+
+            self.assertFalse(response["summary"]["forked"])
+            self.assertEqual(db.document_data(("routes", "988200"))["catalog"]["mode"], mode)
 
 
 if __name__ == "__main__":
