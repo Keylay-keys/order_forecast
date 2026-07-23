@@ -262,8 +262,8 @@ class CatalogReferenceContractTests(unittest.TestCase):
         self.assertEqual(item["upc"], "075202303167")
         self.assertEqual(item["fullName"], "Hint of Lime Deli Fresh Chips")
         self.assertEqual(item["casePack"], 10)
-        self.assertEqual(item["imageUrl"], "https://api.routespark.pro/api/catalog/starter/images/54773.png")
-        self.assertEqual(item["imageThumbUrl"], "https://api.routespark.pro/api/catalog/starter/images/54773.png")
+        self.assertTrue(item["imageUrl"].startswith("https://api.routespark.pro/api/catalog/starter/images/54773.png"))
+        self.assertTrue(item["imageThumbUrl"].startswith("https://api.routespark.pro/api/catalog/starter/images/54773.png"))
 
     def test_reference_item_without_image_has_null_image_urls(self):
         item = reference._normalize_reference_item(

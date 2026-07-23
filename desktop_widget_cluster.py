@@ -13,6 +13,8 @@ It is intentionally not activated by default.
 
 from pathlib import Path
 import json
+import os
+import signal
 import socket
 import subprocess
 import time
@@ -24,6 +26,7 @@ CLUSTER_EDGE_LAN_SSH_HOST = "keylay@192.168.1.39"
 CLUSTER_EDGE_TAILSCALE_SSH_HOST = "keylay@100.66.239.73"
 CLUSTER_DATA_LAN_SSH_HOST = "keylay@192.168.1.40"
 CLUSTER_DATA_TAILSCALE_SSH_HOST = "keylay@100.72.199.115"
+CLUSTER_EVENTS_LAN_SSH_HOST = "keylay@192.168.1.38"
 CLUSTER_PUBLIC_API_URL = "https://api.routespark.pro"
 LEGACY_CLUSTER_API_URLS = {
     "http://192.168.1.39",
@@ -34,6 +37,14 @@ CLUSTER_SNAPSHOT_TTL_SECONDS = 10
 BACKUP_TIMESTAMP_TTL_SECONDS = 60
 ARCHIVE_FRESHNESS_TTL_SECONDS = 60
 POSTGRES_HEALTH_TTL_SECONDS = 30
+SSH_OPTIONS = [
+    "-o", "ConnectTimeout=3",
+    "-o", "BatchMode=yes",
+    "-o", "ConnectionAttempts=1",
+    "-o", "ServerAliveInterval=2",
+    "-o", "ServerAliveCountMax=1",
+    "-n",
+]
 
 _original_check_server_health = base.check_server_health
 _cluster_snapshot_cache: dict | None = None
@@ -76,15 +87,45 @@ def _host_port_reachable(host: str, port: int, timeout_seconds: float = 1.0) -> 
 
 
 def _ordered_cluster_ssh_hosts() -> list[str]:
-    if _host_port_reachable("192.168.1.39", 22):
-        return [CLUSTER_EDGE_LAN_SSH_HOST, CLUSTER_EDGE_TAILSCALE_SSH_HOST]
-    return [CLUSTER_EDGE_TAILSCALE_SSH_HOST, CLUSTER_EDGE_LAN_SSH_HOST]
+    lan_hosts = [
+        ("192.168.1.40", CLUSTER_DATA_LAN_SSH_HOST),
+        ("192.168.1.39", CLUSTER_EDGE_LAN_SSH_HOST),
+        ("192.168.1.38", CLUSTER_EVENTS_LAN_SSH_HOST),
+    ]
+    reachable = [ssh_host for host, ssh_host in lan_hosts if _host_port_reachable(host, 22)]
+    unreachable = [ssh_host for host, ssh_host in lan_hosts if not _host_port_reachable(host, 22)]
+    return reachable + unreachable + [CLUSTER_EDGE_TAILSCALE_SSH_HOST, CLUSTER_DATA_TAILSCALE_SSH_HOST]
 
 
 def _ordered_cluster_data_ssh_hosts() -> list[str]:
     if _host_port_reachable("192.168.1.40", 22):
         return [CLUSTER_DATA_LAN_SSH_HOST, CLUSTER_DATA_TAILSCALE_SSH_HOST]
     return [CLUSTER_DATA_TAILSCALE_SSH_HOST, CLUSTER_DATA_LAN_SSH_HOST]
+
+
+def _run_ssh(ssh_host: str, remote_script: str, timeout_seconds: int) -> subprocess.CompletedProcess:
+    process = subprocess.Popen(
+        ["ssh", *SSH_OPTIONS, ssh_host, remote_script],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    try:
+        stdout, stderr = process.communicate(timeout=timeout_seconds)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        stdout, stderr = process.communicate()
+        return subprocess.CompletedProcess(
+            process.args,
+            124,
+            stdout,
+            (stderr or f"SSH timed out after {timeout_seconds}s"),
+        )
+    return subprocess.CompletedProcess(process.args, process.returncode, stdout, stderr)
 
 
 def _fetch_cluster_snapshot(force: bool = False) -> dict | None:
@@ -105,12 +146,29 @@ import json
 import subprocess
 
 def run_json(args):
-    return json.loads(subprocess.check_output(args).decode())
+    kubectl_commands = [
+        ["sudo", "-n", "k3s", "kubectl"],
+        ["kubectl"],
+        ["k3s", "kubectl"],
+    ]
+    last_error = None
+    for kubectl_command in kubectl_commands:
+        try:
+            return json.loads(
+                subprocess.check_output(
+                    kubectl_command + args,
+                    stderr=subprocess.PIPE,
+                    timeout=8,
+                ).decode()
+            )
+        except Exception as exc:
+            last_error = exc
+    raise last_error
 
 snapshot = {
-    "deployments": run_json(["k3s", "kubectl", "get", "deploy", "-A", "-o", "json"]),
-    "cronjobs": run_json(["k3s", "kubectl", "get", "cronjob", "-A", "-o", "json"]),
-    "jobs": run_json(["k3s", "kubectl", "get", "jobs", "-A", "-o", "json"]),
+    "deployments": run_json(["get", "deploy", "-A", "-o", "json"]),
+    "cronjobs": run_json(["get", "cronjob", "-A", "-o", "json"]),
+    "jobs": run_json(["get", "jobs", "-A", "-o", "json"]),
 }
 print(json.dumps(snapshot))
 PY
@@ -118,18 +176,7 @@ PY
 
     for ssh_host in ssh_hosts:
         try:
-            result = subprocess.run(
-                [
-                    "ssh",
-                    "-o", "ConnectTimeout=3",
-                    "-o", "BatchMode=yes",
-                    ssh_host,
-                    remote_script,
-                ],
-                capture_output=True,
-                text=True,
-                timeout=12,
-            )
+            result = _run_ssh(ssh_host, remote_script, 12)
             if result.returncode != 0 or not result.stdout.strip():
                 continue
             snapshot = json.loads(result.stdout)
@@ -208,7 +255,14 @@ def _get_cluster_postgres_health(force: bool = False) -> tuple[bool, str]:
         return _postgres_health_cache
 
     remote_script = (
-        "kubectl -n routespark-edge exec deploy/web-api -- python -c "
+        "if sudo -n k3s kubectl -n routespark-edge get deploy/web-api >/dev/null 2>&1; then "
+        "KUBECTL='sudo -n k3s kubectl'; "
+        "elif kubectl -n routespark-edge get deploy/web-api >/dev/null 2>&1; then "
+        "KUBECTL=kubectl; "
+        "else "
+        "KUBECTL='k3s kubectl'; "
+        "fi; "
+        "$KUBECTL -n routespark-edge exec deploy/web-api -- python -c "
         "'import os, psycopg2; "
         "conn=psycopg2.connect("
         "host=os.environ[\"POSTGRES_HOST\"], "
@@ -226,18 +280,7 @@ def _get_cluster_postgres_health(force: bool = False) -> tuple[bool, str]:
 
     for ssh_host in _ordered_cluster_ssh_hosts():
         try:
-            result = subprocess.run(
-                [
-                    "ssh",
-                    "-o", "ConnectTimeout=3",
-                    "-o", "BatchMode=yes",
-                    ssh_host,
-                    remote_script,
-                ],
-                capture_output=True,
-                text=True,
-                timeout=12,
-            )
+            result = _run_ssh(ssh_host, remote_script, 12)
             if result.returncode == 0 and result.stdout.strip() == "1":
                 _postgres_health_cache = (True, "OK")
                 _postgres_health_checked_at = now
@@ -296,18 +339,7 @@ def _get_cluster_backup_success() -> str | None:
 
     for ssh_host in _ordered_cluster_data_ssh_hosts():
         try:
-            result = subprocess.run(
-                [
-                    "ssh",
-                    "-o", "ConnectTimeout=3",
-                    "-o", "BatchMode=yes",
-                    ssh_host,
-                    remote_script,
-                ],
-                capture_output=True,
-                text=True,
-                timeout=8,
-            )
+            result = _run_ssh(ssh_host, remote_script, 8)
             if result.returncode != 0 or not result.stdout.strip():
                 continue
             _backup_timestamp_cache = result.stdout.strip()
@@ -345,18 +377,7 @@ def _get_cluster_archive_freshness() -> str | None:
 
     for ssh_host in _ordered_cluster_data_ssh_hosts():
         try:
-            result = subprocess.run(
-                [
-                    "ssh",
-                    "-o", "ConnectTimeout=3",
-                    "-o", "BatchMode=yes",
-                    ssh_host,
-                    remote_script,
-                ],
-                capture_output=True,
-                text=True,
-                timeout=20,
-            )
+            result = _run_ssh(ssh_host, remote_script, 20)
             if result.returncode != 0 or not result.stdout.strip():
                 continue
             _archive_freshness_cache = result.stdout.strip()

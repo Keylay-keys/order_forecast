@@ -78,7 +78,14 @@ def _escape_like(value: str) -> str:
 def _reference_image_url(base_url: Optional[str], sap: str, image_path: Optional[str]) -> Optional[str]:
     if not base_url or not image_path:
         return None
-    return f"{base_url.rstrip('/')}{IMAGE_ROUTE_PREFIX}/{sap}.png"
+    url = f"{base_url.rstrip('/')}{IMAGE_ROUTE_PREFIX}/{sap}.png"
+    image_file = _safe_catalog_image_file(_image_root(), image_path)
+    if image_file and image_file.exists():
+        try:
+            return f"{url}?v={int(image_file.stat().st_mtime)}"
+        except OSError:
+            pass
+    return url
 
 
 def _normalize_reference_item(row: Dict[str, Any], *, base_url: Optional[str] = None) -> Dict[str, Any]:
@@ -397,7 +404,7 @@ async def get_reference_catalog_image(
     return FileResponse(
         image_path,
         media_type="image/png",
-        headers={"Cache-Control": "private, max-age=86400"},
+        headers={"Cache-Control": "private, max-age=300, must-revalidate"},
     )
 
 
