@@ -246,6 +246,7 @@ class Order(BaseModel):
     orderCycleId: Optional[str] = None
     notes: Optional[str] = None
     isHolidaySchedule: Optional[bool] = None
+    orderAdjustmentAppliedAtMs: Optional[int] = None
 
     # Transfer metadata (route splitting)
     routeTransfers: Optional[List[RouteTransferAllocation]] = None

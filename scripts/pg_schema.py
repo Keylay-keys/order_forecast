@@ -312,6 +312,7 @@ def _create_user_param_tables(cur) -> None:
             full_name VARCHAR(255) NOT NULL,
             brand VARCHAR(100),
             category VARCHAR(100),
+            tags TEXT[] DEFAULT ARRAY[]::TEXT[],
             case_pack INTEGER NOT NULL DEFAULT 1,
             display_order INTEGER,
             image_path VARCHAR(255),
@@ -325,6 +326,7 @@ def _create_user_param_tables(cur) -> None:
     """)
     cur.execute("ALTER TABLE reference_catalog_items ADD COLUMN IF NOT EXISTS image_path VARCHAR(255)")
     cur.execute("ALTER TABLE reference_catalog_items ADD COLUMN IF NOT EXISTS image_thumb_path VARCHAR(255)")
+    cur.execute("ALTER TABLE reference_catalog_items ADD COLUMN IF NOT EXISTS tags TEXT[] DEFAULT ARRAY[]::TEXT[]")
     cur.execute("""
         CREATE TABLE IF NOT EXISTS reference_catalog_meta (
             catalog_id VARCHAR(120) PRIMARY KEY,

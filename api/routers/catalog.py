@@ -151,6 +151,7 @@ def _normalize_product(raw: Dict[str, Any], fallback_sap: str) -> Dict[str, Any]
         "pcfAbbreviation": _clean_optional_text(raw.get("pcfAbbreviation") or raw.get("pcf_abbreviation")),
         "upc": upc,
         "sku": _clean_optional_text(raw.get("sku")),
+        "tags": raw.get("tags") if isinstance(raw.get("tags"), list) else [],
         "notes": _clean_optional_text(raw.get("notes")),
     }
 

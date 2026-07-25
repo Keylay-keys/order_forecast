@@ -248,6 +248,7 @@ class CatalogReferenceContractTests(unittest.TestCase):
                 "full_name": "Hint of Lime Deli Fresh Chips",
                 "brand": "Deli Fresh",
                 "category": "chips",
+                "tags": ["better_for_you"],
                 "case_pack": 10,
                 "display_order": 204,
                 "image_path": "routespark-starter-catalog/54773.png",
@@ -262,6 +263,7 @@ class CatalogReferenceContractTests(unittest.TestCase):
         self.assertEqual(item["upc"], "075202303167")
         self.assertEqual(item["fullName"], "Hint of Lime Deli Fresh Chips")
         self.assertEqual(item["casePack"], 10)
+        self.assertEqual(item["tags"], ["better_for_you"])
         self.assertTrue(item["imageUrl"].startswith("https://api.routespark.pro/api/catalog/starter/images/54773.png"))
         self.assertTrue(item["imageThumbUrl"].startswith("https://api.routespark.pro/api/catalog/starter/images/54773.png"))
 
@@ -385,6 +387,7 @@ class CatalogReferenceContractTests(unittest.TestCase):
                     "casePack": 16,
                     "brand": "Kroger",
                     "category": "tortillas",
+                    "tags": ["better_for_you"],
                     "displayOrder": 203,
                     "active": True,
                 }
@@ -396,7 +399,8 @@ class CatalogReferenceContractTests(unittest.TestCase):
         self.assertEqual(rows[0][0], "routespark-starter-catalog")
         self.assertEqual(rows[0][1], "54511")
         self.assertEqual(rows[0][2], "11110-08472")
-        self.assertEqual(rows[0][6], 16)
+        self.assertEqual(rows[0][6], ["better_for_you"])
+        self.assertEqual(rows[0][7], 16)
 
     def test_reference_loader_rows_include_manifest_image_paths(self):
         rows = load_reference_catalog._rows(
@@ -418,8 +422,8 @@ class CatalogReferenceContractTests(unittest.TestCase):
             },
         )
 
-        self.assertEqual(rows[0][8], "routespark-starter-catalog/31032.png")
         self.assertEqual(rows[0][9], "routespark-starter-catalog/31032.png")
+        self.assertEqual(rows[0][10], "routespark-starter-catalog/31032.png")
 
     def test_reference_loader_signature_changes_when_upc_changes(self):
         image_paths = {}
@@ -441,6 +445,35 @@ class CatalogReferenceContractTests(unittest.TestCase):
                     "upc": "11110-99999",
                     "fullName": "Kroger Zero Net Carb Street Taco",
                     "casePack": 16,
+                }
+            ],
+            image_paths,
+        )
+
+        self.assertNotEqual(signature_a, signature_b)
+
+    def test_reference_loader_signature_changes_when_tags_change(self):
+        image_paths = {}
+        signature_a = load_reference_catalog._catalog_signature(
+            [
+                {
+                    "sap": "37983",
+                    "upc": "73731-07140",
+                    "fullName": "Mission Gluten Free Tortilla 6ct",
+                    "casePack": 15,
+                    "tags": [],
+                }
+            ],
+            image_paths,
+        )
+        signature_b = load_reference_catalog._catalog_signature(
+            [
+                {
+                    "sap": "37983",
+                    "upc": "73731-07140",
+                    "fullName": "Mission Gluten Free Tortilla 6ct",
+                    "casePack": 15,
+                    "tags": ["better_for_you"],
                 }
             ],
             image_paths,

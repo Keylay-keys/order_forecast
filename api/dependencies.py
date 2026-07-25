@@ -136,10 +136,41 @@ def get_pg_pool() -> pool.ThreadedConnectionPool:
             database=PG_DATABASE,
             user=PG_USER,
             password=PG_PASSWORD,
+            connect_timeout=10,
+            keepalives=1,
+            keepalives_idle=30,
+            keepalives_interval=10,
+            keepalives_count=3,
         )
         logger.info(f"PostgreSQL connection pool created (2-10 connections to {PG_HOST}:{PG_PORT})")
     
     return _pg_pool
+
+
+def _discard_pg_connection(conn) -> None:
+    """Close and remove an unusable PostgreSQL connection from the pool."""
+    if conn is None:
+        return
+    try:
+        get_pg_pool().putconn(conn, close=True)
+    except Exception as e:
+        logger.warning(f"Error discarding pooled connection: {e}")
+
+
+def _is_pg_connection_usable(conn) -> bool:
+    """Return True when a pooled PostgreSQL connection can execute queries."""
+    if conn is None or conn.closed:
+        return False
+    try:
+        if conn.get_transaction_status() != extensions.TRANSACTION_STATUS_IDLE:
+            conn.rollback()
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1")
+        conn.rollback()
+        return True
+    except Exception as e:
+        logger.warning(f"Discarding stale PostgreSQL pooled connection: {e}")
+        return False
 
 
 def get_pg_connection():
@@ -151,7 +182,25 @@ def get_pg_connection():
     Or use as context manager for auto-return on close (psycopg2 2.9+).
     For read-only queries and health checks.
     """
-    return get_pg_pool().getconn()
+    pg_pool = get_pg_pool()
+    last_error: Optional[Exception] = None
+    for _ in range(2):
+        conn = pg_pool.getconn()
+        if _is_pg_connection_usable(conn):
+            return conn
+        _discard_pg_connection(conn)
+
+    try:
+        conn = pg_pool.getconn()
+        if _is_pg_connection_usable(conn):
+            return conn
+        _discard_pg_connection(conn)
+    except Exception as e:
+        last_error = e
+
+    if last_error:
+        raise last_error
+    raise psycopg2.OperationalError("No usable PostgreSQL connections available")
 
 
 def return_pg_connection(conn):

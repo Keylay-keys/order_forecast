@@ -38,9 +38,9 @@ A lightweight toolkit for generating twice-weekly order forecasts, comparing the
 
 - Python 3.10+
 - Install dependencies once:
-  `ash
+  ```bash
   pip install -r requirements.txt
-  `
+  ```
 
 ## Repository Layout
 

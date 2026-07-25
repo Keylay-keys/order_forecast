@@ -26,6 +26,10 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_REFERENCE_CATALOG_ID = "routespark-starter-catalog"
 IMAGE_ROUTE_PREFIX = "/api/catalog/starter/images"
+REFERENCE_TAG_SEARCH_ALIASES = {
+    "bfy": "better_for_you",
+    "better for you": "better_for_you",
+}
 
 
 def _public_base_url(request: Request) -> str:
@@ -67,12 +71,37 @@ def _clean_int(value: Any, fallback: int = 0) -> int:
     return number if number >= 0 else fallback
 
 
+def _clean_tags(value: Any) -> List[str]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        raw_tags = value
+    elif isinstance(value, tuple):
+        raw_tags = list(value)
+    else:
+        raw_tags = [value]
+
+    tags: List[str] = []
+    seen = set()
+    for entry in raw_tags:
+        tag = _clean_text(entry)
+        if tag and tag not in seen:
+            tags.append(tag)
+            seen.add(tag)
+    return tags
+
+
 def _normalize_upc(value: Any) -> str:
     return "".join(ch for ch in str(value or "") if ch.isdigit())
 
 
 def _escape_like(value: str) -> str:
     return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def _tag_alias_like_query(query: str) -> str:
+    alias = REFERENCE_TAG_SEARCH_ALIASES.get(query.strip().lower())
+    return f"%{_escape_like(alias)}%" if alias else f"%{_escape_like(query)}%"
 
 
 def _reference_image_url(base_url: Optional[str], sap: str, image_path: Optional[str]) -> Optional[str]:
@@ -98,6 +127,7 @@ def _normalize_reference_item(row: Dict[str, Any], *, base_url: Optional[str] = 
         "upc": _clean_optional_text(row.get("upc")),
         "brand": _clean_text(row.get("brand")),
         "category": _clean_text(row.get("category")),
+        "tags": _clean_tags(row.get("tags")),
         "fullName": _clean_text(row.get("full_name") or row.get("fullName"), "Unnamed Product"),
         "casePack": _clean_int(row.get("case_pack") or row.get("casePack"), 0),
         "displayOrder": _clean_int(row.get("display_order") or row.get("displayOrder"), 0),
@@ -184,6 +214,7 @@ def _fetch_reference_items_by_search(
     normalized_query = query.strip()
     normalized_upc = _normalize_upc(normalized_query)
     like_query = f"%{_escape_like(normalized_query)}%"
+    tag_alias_query = _tag_alias_like_query(normalized_query)
     conn = get_pg_connection()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
@@ -196,6 +227,7 @@ def _fetch_reference_items_by_search(
                     full_name,
                     brand,
                     category,
+                    tags,
                     case_pack,
                     display_order,
                     image_path,
@@ -223,6 +255,9 @@ def _fetch_reference_items_by_search(
                     OR full_name ILIKE %s ESCAPE '\\'
                     OR brand ILIKE %s ESCAPE '\\'
                     OR category ILIKE %s ESCAPE '\\'
+                    OR array_to_string(COALESCE(tags, ARRAY[]::TEXT[]), ' ') ILIKE %s ESCAPE '\\'
+                    OR array_to_string(COALESCE(tags, ARRAY[]::TEXT[]), ' ') ILIKE %s ESCAPE '\\'
+                    OR replace(array_to_string(COALESCE(tags, ARRAY[]::TEXT[]), ' '), '_', ' ') ILIKE %s ESCAPE '\\'
                   )
                 ORDER BY match_rank, display_order NULLS LAST, sap
                 LIMIT %s
@@ -240,6 +275,9 @@ def _fetch_reference_items_by_search(
                     normalized_upc,
                     normalized_upc,
                     like_query,
+                    like_query,
+                    like_query,
+                    tag_alias_query,
                     like_query,
                     like_query,
                     limit,
@@ -262,7 +300,7 @@ def _fetch_reference_item_by_sap(
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute(
                 """
-                SELECT catalog_id, sap, upc, full_name, brand, category,
+                SELECT catalog_id, sap, upc, full_name, brand, category, tags,
                        case_pack, display_order, image_path, image_thumb_path,
                        source, active
                 FROM reference_catalog_items
@@ -289,7 +327,7 @@ def _fetch_reference_catalog_items(
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute(
                 """
-                SELECT catalog_id, sap, upc, full_name, brand, category,
+                SELECT catalog_id, sap, upc, full_name, brand, category, tags,
                        case_pack, display_order, image_path, image_thumb_path,
                        source, active
                 FROM reference_catalog_items

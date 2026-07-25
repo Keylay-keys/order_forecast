@@ -45,6 +45,19 @@ def _clean_int(value: Any, fallback: int = 0) -> int:
     return number if number >= 0 else fallback
 
 
+def _clean_tags(value: Any) -> List[str]:
+    if not isinstance(value, list):
+        return []
+    tags: List[str] = []
+    seen = set()
+    for entry in value:
+        tag = _clean_text(entry)
+        if tag and tag not in seen:
+            tags.append(tag)
+            seen.add(tag)
+    return tags
+
+
 def _catalog_image_path(value: Any) -> Optional[str]:
     text = _clean_text(value)
     if not text:
@@ -97,6 +110,7 @@ def _rows(
                 full_name,
                 _clean_text(product.get("brand")) or None,
                 _clean_text(product.get("category")) or None,
+                _clean_tags(product.get("tags")),
                 case_pack,
                 _clean_int(product.get("displayOrder"), index),
                 image_paths.get(sap, {}).get("imagePath"),
@@ -122,6 +136,7 @@ def _catalog_signature(products: Iterable[Dict[str, Any]], image_paths: Dict[str
                 ),
                 "brand": _clean_text(product.get("brand")),
                 "category": _clean_text(product.get("category")),
+                "tags": _clean_tags(product.get("tags")),
                 "casePack": _clean_int(product.get("casePack") or product.get("caseCount"), 0),
                 "displayOrder": _clean_int(product.get("displayOrder"), 0),
                 "imagePath": images.get("imagePath") or None,
@@ -176,7 +191,7 @@ def load_reference_catalog(
                 cur,
                 """
                 INSERT INTO reference_catalog_items (
-                    catalog_id, sap, upc, full_name, brand, category,
+                    catalog_id, sap, upc, full_name, brand, category, tags,
                     case_pack, display_order, image_path, image_thumb_path,
                     source, active
                 )
@@ -186,6 +201,7 @@ def load_reference_catalog(
                     full_name = EXCLUDED.full_name,
                     brand = EXCLUDED.brand,
                     category = EXCLUDED.category,
+                    tags = EXCLUDED.tags,
                     case_pack = EXCLUDED.case_pack,
                     display_order = EXCLUDED.display_order,
                     image_path = EXCLUDED.image_path,
