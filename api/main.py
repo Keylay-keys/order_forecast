@@ -16,18 +16,18 @@ from __future__ import annotations
 import os
 import logging
 from contextlib import asynccontextmanager
-from datetime import datetime
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
 
 from .dependencies import get_firebase_app, get_pg_pool, get_firestore
+from .errors import install_api_error_handlers
 from .routers import auth, history, health, orders, forecast, reference, stores, catalog, low_quantity, settings, schedule, credits, pos, deliveries, transfers, team, team_tasks, billing, archive_exports, dashboard
 from .middleware.rate_limit import setup_rate_limiting
 from .middleware.honeypots import setup_honeypots
 from .middleware.brute_force import setup_brute_force_protection
 from .middleware.code_protection import setup_code_protection
+from .middleware.request_context import setup_request_context
 
 # =============================================================================
 # CONFIGURATION
@@ -126,6 +126,7 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "DELETE"],
     allow_headers=["Authorization", "Content-Type"],
+    expose_headers=["X-Request-ID"],
     max_age=3600,
 )
 
@@ -159,52 +160,14 @@ async def add_security_headers(request: Request, call_next):
     return response
 
 
-@app.middleware("http")
-async def log_requests(request: Request, call_next):
-    """Log all requests for debugging."""
-    start_time = datetime.utcnow()
-    
-    response = await call_next(request)
-    
-    duration_ms = (datetime.utcnow() - start_time).total_seconds() * 1000
-    
-    # Log request (redact auth header)
-    logger.debug(
-        f"{request.method} {request.url.path} "
-        f"-> {response.status_code} ({duration_ms:.0f}ms)"
-    )
-    
-    return response
+setup_request_context(app, logger)
 
 
 # =============================================================================
 # EXCEPTION HANDLERS
 # =============================================================================
 
-@app.exception_handler(Exception)
-async def generic_exception_handler(request: Request, exc: Exception):
-    """Handle uncaught exceptions with generic error response."""
-    # Log full error internally
-    logger.exception(f"Unhandled exception on {request.url.path}")
-    
-    # Return generic error to client (no stack traces)
-    if DEBUG_MODE:
-        return JSONResponse(
-            status_code=500,
-            content={
-                "error": str(exc),
-                "code": "INTERNAL_ERROR",
-                "type": type(exc).__name__
-            }
-        )
-    else:
-        return JSONResponse(
-            status_code=500,
-            content={
-                "error": "Internal server error",
-                "code": "INTERNAL_ERROR"
-            }
-        )
+install_api_error_handlers(app, debug_mode=DEBUG_MODE, app_logger=logger)
 
 
 # =============================================================================
