@@ -5,11 +5,12 @@ from __future__ import annotations
 import logging
 import os
 from pathlib import Path as FilePath
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, NoReturn, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Path, Query, Request
 from fastapi.responses import FileResponse
 from google.cloud import firestore
+import psycopg2
 from psycopg2.extras import RealDictCursor
 
 from ..dependencies import (
@@ -19,6 +20,7 @@ from ..dependencies import (
     require_route_access,
     get_firestore,
 )
+from ..errors import StructuredApiError, get_request_id
 from ..middleware.rate_limit import rate_limit_history
 
 router = APIRouter()
@@ -30,6 +32,26 @@ REFERENCE_TAG_SEARCH_ALIASES = {
     "bfy": "better_for_you",
     "better for you": "better_for_you",
 }
+
+
+def _raise_reference_catalog_unavailable(
+    request: Request,
+    *,
+    stage: str,
+    error: psycopg2.Error,
+) -> NoReturn:
+    logger.exception(
+        "reference_catalog_db_error request_id=%s stage=%s error_type=%s",
+        get_request_id(request),
+        stage,
+        type(error).__name__,
+    )
+    raise StructuredApiError(
+        status_code=503,
+        error="Reference catalog temporarily unavailable",
+        code="REFERENCE_CATALOG_UNAVAILABLE",
+        details={"stage": stage},
+    ) from error
 
 
 def _public_base_url(request: Request) -> str:
@@ -374,12 +396,19 @@ async def get_starter_catalog(
 ) -> Dict[str, Any]:
     """Return the shared RouteSpark starter/reference catalog."""
     del decoded_token
-    items = _fetch_reference_catalog_items(
-        limit=limit,
-        base_url=_public_base_url(request),
-        include_inactive=includeInactive,
-    )
-    return _reference_catalog_response(items=items)
+    try:
+        items = _fetch_reference_catalog_items(
+            limit=limit,
+            base_url=_public_base_url(request),
+            include_inactive=includeInactive,
+        )
+    except psycopg2.Error as error:
+        _raise_reference_catalog_unavailable(request, stage="items", error=error)
+
+    try:
+        return _reference_catalog_response(items=items)
+    except psycopg2.Error as error:
+        _raise_reference_catalog_unavailable(request, stage="metadata", error=error)
 
 
 @router.get("/catalog/items/search")

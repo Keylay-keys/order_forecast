@@ -3,10 +3,13 @@ import json
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from fastapi import HTTPException
+import psycopg2
 
+from order_forecast.api.errors import StructuredApiError
 from order_forecast.api.routers import catalog, reference
 from order_forecast.scripts import load_reference_catalog
 
@@ -17,6 +20,7 @@ class _FakeRequest:
     def __init__(self, headers=None, scheme="http", netloc="internal:8000", base_url="http://internal:8000/"):
         self.headers = headers or {}
         self.base_url = base_url
+        self.state = SimpleNamespace(request_id="catalog-test-request")
 
         class Url:
             pass
@@ -24,6 +28,7 @@ class _FakeRequest:
         self.url = Url()
         self.url.scheme = scheme
         self.url.netloc = netloc
+        self.url.path = "/api/catalog/starter"
 
 
 class _FakeSnapshot:
@@ -551,6 +556,46 @@ class CatalogReferenceContractTests(unittest.TestCase):
 
             self.assertEqual(safe, image.resolve())
             self.assertIsNone(escape)
+
+
+class ReferenceCatalogAvailabilityTests(unittest.IsolatedAsyncioTestCase):
+    async def test_starter_catalog_reports_item_query_database_failure_as_retryable(self):
+        endpoint = inspect.unwrap(reference.get_starter_catalog)
+        with patch.object(
+            reference,
+            "_fetch_reference_catalog_items",
+            side_effect=psycopg2.OperationalError("SSL connection has been closed unexpectedly"),
+        ):
+            with self.assertRaises(StructuredApiError) as raised:
+                await endpoint(_FakeRequest(), 500, True, {})
+
+        self.assertEqual(raised.exception.status_code, 503)
+        self.assertEqual(raised.exception.code, "REFERENCE_CATALOG_UNAVAILABLE")
+        self.assertEqual(raised.exception.details, {"stage": "items"})
+
+    async def test_starter_catalog_reports_metadata_database_failure_as_retryable(self):
+        endpoint = inspect.unwrap(reference.get_starter_catalog)
+        with patch.object(reference, "_fetch_reference_catalog_items", return_value=[]), patch.object(
+            reference,
+            "_reference_catalog_response",
+            side_effect=psycopg2.OperationalError("SSL connection has been closed unexpectedly"),
+        ):
+            with self.assertRaises(StructuredApiError) as raised:
+                await endpoint(_FakeRequest(), 500, True, {})
+
+        self.assertEqual(raised.exception.status_code, 503)
+        self.assertEqual(raised.exception.code, "REFERENCE_CATALOG_UNAVAILABLE")
+        self.assertEqual(raised.exception.details, {"stage": "metadata"})
+
+    async def test_starter_catalog_does_not_misclassify_unexpected_defects(self):
+        endpoint = inspect.unwrap(reference.get_starter_catalog)
+        with patch.object(
+            reference,
+            "_fetch_reference_catalog_items",
+            side_effect=RuntimeError("programming defect"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "programming defect"):
+                await endpoint(_FakeRequest(), 500, True, {})
 
 
 class SapListActivationApiTests(unittest.IsolatedAsyncioTestCase):

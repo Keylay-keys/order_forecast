@@ -63,6 +63,24 @@ class PostgresPoolConnectionTests(unittest.TestCase):
         self.assertEqual(fake_pool.returned, [(stale, True)])
         self.assertEqual(fresh.rollback_count, 1)
 
+    def test_get_pg_connection_recovers_when_all_prewarmed_connections_are_stale(self):
+        stale_connections = [
+            _FakeConnection(fail_ping=True),
+            _FakeConnection(fail_ping=True),
+        ]
+        fresh = _FakeConnection()
+        fake_pool = _FakePool([*stale_connections, fresh])
+
+        with patch.object(dependencies, "get_pg_pool", return_value=fake_pool):
+            conn = dependencies.get_pg_connection()
+
+        self.assertIs(conn, fresh)
+        self.assertEqual(
+            fake_pool.returned,
+            [(stale_connections[0], True), (stale_connections[1], True)],
+        )
+        self.assertEqual(fresh.rollback_count, 1)
+
 
 if __name__ == "__main__":
     unittest.main()
