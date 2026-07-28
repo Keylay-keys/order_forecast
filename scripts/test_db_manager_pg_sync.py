@@ -188,8 +188,11 @@ class TestHandleSyncOrderProjectionReplacement(unittest.TestCase):
             "routeNumber": route_number,
             "userId": "user-1",
             "expectedDeliveryDate": "2026-04-27",
+            "expectedLoadDate": "2026-04-26",
             "orderDate": "2026-04-21",
             "scheduleKey": "tuesday",
+            "coreItemPolicyVersion": 1,
+            "coreItemOverrides": [{"storeId": "store-1", "sap": "11111"}],
             "forecastId": "fc-1",
             "stores": [
                 {
@@ -207,8 +210,11 @@ class TestHandleSyncOrderProjectionReplacement(unittest.TestCase):
             "routeNumber": route_number,
             "userId": "user-1",
             "expectedDeliveryDate": "2026-04-27",
+            "expectedLoadDate": "2026-04-26",
             "orderDate": "2026-04-21",
             "scheduleKey": "tuesday",
+            "coreItemPolicyVersion": 1,
+            "coreItemOverrides": [{"storeId": "store-1", "sap": "11111"}],
             "forecastId": "fc-1",
             "stores": [
                 {

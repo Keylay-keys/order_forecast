@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional, List, Dict, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -87,14 +87,14 @@ def _resolve_route_group_id(
 def _validate_non_holiday_schedule_key(
     db: firestore.Client,
     payload: OrderCreateRequest,
-) -> None:
+) -> Optional[Dict[str, Any]]:
     """Reject normal orders whose scheduleKey disagrees with the route schedule.
 
     Holiday/off-schedule orders are allowed to bypass this because their normal
     route cycle may not apply.
     """
     if payload.isHolidaySchedule:
-        return
+        return None
 
     try:
         cycles = get_order_cycles_from_firestore(db, payload.routeNumber)
@@ -104,14 +104,14 @@ def _validate_non_holiday_schedule_key(
             payload.routeNumber,
             exc,
         )
-        return
+        return None
 
     if not cycles:
         logger.info(
             "Schedule key validation skipped for route %s: no configured cycles",
             payload.routeNumber,
         )
-        return
+        return None
 
     resolution = get_schedule_key_for_delivery_date(payload.deliveryDate, cycles)
     if not resolution:
@@ -120,7 +120,7 @@ def _validate_non_holiday_schedule_key(
             payload.routeNumber,
             payload.deliveryDate,
         )
-        return
+        return None
 
     valid_keys = {
         str(match.get("scheduleKey", "")).lower()
@@ -138,6 +138,39 @@ def _validate_non_holiday_schedule_key(
                 "Refresh the page and try again."
             ),
         )
+
+    return resolution
+
+
+def _derive_expected_load_date(
+    payload: OrderCreateRequest,
+    resolution: Optional[Dict[str, Any]],
+) -> Optional[str]:
+    if not resolution:
+        return None
+
+    schedule_key = payload.scheduleKey.lower()
+    matches = [
+        match
+        for match in resolution.get("matches", [])
+        if match.get("matchedBy") == "delivery"
+        and str(match.get("scheduleKey") or "").lower() == schedule_key
+    ]
+    if len(matches) != 1:
+        return None
+
+    cycle = matches[0].get("cycle") or {}
+    order_day = cycle.get("orderDay")
+    load_offset = cycle.get("loadOffsetDays")
+    delivery_offset = cycle.get("deliveryOffsetDays")
+    if not all(isinstance(value, int) for value in (order_day, load_offset, delivery_offset)):
+        return None
+
+    order_date = payload.deliveryDate - timedelta(days=delivery_offset)
+    if order_date.isoweekday() != order_day:
+        return None
+
+    return (order_date + timedelta(days=load_offset)).isoformat()
 
 
 def _get_local_order_date(db: firestore.Client, route_number: str) -> str:
@@ -274,7 +307,8 @@ async def create_order(
 ) -> Order:
     """Create a new draft order."""
     await require_route_feature_access(payload.routeNumber, "ordering", decoded_token, db)
-    _validate_non_holiday_schedule_key(db, payload)
+    schedule_resolution = _validate_non_holiday_schedule_key(db, payload)
+    expected_load_date = _derive_expected_load_date(payload, schedule_resolution)
 
     order_id = f"order-{payload.routeNumber}-{int(datetime.utcnow().timestamp() * 1000)}"
     now = datetime.now(timezone.utc)
@@ -285,6 +319,7 @@ async def create_order(
         "userId": decoded_token["uid"],
         "orderDate": _get_local_order_date(db, payload.routeNumber),
         "expectedDeliveryDate": payload.deliveryDate.isoformat(),
+        **({"expectedLoadDate": expected_load_date} if expected_load_date else {}),
         "scheduleKey": payload.scheduleKey,
         "status": "draft",
         "stores": [],

@@ -237,6 +237,7 @@ class Order(BaseModel):
     userId: str
     orderDate: str  # ISO date string YYYY-MM-DD
     expectedDeliveryDate: str
+    expectedLoadDate: Optional[str] = None
     scheduleKey: Optional[str] = None
     status: str = Field(..., pattern='^(draft|finalized)$')
     stores: List[StoreOrder]

@@ -53,6 +53,45 @@ class OrderScheduleGuardTests(unittest.TestCase):
 
         get_cycles.assert_not_called()
 
+    def test_derives_load_date_only_from_one_consistent_delivery_match(self):
+        payload = _payload("thursday")
+        delivery_offset = 3
+        load_offset = 2
+        order_date = payload.deliveryDate - timedelta(days=delivery_offset)
+        match = {
+            "scheduleKey": "thursday",
+            "matchedBy": "delivery",
+            "cycle": {
+                "orderDay": order_date.isoweekday(),
+                "loadOffsetDays": load_offset,
+                "deliveryOffsetDays": delivery_offset,
+            },
+        }
+
+        self.assertEqual(
+            orders._derive_expected_load_date(payload, {"matches": [match]}),
+            (order_date + timedelta(days=load_offset)).isoformat(),
+        )
+        self.assertIsNone(
+            orders._derive_expected_load_date(payload, {"matches": [match, dict(match)]})
+        )
+
+    def test_order_model_remains_compatible_when_load_date_is_absent(self):
+        order = orders.Order(
+            id="order-1",
+            routeNumber="989262",
+            userId="user-1",
+            orderDate="2026-07-27",
+            expectedDeliveryDate="2026-07-30",
+            scheduleKey="monday",
+            status="draft",
+            stores=[],
+            createdAt="2026-07-27T12:00:00Z",
+            updatedAt="2026-07-27T12:00:00Z",
+        )
+
+        self.assertIsNone(order.expectedLoadDate)
+
 
 if __name__ == "__main__":
     unittest.main()
