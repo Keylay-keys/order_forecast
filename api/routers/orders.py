@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from datetime import datetime, timedelta, timezone
 from typing import Optional, List, Dict, Any
 
@@ -17,7 +18,9 @@ from ..dependencies import (
     get_firestore,
     get_route_timezone,
 )
+from ..errors import StructuredApiError
 from ..middleware.rate_limit import rate_limit_write
+from ..order_attention import build_core_item_issues
 from ..models import (
     Order,
     OrderCreateRequest,
@@ -35,6 +38,9 @@ from .schedule import get_order_cycles_from_firestore
 
 router = APIRouter()
 API_FORECAST_WORKER_ID = "api-finalize"
+CORE_ITEM_ENFORCEMENT_ENABLED = (
+    os.environ.get("CORE_ITEM_ENFORCEMENT_ENABLED", "false").lower() == "true"
+)
 logger = logging.getLogger("api.orders")
 
 def _normalize_route_number(value: Any) -> str:
@@ -206,6 +212,48 @@ def _order_ref(db: firestore.Client, route_number: str, order_id: str):
     )
 
 
+@firestore.transactional
+def _finalize_order_document(
+    transaction,
+    *,
+    order_ref,
+    stores_ref,
+    route_number: str,
+    now: datetime,
+) -> Dict[str, Any]:
+    order_doc = order_ref.get(transaction=transaction)
+    if not order_doc.exists:
+        raise HTTPException(404, "Order not found")
+
+    order_data = order_doc.to_dict() or {}
+    if str(order_data.get("routeNumber", "")) != route_number:
+        raise HTTPException(403, "Route mismatch")
+
+    if (
+        CORE_ITEM_ENFORCEMENT_ENABLED
+        and order_data.get("coreItemPolicyVersion") == 1
+    ):
+        stores = [
+            {"id": store_doc.id, **(store_doc.to_dict() or {})}
+            for store_doc in stores_ref.stream(transaction=transaction)
+        ]
+        issues = build_core_item_issues(order_data=order_data, stores=stores)
+        if issues:
+            raise StructuredApiError(
+                status_code=409,
+                error="Core items require a quantity or explicit override.",
+                code="CORE_ITEMS_REQUIRED",
+                details={"items": issues},
+            )
+
+    transaction.update(order_ref, {
+        "status": "finalized",
+        "submittedAt": now,
+        "updatedAt": now,
+    })
+    return order_data
+
+
 def _log_order_audit(
     db: firestore.Client,
     order_id: str,
@@ -329,6 +377,14 @@ async def create_order(
         "orderCycleId": None,
         "notes": payload.notes,
         "isHolidaySchedule": payload.isHolidaySchedule,
+        **(
+            {
+                "coreItemPolicyVersion": payload.coreItemPolicyVersion,
+                "coreItemOverrides": [],
+            }
+            if payload.coreItemPolicyVersion == 1
+            else {}
+        ),
     }
 
     _order_ref(db, payload.routeNumber, order_id).set(order_doc)
@@ -575,6 +631,7 @@ async def delete_order(
         401: {"model": ErrorResponse},
         403: {"model": ErrorResponse},
         404: {"model": ErrorResponse},
+        409: {"model": ErrorResponse},
     },
 )
 @rate_limit_write
@@ -589,21 +646,15 @@ async def finalize_order(
     requester_user_data = await require_route_feature_access(route, "ordering", decoded_token, db)
 
     order_ref = _order_ref(db, route, order_id)
-    order_doc = order_ref.get()
-    if not order_doc.exists:
-        raise HTTPException(404, "Order not found")
-
-    order_data = order_doc.to_dict() or {}
-    route_number = str(order_data.get("routeNumber", ""))
-    if route_number != route:
-        raise HTTPException(403, "Route mismatch")
-
     now = datetime.now(timezone.utc)
-    order_ref.update({
-        "status": "finalized",
-        "submittedAt": now,
-        "updatedAt": now,
-    })
+    order_data = _finalize_order_document(
+        db.transaction(),
+        order_ref=order_ref,
+        stores_ref=db.collection("routes").document(route).collection("stores"),
+        route_number=route,
+        now=now,
+    )
+    route_number = str(order_data.get("routeNumber", ""))
 
     # Commit outbound transfers (change status from 'planned' to 'committed')
     route_group_id = _resolve_route_group_id(

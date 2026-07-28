@@ -66,6 +66,7 @@ class OrderCreateRequest(BaseModel):
     scheduleKey: str = Field(..., description="Order day (monday, tuesday, etc.)")
     isHolidaySchedule: Optional[bool] = None
     notes: Optional[str] = None
+    coreItemPolicyVersion: Optional[int] = Field(default=None, ge=1, le=1)
     
     @validator('routeNumber')
     def validate_route(cls, v):
@@ -162,6 +163,26 @@ class RouteTransferAllocation(BaseModel):
     sourceOrderId: Optional[str] = None
 
 
+class InboundTransferStoreAllocation(BaseModel):
+    """Inbound transfer units assigned into one store/SAP order row."""
+    transferKey: str
+    storeId: str
+    sap: str
+    units: int = Field(..., ge=0)
+    fromRouteNumber: str
+    casePack: int = Field(default=1, ge=1)
+    transferDate: Optional[str] = None
+    sourceOrderId: Optional[str] = None
+
+
+class CoreItemOverride(BaseModel):
+    """Per-order acknowledgement allowing one zero-quantity Core item."""
+    storeId: str
+    sap: str
+    overriddenAtMs: int = Field(..., ge=1)
+    overriddenByUserId: str
+
+
 class OrderItem(BaseModel):
     """Single product line item in an order."""
     sap: str
@@ -248,10 +269,13 @@ class Order(BaseModel):
     notes: Optional[str] = None
     isHolidaySchedule: Optional[bool] = None
     orderAdjustmentAppliedAtMs: Optional[int] = None
+    coreItemPolicyVersion: Optional[int] = Field(default=None, ge=1, le=1)
+    coreItemOverrides: Optional[List[CoreItemOverride]] = None
 
     # Transfer metadata (route splitting)
     routeTransfers: Optional[List[RouteTransferAllocation]] = None
     inboundTransfersUsed: Optional[List[InboundTransferUse]] = None
+    inboundTransferStoreAllocations: Optional[List[InboundTransferStoreAllocation]] = None
     routeSplittingEnabled: Optional[bool] = None
 
     # Some legacy writers have persisted Firestore timestamps as JSON-like maps:
