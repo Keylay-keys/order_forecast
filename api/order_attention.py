@@ -80,3 +80,60 @@ def build_core_item_issues(
             })
 
     return issues
+
+
+def build_next_order_store_updates(
+    *,
+    order_data: Dict[str, Any],
+    stores: List[Dict[str, Any]],
+) -> Dict[str, List[Any]]:
+    """Return store reminder arrays after resolving active positive-quantity rows."""
+    order_id = str(order_data.get("id") or "").strip()
+    if not order_id:
+        return {}
+
+    quantity_by_key: Dict[Tuple[str, str], int] = {}
+    for order_store in order_data.get("stores") or []:
+        if not isinstance(order_store, dict):
+            continue
+        store_id = str(order_store.get("storeId") or "").strip()
+        if not store_id:
+            continue
+        for item in order_store.get("items") or []:
+            if not isinstance(item, dict):
+                continue
+            sap = str(item.get("sap") or "").strip()
+            if sap:
+                quantity_by_key[(store_id, sap)] = _quantity(item.get("quantity"))
+
+    updates: Dict[str, List[Any]] = {}
+    for store in stores:
+        if not isinstance(store, dict):
+            continue
+        store_id = str(store.get("id") or store.get("storeId") or "").strip()
+        if not store_id:
+            continue
+
+        reminders = store.get("nextOrderItems")
+        if not isinstance(reminders, list):
+            continue
+        retained: List[Any] = []
+        changed = False
+
+        for reminder in reminders:
+            if not isinstance(reminder, dict):
+                retained.append(reminder)
+                continue
+            sap = str(reminder.get("sap") or "").strip()
+            after_order_id = str(reminder.get("afterOrderId") or "").strip()
+            is_active = bool(sap and after_order_id and after_order_id != order_id)
+            has_positive_quantity = quantity_by_key.get((store_id, sap), 0) > 0
+            if is_active and has_positive_quantity:
+                changed = True
+                continue
+            retained.append(reminder)
+
+        if changed:
+            updates[store_id] = retained
+
+    return updates

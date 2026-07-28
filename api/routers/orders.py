@@ -20,7 +20,7 @@ from ..dependencies import (
 )
 from ..errors import StructuredApiError
 from ..middleware.rate_limit import rate_limit_write
-from ..order_attention import build_core_item_issues
+from ..order_attention import build_core_item_issues, build_next_order_store_updates
 from ..models import (
     Order,
     OrderCreateRequest,
@@ -229,28 +229,43 @@ def _finalize_order_document(
     if str(order_data.get("routeNumber", "")) != route_number:
         raise HTTPException(403, "Route mismatch")
 
-    if (
-        CORE_ITEM_ENFORCEMENT_ENABLED
-        and order_data.get("coreItemPolicyVersion") == 1
-    ):
+    store_docs = []
+    stores = []
+    if order_data.get("coreItemPolicyVersion") == 1:
+        store_docs = list(stores_ref.stream(transaction=transaction))
         stores = [
             {"id": store_doc.id, **(store_doc.to_dict() or {})}
-            for store_doc in stores_ref.stream(transaction=transaction)
+            for store_doc in store_docs
         ]
-        issues = build_core_item_issues(order_data=order_data, stores=stores)
-        if issues:
-            raise StructuredApiError(
-                status_code=409,
-                error="Core items require a quantity or explicit override.",
-                code="CORE_ITEMS_REQUIRED",
-                details={"items": issues},
-            )
+
+        if CORE_ITEM_ENFORCEMENT_ENABLED:
+            issues = build_core_item_issues(order_data=order_data, stores=stores)
+            if issues:
+                raise StructuredApiError(
+                    status_code=409,
+                    error="Core items require a quantity or explicit override.",
+                    code="CORE_ITEMS_REQUIRED",
+                    details={"items": issues},
+                )
+
+    next_order_updates = build_next_order_store_updates(
+        order_data=order_data,
+        stores=stores,
+    )
 
     transaction.update(order_ref, {
         "status": "finalized",
         "submittedAt": now,
         "updatedAt": now,
     })
+    updated_at_ms = int(now.timestamp() * 1000)
+    for store_doc in store_docs:
+        if store_doc.id not in next_order_updates:
+            continue
+        transaction.update(store_doc.reference, {
+            "nextOrderItems": next_order_updates[store_doc.id],
+            "updatedAt": updated_at_ms,
+        })
     return order_data
 
 
