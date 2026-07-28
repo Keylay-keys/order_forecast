@@ -505,6 +505,32 @@ class CatalogReferenceContractTests(unittest.TestCase):
 
         self.assertEqual(version, 5)
 
+    def test_reference_loader_schema_validation_accepts_required_columns(self):
+        cursor = MagicMock()
+        cursor.fetchall.return_value = [
+            (table_name, column_name)
+            for table_name, columns in load_reference_catalog.REFERENCE_SCHEMA_COLUMNS.items()
+            for column_name in columns
+        ]
+
+        load_reference_catalog._validate_reference_schema(cursor)
+
+        self.assertIn("information_schema.columns", cursor.execute.call_args.args[0])
+
+    def test_reference_loader_schema_validation_fails_without_running_ddl(self):
+        cursor = MagicMock()
+        cursor.fetchall.return_value = [
+            ("reference_catalog_items", "catalog_id"),
+            ("reference_catalog_items", "sap"),
+        ]
+
+        with self.assertRaisesRegex(RuntimeError, "apply the PostgreSQL schema migration"):
+            load_reference_catalog._validate_reference_schema(cursor)
+
+        executed_sql = cursor.execute.call_args.args[0].upper()
+        self.assertNotIn("CREATE TABLE", executed_sql)
+        self.assertNotIn("ALTER TABLE", executed_sql)
+
     def test_reference_loader_strips_manifest_path_to_catalog_relative_image_path(self):
         self.assertEqual(
             load_reference_catalog._catalog_image_path(

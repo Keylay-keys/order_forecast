@@ -7,12 +7,29 @@ POSTGRES_HOST, POSTGRES_PORT, POSTGRES_DB, POSTGRES_USER, POSTGRES_PASSWORD
 from __future__ import annotations
 
 import os
+import sys
 from typing import Any, Iterable, Optional
 
 import psycopg2
 from psycopg2.extras import RealDictCursor
 
 _pg_conn: Optional[psycopg2.extensions.connection] = None
+
+
+def _positive_int_env(name: str, default: int) -> int:
+    try:
+        value = int(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
+    return value if value > 0 else default
+
+
+def _postgres_application_name() -> str:
+    configured = os.environ.get("POSTGRES_APPLICATION_NAME", "").strip()
+    if configured:
+        return configured
+    script_name = os.path.basename(sys.argv[0] or "runtime")
+    return f"routespark-{script_name[:48]}"
 
 
 def get_pg_connection() -> psycopg2.extensions.connection:
@@ -27,6 +44,13 @@ def get_pg_connection() -> psycopg2.extensions.connection:
         database=os.environ.get("POSTGRES_DB", "routespark"),
         user=os.environ.get("POSTGRES_USER", "routespark"),
         password=os.environ.get("POSTGRES_PASSWORD", ""),
+        connect_timeout=_positive_int_env("POSTGRES_CONNECT_TIMEOUT_SECONDS", 10),
+        application_name=_postgres_application_name(),
+        options=(
+            f"-c idle_in_transaction_session_timeout="
+            f"{_positive_int_env('POSTGRES_IDLE_TRANSACTION_TIMEOUT_MS', 60000)} "
+            f"-c lock_timeout={_positive_int_env('POSTGRES_LOCK_TIMEOUT_MS', 15000)}"
+        ),
     )
     # This module keeps a cached connection in long-running daemons. Without
     # autocommit, even plain SELECT helpers leave the session "idle in

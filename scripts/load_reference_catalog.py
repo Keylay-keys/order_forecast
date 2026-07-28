@@ -16,9 +16,9 @@ from typing import Any, Dict, Iterable, List, Optional
 from psycopg2.extras import execute_values
 
 try:
-    from .pg_schema import create_schema, get_connection
+    from .pg_schema import get_connection
 except ImportError:
-    from pg_schema import create_schema, get_connection
+    from pg_schema import get_connection
 
 
 DEFAULT_CATALOG_ID = "routespark-starter-catalog"
@@ -30,6 +30,31 @@ DEFAULT_IMAGE_MANIFEST = (
     / "product_images"
     / "routespark-starter-catalog-manifest.json"
 )
+REFERENCE_SCHEMA_COLUMNS = {
+    "reference_catalog_items": {
+        "catalog_id",
+        "sap",
+        "upc",
+        "full_name",
+        "brand",
+        "category",
+        "tags",
+        "case_pack",
+        "display_order",
+        "image_path",
+        "image_thumb_path",
+        "source",
+        "active",
+    },
+    "reference_catalog_meta": {
+        "catalog_id",
+        "version",
+        "product_count",
+        "signature",
+        "source",
+        "updated_at",
+    },
+}
 
 
 def _clean_text(value: Any, fallback: str = "") -> str:
@@ -168,6 +193,35 @@ def _next_catalog_version(cur: Any, *, catalog_id: str, signature: str) -> int:
     return max(existing_version, 0) + 1
 
 
+def _validate_reference_schema(cur: Any) -> None:
+    cur.execute(
+        """
+        SELECT table_name, column_name
+        FROM information_schema.columns
+        WHERE table_schema = current_schema()
+          AND table_name = ANY(%s)
+        """,
+        [list(REFERENCE_SCHEMA_COLUMNS)],
+    )
+    present: Dict[str, set[str]] = {}
+    for row in cur.fetchall():
+        table_name = row[0] if not isinstance(row, dict) else row.get("table_name")
+        column_name = row[1] if not isinstance(row, dict) else row.get("column_name")
+        if table_name and column_name:
+            present.setdefault(str(table_name), set()).add(str(column_name))
+
+    missing = []
+    for table_name, required_columns in REFERENCE_SCHEMA_COLUMNS.items():
+        for column_name in sorted(required_columns - present.get(table_name, set())):
+            missing.append(f"{table_name}.{column_name}")
+
+    if missing:
+        raise RuntimeError(
+            "Reference catalog schema is not ready; apply the PostgreSQL schema migration "
+            f"before loading data. Missing: {', '.join(missing)}"
+        )
+
+
 def load_reference_catalog(
     path: Path,
     *,
@@ -184,8 +238,9 @@ def load_reference_catalog(
     signature = _catalog_signature(products, image_paths)
     conn = get_connection()
     try:
-        create_schema(conn)
         with conn.cursor() as cur:
+            cur.execute("SET LOCAL lock_timeout = '15s'")
+            _validate_reference_schema(cur)
             version = _next_catalog_version(cur, catalog_id=catalog_id, signature=signature)
             execute_values(
                 cur,

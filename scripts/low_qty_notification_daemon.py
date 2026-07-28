@@ -394,14 +394,16 @@ def check_and_notify(
     *,
     early_tolerance_minutes: int = DEFAULT_REMINDER_TOLERANCE_MINUTES,
     late_tolerance_minutes: int = DEFAULT_REMINDER_TOLERANCE_MINUTES,
-) -> None:
+) -> int:
     """Check all users and send notifications if it's their reminder time.
 
     Called every 60 seconds by the main loop.
     Only notifies route owners (userId field on route document).
     """
     if not reminder_cache:
-        return
+        return 0
+
+    failure_count = 0
     
     for user_id, user_data in list(reminder_cache.items()):
         reminder_time = user_data["reminder_time"]
@@ -487,9 +489,13 @@ def check_and_notify(
                 print(f"    ✅ Sent notification: {item_count} items")
             else:
                 print(f"    ❌ Failed to send notification")
+                failure_count += 1
                 
         except Exception as e:
             print(f"    ❌ Error processing user {user_id}: {e}")
+            failure_count += 1
+
+    return failure_count
 
 
 def run_daemon(
@@ -515,11 +521,15 @@ def run_daemon(
         loaded = load_reminder_cache_once(db)
         print(f"  [cache] {loaded} users with reminders enabled (one-time scan)")
         if LOW_QTY_NOTIFICATIONS_ENABLED:
-            check_and_notify(
+            failure_count = check_and_notify(
                 db,
                 early_tolerance_minutes=DEFAULT_REMINDER_TOLERANCE_MINUTES,
                 late_tolerance_minutes=once_late_tolerance_minutes,
             )
+            if failure_count:
+                raise RuntimeError(
+                    f"Low-quantity notification cycle failed for {failure_count} user(s)"
+                )
         else:
             print("  [skip] LOW_QTY_NOTIFICATIONS_ENABLED=false; notification cycle skipped")
         return
