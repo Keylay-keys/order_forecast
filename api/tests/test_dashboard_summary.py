@@ -1,3 +1,4 @@
+import json
 import unittest
 from datetime import datetime, timezone
 
@@ -142,6 +143,9 @@ def _container_doc():
         "itemCount": 2,
         "expiringCount": 1,
         "expiredCount": 0,
+        "loadingDate": datetime(2026, 3, 17, 12, 0, tzinfo=timezone.utc),
+        "createdAt": datetime(2026, 3, 16, 8, 30, tzinfo=timezone.utc),
+        "updatedAt": datetime(2026, 3, 17, 9, 45, tzinfo=timezone.utc),
         "expiringItems": [
             {
                 "description": "Whole Milk",
@@ -220,7 +224,11 @@ class DashboardSummaryMirrorTests(unittest.TestCase):
         self.assertEqual(result["freshness"]["mirroredRevision"], "1773777600000")
         self.assertEqual(result["counts"]["totalPCFs"], 1)
         self.assertEqual(result["activePcfs"][0]["items"][0]["guaranteed"]["isGuaranteed"], True)
+        self.assertEqual(result["activePcfs"][0]["loadingDate"], "2026-03-17T12:00:00+00:00")
+        self.assertEqual(result["activePcfs"][0]["createdAt"], "2026-03-16T08:30:00+00:00")
+        self.assertEqual(result["activePcfs"][0]["updatedAt"], "2026-03-17T09:45:00+00:00")
         self.assertNotIn("pages", result["activePcfs"][0])
+        json.dumps(result)
         self.assertIn("989567", conn.rows)
 
     def test_rebuild_failure_returns_cached_payload_as_stale(self):

@@ -76,6 +76,13 @@ def _coerce_revision(value: Any) -> Optional[str]:
     return text or None
 
 
+def _json_date(value: Any) -> Any:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    normalized = _iso(value)
+    return normalized if normalized is not None else str(value)
+
+
 def _source_watermark_from_doc(data: Dict[str, Any]) -> SourceWatermark:
     revision = (
         _coerce_revision(data.get("sourceRevision"))
@@ -132,14 +139,14 @@ def _normalize_container_row(raw: Dict[str, Any], fallback_id: str) -> Dict[str,
         "id": str(raw.get("containerCode") or fallback_id),
         "deliveryNumber": str(raw.get("deliveryNumber") or ""),
         "containerCode": str(raw.get("containerCode") or fallback_id),
-        "loadingDate": raw.get("loadingDate"),
+        "loadingDate": _json_date(raw.get("loadingDate")),
         "itemCount": int(raw.get("itemCount") or 0),
         "expiringCount": int(raw.get("expiringCount") or 0),
         "expiredCount": int(raw.get("expiredCount") or 0),
         "routeId": str(raw.get("routeId") or raw.get("routeNumber") or ""),
         "status": raw.get("status"),
-        "createdAt": raw.get("createdAt"),
-        "updatedAt": raw.get("updatedAt"),
+        "createdAt": _json_date(raw.get("createdAt")),
+        "updatedAt": _json_date(raw.get("updatedAt")),
         "userId": raw.get("userId"),
         "allItemsExpired": bool(raw.get("allItemsExpired")),
         "items": expiring_items,
