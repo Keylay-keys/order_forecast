@@ -393,6 +393,8 @@ class CatalogReferenceContractTests(unittest.TestCase):
                     "brand": "Kroger",
                     "category": "tortillas",
                     "tags": ["better_for_you"],
+                    "unitPack": 8,
+                    "searchPriority": 100,
                     "displayOrder": 203,
                     "active": True,
                 }
@@ -406,6 +408,8 @@ class CatalogReferenceContractTests(unittest.TestCase):
         self.assertEqual(rows[0][2], "11110-08472")
         self.assertEqual(rows[0][6], ["better_for_you"])
         self.assertEqual(rows[0][7], 16)
+        self.assertEqual(rows[0][8], 8)
+        self.assertEqual(rows[0][9], 100)
 
     def test_reference_loader_rows_include_manifest_image_paths(self):
         rows = load_reference_catalog._rows(
@@ -427,8 +431,43 @@ class CatalogReferenceContractTests(unittest.TestCase):
             },
         )
 
-        self.assertEqual(rows[0][9], "routespark-starter-catalog/31032.png")
-        self.assertEqual(rows[0][10], "routespark-starter-catalog/31032.png")
+        self.assertEqual(rows[0][11], "routespark-starter-catalog/31032.png")
+        self.assertEqual(rows[0][12], "routespark-starter-catalog/31032.png")
+
+    def test_reference_nullable_integer_cleaners_do_not_coerce_unknown_to_zero(self):
+        for value in (None, "", "not-a-number", 0, "0", -1):
+            self.assertIsNone(load_reference_catalog._clean_optional_positive_int(value))
+            self.assertIsNone(reference._clean_optional_positive_int(value))
+
+        self.assertEqual(load_reference_catalog._clean_optional_positive_int("10"), 10)
+        self.assertEqual(reference._clean_optional_positive_int("10"), 10)
+        self.assertIsNone(load_reference_catalog._clean_optional_int(""))
+        self.assertIsNone(reference._clean_optional_int(""))
+        self.assertEqual(load_reference_catalog._clean_optional_int("100"), 100)
+        self.assertEqual(reference._clean_optional_int("100"), 100)
+
+    def test_reference_normalizer_returns_nullable_search_metadata(self):
+        item = reference._normalize_reference_item(
+            {
+                "sap": "28934",
+                "full_name": "Mission Flour Soft Taco",
+                "case_pack": 15,
+                "unit_pack": 10,
+                "search_priority": 100,
+            }
+        )
+        old_item = reference._normalize_reference_item(
+            {
+                "sap": "99999",
+                "full_name": "Legacy Product",
+                "case_pack": 12,
+            }
+        )
+
+        self.assertEqual(item["unitPack"], 10)
+        self.assertEqual(item["searchPriority"], 100)
+        self.assertIsNone(old_item["unitPack"])
+        self.assertIsNone(old_item["searchPriority"])
 
     def test_reference_loader_signature_changes_when_upc_changes(self):
         image_paths = {}
@@ -486,6 +525,27 @@ class CatalogReferenceContractTests(unittest.TestCase):
 
         self.assertNotEqual(signature_a, signature_b)
 
+    def test_reference_loader_signature_changes_when_search_metadata_changes(self):
+        image_paths = {}
+        base_product = {
+            "sap": "28934",
+            "upc": "73731-00415",
+            "fullName": "Mission Flour Soft Taco",
+            "casePack": 15,
+        }
+        base_signature = load_reference_catalog._catalog_signature([base_product], image_paths)
+        unit_pack_signature = load_reference_catalog._catalog_signature(
+            [{**base_product, "unitPack": 10}],
+            image_paths,
+        )
+        priority_signature = load_reference_catalog._catalog_signature(
+            [{**base_product, "searchPriority": 100}],
+            image_paths,
+        )
+
+        self.assertNotEqual(base_signature, unit_pack_signature)
+        self.assertNotEqual(base_signature, priority_signature)
+
     def test_reference_loader_keeps_version_when_signature_is_unchanged(self):
         cursor = MagicMock()
         cursor.fetchone.return_value = (4, "same-signature")
@@ -535,6 +595,50 @@ class CatalogReferenceContractTests(unittest.TestCase):
         executed_sql = cursor.execute.call_args.args[0].upper()
         self.assertNotIn("CREATE TABLE", executed_sql)
         self.assertNotIn("ALTER TABLE", executed_sql)
+
+    def test_reference_loader_upsert_writes_search_metadata_columns(self):
+        with TemporaryDirectory() as tmp:
+            source = Path(tmp) / "catalog.json"
+            source.write_text(
+                json.dumps(
+                    [
+                        {
+                            "sap": "28934",
+                            "fullName": "Mission Flour Soft Taco",
+                            "casePack": 15,
+                            "unitPack": 10,
+                            "searchPriority": 100,
+                        }
+                    ]
+                )
+            )
+            connection = MagicMock()
+            cursor = connection.cursor.return_value.__enter__.return_value
+            cursor.fetchall.return_value = [
+                (table_name, column_name)
+                for table_name, columns in load_reference_catalog.REFERENCE_SCHEMA_COLUMNS.items()
+                for column_name in columns
+            ]
+            cursor.fetchone.return_value = None
+
+            with patch.object(load_reference_catalog, "get_connection", return_value=connection), patch.object(
+                load_reference_catalog,
+                "execute_values",
+            ) as execute_values:
+                count = load_reference_catalog.load_reference_catalog(
+                    source,
+                    source_label="test",
+                    image_manifest=None,
+                )
+
+        self.assertEqual(count, 1)
+        upsert_sql = execute_values.call_args.args[1]
+        upsert_rows = execute_values.call_args.args[2]
+        self.assertIn("unit_pack", upsert_sql)
+        self.assertIn("search_priority", upsert_sql)
+        self.assertEqual(upsert_rows[0][8], 10)
+        self.assertEqual(upsert_rows[0][9], 100)
+        connection.commit.assert_called_once()
 
     def test_reference_loader_strips_manifest_path_to_catalog_relative_image_path(self):
         self.assertEqual(

@@ -93,6 +93,20 @@ def _clean_int(value: Any, fallback: int = 0) -> int:
     return number if number >= 0 else fallback
 
 
+def _clean_optional_int(value: Any) -> Optional[int]:
+    if value is None or str(value).strip() == "":
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _clean_optional_positive_int(value: Any) -> Optional[int]:
+    number = _clean_optional_int(value)
+    return number if number is not None and number > 0 else None
+
+
 def _clean_tags(value: Any) -> List[str]:
     if value is None:
         return []
@@ -152,6 +166,14 @@ def _normalize_reference_item(row: Dict[str, Any], *, base_url: Optional[str] = 
         "tags": _clean_tags(row.get("tags")),
         "fullName": _clean_text(row.get("full_name") or row.get("fullName"), "Unnamed Product"),
         "casePack": _clean_int(row.get("case_pack") or row.get("casePack"), 0),
+        "unitPack": _clean_optional_positive_int(
+            row.get("unit_pack") if row.get("unit_pack") is not None else row.get("unitPack")
+        ),
+        "searchPriority": _clean_optional_int(
+            row.get("search_priority")
+            if row.get("search_priority") is not None
+            else row.get("searchPriority")
+        ),
         "displayOrder": _clean_int(row.get("display_order") or row.get("displayOrder"), 0),
         "imageUrl": _reference_image_url(base_url, sap, image_path),
         "imageThumbUrl": _reference_image_url(base_url, sap, image_thumb_path),
@@ -251,6 +273,8 @@ def _fetch_reference_items_by_search(
                     category,
                     tags,
                     case_pack,
+                    unit_pack,
+                    search_priority,
                     display_order,
                     image_path,
                     image_thumb_path,
@@ -323,7 +347,7 @@ def _fetch_reference_item_by_sap(
             cur.execute(
                 """
                 SELECT catalog_id, sap, upc, full_name, brand, category, tags,
-                       case_pack, display_order, image_path, image_thumb_path,
+                       case_pack, unit_pack, search_priority, display_order, image_path, image_thumb_path,
                        source, active
                 FROM reference_catalog_items
                 WHERE catalog_id = %s AND sap = %s AND (%s OR active = TRUE)
@@ -350,7 +374,7 @@ def _fetch_reference_catalog_items(
             cur.execute(
                 """
                 SELECT catalog_id, sap, upc, full_name, brand, category, tags,
-                       case_pack, display_order, image_path, image_thumb_path,
+                       case_pack, unit_pack, search_priority, display_order, image_path, image_thumb_path,
                        source, active
                 FROM reference_catalog_items
                 WHERE catalog_id = %s AND (%s OR active = TRUE)

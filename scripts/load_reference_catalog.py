@@ -40,6 +40,8 @@ REFERENCE_SCHEMA_COLUMNS = {
         "category",
         "tags",
         "case_pack",
+        "unit_pack",
+        "search_priority",
         "display_order",
         "image_path",
         "image_thumb_path",
@@ -68,6 +70,20 @@ def _clean_int(value: Any, fallback: int = 0) -> int:
     except (TypeError, ValueError):
         return fallback
     return number if number >= 0 else fallback
+
+
+def _clean_optional_int(value: Any) -> Optional[int]:
+    if value is None or str(value).strip() == "":
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _clean_optional_positive_int(value: Any) -> Optional[int]:
+    number = _clean_optional_int(value)
+    return number if number is not None and number > 0 else None
 
 
 def _clean_tags(value: Any) -> List[str]:
@@ -125,6 +141,12 @@ def _rows(
             product.get("fullName") or product.get("itemDescription") or product.get("description")
         )
         case_pack = _clean_int(product.get("casePack") or product.get("caseCount"), 0)
+        unit_pack = _clean_optional_positive_int(
+            product.get("unitPack") if "unitPack" in product else product.get("unit_pack")
+        )
+        search_priority = _clean_optional_int(
+            product.get("searchPriority") if "searchPriority" in product else product.get("search_priority")
+        )
         if not sap or not full_name or case_pack <= 0:
             raise ValueError(f"Invalid reference catalog row {index}: sap, name, and positive case pack are required")
         rows.append(
@@ -137,6 +159,8 @@ def _rows(
                 _clean_text(product.get("category")) or None,
                 _clean_tags(product.get("tags")),
                 case_pack,
+                unit_pack,
+                search_priority,
                 _clean_int(product.get("displayOrder"), index),
                 image_paths.get(sap, {}).get("imagePath"),
                 image_paths.get(sap, {}).get("imageThumbPath"),
@@ -163,6 +187,14 @@ def _catalog_signature(products: Iterable[Dict[str, Any]], image_paths: Dict[str
                 "category": _clean_text(product.get("category")),
                 "tags": _clean_tags(product.get("tags")),
                 "casePack": _clean_int(product.get("casePack") or product.get("caseCount"), 0),
+                "unitPack": _clean_optional_positive_int(
+                    product.get("unitPack") if "unitPack" in product else product.get("unit_pack")
+                ),
+                "searchPriority": _clean_optional_int(
+                    product.get("searchPriority")
+                    if "searchPriority" in product
+                    else product.get("search_priority")
+                ),
                 "displayOrder": _clean_int(product.get("displayOrder"), 0),
                 "imagePath": images.get("imagePath") or None,
                 "imageThumbPath": images.get("imageThumbPath") or None,
@@ -247,7 +279,7 @@ def load_reference_catalog(
                 """
                 INSERT INTO reference_catalog_items (
                     catalog_id, sap, upc, full_name, brand, category, tags,
-                    case_pack, display_order, image_path, image_thumb_path,
+                    case_pack, unit_pack, search_priority, display_order, image_path, image_thumb_path,
                     source, active
                 )
                 VALUES %s
@@ -258,6 +290,8 @@ def load_reference_catalog(
                     category = EXCLUDED.category,
                     tags = EXCLUDED.tags,
                     case_pack = EXCLUDED.case_pack,
+                    unit_pack = EXCLUDED.unit_pack,
+                    search_priority = EXCLUDED.search_priority,
                     display_order = EXCLUDED.display_order,
                     image_path = EXCLUDED.image_path,
                     image_thumb_path = EXCLUDED.image_thumb_path,
