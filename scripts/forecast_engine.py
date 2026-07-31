@@ -408,10 +408,66 @@ def _get_last_promo_quantities(
         return {}
 
 
+_DELIVERY_WEEKDAYS = {
+    'monday': 0,
+    'tuesday': 1,
+    'wednesday': 2,
+    'thursday': 3,
+    'friday': 4,
+    'saturday': 5,
+    'sunday': 6,
+}
+
+
+def _parse_delivery_date(value: str) -> Optional[datetime]:
+    if not value:
+        return None
+    for date_format in ('%Y-%m-%d', '%m/%d/%Y'):
+        try:
+            return datetime.strptime(value, date_format)
+        except ValueError:
+            continue
+    return None
+
+
+def _resolve_store_delivery_date(
+    order_delivery_date: str,
+    order_date: str,
+    store_delivery_days: List[str],
+) -> str:
+    """Resolve a store delivery without overriding a valid saved cycle date."""
+    persisted_delivery = _parse_delivery_date(order_delivery_date)
+    order_day = _parse_delivery_date(order_date)
+    configured_weekdays = {
+        weekday
+        for day_name in store_delivery_days or []
+        if (weekday := _DELIVERY_WEEKDAYS.get(str(day_name).lower())) is not None
+    }
+
+    if persisted_delivery and (
+        not configured_weekdays or persisted_delivery.weekday() in configured_weekdays
+    ):
+        return persisted_delivery.strftime('%Y-%m-%d')
+
+    if order_day and configured_weekdays:
+        candidates = []
+        for weekday in configured_weekdays:
+            days_until = (weekday - order_day.weekday()) % 7
+            if days_until == 0:
+                days_until = 7
+            candidates.append(order_day + timedelta(days=days_until))
+        return min(candidates).strftime('%Y-%m-%d')
+
+    if persisted_delivery:
+        return persisted_delivery.strftime('%Y-%m-%d')
+    return order_delivery_date
+
+
 def _get_prior_order_context(
     db,
     route_number: str,
     current_schedule_key: str,
+    current_order_date: str,
     target_delivery_date: str,
     stores_cfg: List[StoreConfig],
 ) -> Dict[tuple, PriorOrderContext]:
@@ -487,19 +543,6 @@ def _get_prior_order_context(
             order_date_raw = order_data.get('orderDate', '')
             order_id = doc.id
             
-            # Parse order date to calculate store-specific delivery dates
-            order_date_parsed = None
-            if order_date_raw:
-                try:
-                    if '-' in order_date_raw:
-                        order_date_parsed = datetime.strptime(order_date_raw, '%Y-%m-%d')
-                    elif '/' in order_date_raw:
-                        parts = order_date_raw.split('/')
-                        if len(parts) == 3:
-                            order_date_parsed = datetime(int(parts[2]), int(parts[0]), int(parts[1]))
-                except:
-                    pass
-            
             # Normalize target delivery for comparison
             target_delivery_normalized = target_delivery_date
             if target_delivery_date and '/' in target_delivery_date:
@@ -517,59 +560,20 @@ def _get_prior_order_context(
                 if not store_cfg:
                     continue
                 
-                # Calculate the ACTUAL delivery date for this store based on their delivery days
-                # e.g., Bowman's only delivers Friday, so their delivery date differs from the order's
-                store_delivery_date = order_delivery  # Default to order's delivery
+                # The order's persisted delivery date is authoritative when it is
+                # valid for this store. Derive only for exception stores whose
+                # configured delivery day differs from the order's main delivery.
+                store_delivery_date = _resolve_store_delivery_date(
+                    order_delivery,
+                    order_date_raw,
+                    store_cfg.delivery_days,
+                )
                 
-                if store_cfg.delivery_days and order_date_parsed:
-                    # Map day names to weekday numbers (0=Monday, 6=Sunday)
-                    day_map = {'monday': 0, 'tuesday': 1, 'wednesday': 2, 'thursday': 3, 
-                               'friday': 4, 'saturday': 5, 'sunday': 6}
-                    
-                    # Calculate PRIOR order's store-specific delivery
-                    order_weekday = order_date_parsed.weekday()
-                    for day_name in store_cfg.delivery_days:
-                        target_weekday = day_map.get(day_name.lower())
-                        if target_weekday is not None:
-                            days_until = (target_weekday - order_weekday) % 7
-                            if days_until == 0:
-                                days_until = 7  # If same day, assume next week
-                            store_delivery = order_date_parsed + timedelta(days=days_until)
-                            store_delivery_date = store_delivery.strftime('%Y-%m-%d')
-                            break
-                
-                # Calculate the CURRENT order's store-specific delivery for accurate comparison
-                # For stores like Bowman's that only deliver Friday, we need to find the Friday
-                # in the same delivery window as the current order
-                current_store_delivery = target_delivery_normalized  # Default
-                
-                if store_cfg.delivery_days:
-                    day_map = {'monday': 0, 'tuesday': 1, 'wednesday': 2, 'thursday': 3, 
-                               'friday': 4, 'saturday': 5, 'sunday': 6}
-                    target_weekday_num = target_dt.weekday()
-                    target_day_name = list(day_map.keys())[target_weekday_num]
-                    
-                    # If the store delivers on the target day (e.g., Monday), use that
-                    # Otherwise use the closest delivery day before the target
-                    if target_day_name in [d.lower() for d in store_cfg.delivery_days]:
-                        # Store delivers on the main delivery day - use target date
-                        current_store_delivery = target_delivery_normalized
-                    else:
-                        # Store delivers on a different day (e.g., Bowman's Friday)
-                        # Find the closest delivery day BEFORE the target
-                        best_delivery = None
-                        for day_name in store_cfg.delivery_days:
-                            store_weekday = day_map.get(day_name.lower())
-                            if store_weekday is not None:
-                                days_diff = store_weekday - target_weekday_num
-                                if days_diff > 0:
-                                    days_diff -= 7  # Previous week
-                                candidate_dt = target_dt + timedelta(days=days_diff)
-                                candidate_str = candidate_dt.strftime('%Y-%m-%d')
-                                if best_delivery is None or candidate_str > best_delivery:
-                                    best_delivery = candidate_str
-                        if best_delivery:
-                            current_store_delivery = best_delivery
+                current_store_delivery = _resolve_store_delivery_date(
+                    target_delivery_normalized,
+                    current_order_date,
+                    store_cfg.delivery_days,
+                )
                 
                 # KEY CHECK: Only warn if prior delivery >= current store's delivery
                 # e.g., Harmon's Thursday Dec 18 < Monday Dec 22 → no warning (already sold)
@@ -2608,10 +2612,28 @@ def generate_forecast(config: ForecastConfig) -> ForecastPayload:
         print(f"[forecast] Warning: could not refresh case shares: {e}")
     
     # Check for prior orders from other schedules that might overlap (e.g., both deliver to Bowman's)
+    current_cycle = next(
+        (
+            cycle
+            for cycle in order_cycles
+            if cycle.get('orderDay') == _DELIVERY_WEEKDAYS.get(schedule_key, -1) + 1
+        ),
+        None,
+    )
+    if not current_cycle or not isinstance(current_cycle.get('deliveryOffsetDays'), int):
+        raise ValueError(
+            f"[forecast] Missing delivery offset for schedule '{schedule_key}' "
+            f"on route {config.route_number}"
+        )
+    current_order_date = (
+        target_dt - timedelta(days=current_cycle['deliveryOffsetDays'])
+    ).strftime('%Y-%m-%d')
+
     prior_order_context = _get_prior_order_context(
         db=db,
         route_number=config.route_number,
         current_schedule_key=schedule_key,
+        current_order_date=current_order_date,
         target_delivery_date=delivery_iso,
         stores_cfg=stores_cfg,
     )
