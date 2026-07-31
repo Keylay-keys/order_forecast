@@ -13,11 +13,13 @@ import json
 import logging
 import os
 import socket
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Optional
 from urllib import request as urllib_request
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from google.cloud import firestore
+from google.cloud.firestore_v1.base_query import FieldFilter
 
 
 EXPO_PUSH_URL = "https://exp.host/--/api/v2/push/send"
@@ -54,6 +56,113 @@ def _to_millis(value: Any) -> Optional[int]:
     if isinstance(value, (int, float)):
         return int(value)
     return None
+
+
+def _meaningful_lines(data: Dict[str, Any]) -> bool:
+    raw_lines = data.get("lines") or (data.get("fullOrderWorkingCopy") or {}).get("generatedLines") or []
+    if not isinstance(raw_lines, list):
+        return False
+
+    net_cases: Dict[str, float] = {}
+    for raw_line in raw_lines:
+        if not isinstance(raw_line, dict):
+            continue
+        sap = str(raw_line.get("sap") or "").strip()
+        direction = str(raw_line.get("direction") or "").lower()
+        try:
+            case_quantity = float(raw_line.get("caseQuantity") or 0)
+        except (TypeError, ValueError):
+            continue
+        if not sap or case_quantity <= 0 or direction not in {"add", "remove"}:
+            continue
+        signed_quantity = case_quantity if direction == "add" else -case_quantity
+        net_cases[sap] = net_cases.get(sap, 0) + signed_quantity
+    return any(abs(quantity) > 1e-9 for quantity in net_cases.values())
+
+
+def _local_date(value: Any, route_timezone: ZoneInfo) -> Optional[date]:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        try:
+            return date.fromisoformat(value[:10])
+        except ValueError:
+            return None
+    millis = _to_millis(value)
+    if millis is None:
+        return None
+    return datetime.fromtimestamp(millis / 1000, timezone.utc).astimezone(route_timezone).date()
+
+
+def _source_order_data(db: firestore.Client, adjustment: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    source_order_id = str(adjustment.get("sourceOrderId") or "").strip()
+    route_number = str(adjustment.get("routeNumber") or "").strip()
+    if not source_order_id:
+        return None
+    if not route_number:
+        return {}
+    snapshot = db.collection("routes").document(route_number).collection("orders").document(source_order_id).get()
+    return snapshot.to_dict() or {} if snapshot.exists else {}
+
+
+def _expected_schedule(
+    adjustment: Dict[str, Any],
+    source_order: Optional[Dict[str, Any]],
+) -> tuple[Optional[Dict[str, Any]], Optional[str]]:
+    timezone_name = str(adjustment.get("timezone") or "UTC")
+    try:
+        route_timezone = ZoneInfo(timezone_name)
+    except ZoneInfoNotFoundError:
+        return None, "invalid_timezone"
+
+    source_order_id = str(adjustment.get("sourceOrderId") or "").strip()
+    if source_order_id:
+        if not source_order:
+            return None, "missing_source_order"
+        order_day = (
+            _local_date(source_order.get("submittedAt"), route_timezone)
+            or _local_date(source_order.get("createdAt"), route_timezone)
+            or _local_date(source_order.get("orderDate"), route_timezone)
+        )
+        if order_day is None:
+            return None, "window_unresolved"
+        adjustment_day = order_day + timedelta(days=1)
+    else:
+        adjustment_day = _local_date(adjustment.get("adjustmentDate"), route_timezone)
+        if adjustment_day is None:
+            return None, "window_unresolved"
+
+    cutoff_text = str(adjustment.get("cutoffTimeLocal") or "").strip()
+    try:
+        cutoff_hour, cutoff_minute = [int(part) for part in cutoff_text.split(":", 1)]
+        if cutoff_hour not in range(24) or cutoff_minute not in range(60):
+            raise ValueError
+    except (TypeError, ValueError):
+        return None, "invalid_cutoff"
+
+    try:
+        lead_minutes = int(adjustment.get("reminderLeadMinutes") or 0)
+    except (TypeError, ValueError):
+        lead_minutes = 0
+    if lead_minutes <= 0:
+        return None, "invalid_reminder_lead"
+
+    cutoff_local = datetime(
+        adjustment_day.year,
+        adjustment_day.month,
+        adjustment_day.day,
+        cutoff_hour,
+        cutoff_minute,
+        tzinfo=route_timezone,
+    )
+    cutoff_at_ms = int(cutoff_local.timestamp() * 1000)
+    reminder_at_ms = cutoff_at_ms - lead_minutes * 60_000
+    return {
+        "adjustmentDate": adjustment_day.isoformat(),
+        "cutoffAtMs": cutoff_at_ms,
+        "reminderAtMs": reminder_at_ms,
+        "reminderScheduledForMs": reminder_at_ms,
+    }, None
 
 
 def _is_valid_expo_token(token: str) -> bool:
@@ -161,9 +270,9 @@ def _reminder_body(data: Dict[str, Any]) -> str:
 def _pending_query(db: firestore.Client, now_ms: int, limit: int) -> Iterable[Any]:
     return (
         db.collection_group("orderAdjustments")
-        .where("status", "==", "draft")
-        .where("reminderStatus", "==", "pending")
-        .where("reminderAtMs", "<=", now_ms)
+        .where(filter=FieldFilter("status", "==", "draft"))
+        .where(filter=FieldFilter("reminderStatus", "==", "pending"))
+        .where(filter=FieldFilter("reminderAtMs", "<=", now_ms))
         .order_by("reminderAtMs")
         .limit(limit)
         .stream()
@@ -173,9 +282,9 @@ def _pending_query(db: firestore.Client, now_ms: int, limit: int) -> Iterable[An
 def _stale_sending_query(db: firestore.Client, cutoff_ms: int, limit: int) -> Iterable[Any]:
     return (
         db.collection_group("orderAdjustments")
-        .where("status", "==", "draft")
-        .where("reminderStatus", "==", "sending")
-        .where("reminderClaimedAtMs", "<=", cutoff_ms)
+        .where(filter=FieldFilter("status", "==", "draft"))
+        .where(filter=FieldFilter("reminderStatus", "==", "sending"))
+        .where(filter=FieldFilter("reminderClaimedAtMs", "<=", cutoff_ms))
         .order_by("reminderClaimedAtMs")
         .limit(limit)
         .stream()
@@ -191,6 +300,8 @@ def _adjustment_ref_from_snapshot(doc: Any) -> Any:
 
 def claim_adjustment_reminder(db: firestore.Client, doc: Any, *, now_ms: int) -> Optional[Dict[str, Any]]:
     adjustment_ref = _adjustment_ref_from_snapshot(doc)
+    queried_adjustment = doc.to_dict() or {}
+    source_order = _source_order_data(db, queried_adjustment)
 
     @firestore.transactional
     def _claim(transaction):
@@ -200,18 +311,57 @@ def claim_adjustment_reminder(db: firestore.Client, doc: Any, *, now_ms: int) ->
         data = snap.to_dict() or {}
         status = str(data.get("status") or "draft")
         reminder_status = str(data.get("reminderStatus") or "none")
-        reminder_at_ms = _to_millis(data.get("reminderAtMs"))
-        cutoff_at_ms = _to_millis(data.get("cutoffAtMs"))
         claimed_at_ms = _to_millis(data.get("reminderClaimedAtMs")) or 0
 
-        is_pending_due = reminder_status == "pending" and reminder_at_ms is not None and reminder_at_ms <= now_ms
-        is_stale_sending = reminder_status == "sending" and claimed_at_ms <= now_ms - ORDER_ADJUSTMENT_REMINDER_CLAIM_TTL_MS
         if status != "draft" or not bool(data.get("reminderEnabled")):
             return None
+        if not _meaningful_lines(data):
+            transaction.update(
+                adjustment_ref,
+                {
+                    "reminderStatus": "skipped",
+                    "reminderSkippedAtMs": now_ms,
+                    "reminderSkipReason": "no_meaningful_lines",
+                    "updatedAt": firestore.SERVER_TIMESTAMP,
+                },
+            )
+            return None
+
+        expected_schedule, schedule_error = _expected_schedule(data, source_order)
+        if expected_schedule is None:
+            transaction.update(
+                adjustment_ref,
+                {
+                    "reminderStatus": "skipped",
+                    "reminderSkippedAtMs": now_ms,
+                    "reminderSkipReason": schedule_error or "window_unresolved",
+                    "updatedAt": firestore.SERVER_TIMESTAMP,
+                },
+            )
+            return None
+
+        reminder_at_ms = int(expected_schedule["reminderAtMs"])
+        cutoff_at_ms = int(expected_schedule["cutoffAtMs"])
+        if reminder_at_ms > now_ms:
+            transaction.update(
+                adjustment_ref,
+                {
+                    **expected_schedule,
+                    "reminderStatus": "pending",
+                    "reminderSkippedAtMs": None,
+                    "reminderSkipReason": None,
+                    "updatedAt": firestore.SERVER_TIMESTAMP,
+                },
+            )
+            return None
+
+        is_pending_due = reminder_status == "pending"
+        is_stale_sending = reminder_status == "sending" and claimed_at_ms <= now_ms - ORDER_ADJUSTMENT_REMINDER_CLAIM_TTL_MS
         if cutoff_at_ms and now_ms > cutoff_at_ms + ORDER_ADJUSTMENT_REMINDER_CUTOFF_GRACE_MS:
             transaction.update(
                 adjustment_ref,
                 {
+                    **expected_schedule,
                     "reminderStatus": "skipped",
                     "reminderSkippedAtMs": now_ms,
                     "reminderSkipReason": "past_cutoff",
@@ -237,6 +387,7 @@ def claim_adjustment_reminder(db: firestore.Client, doc: Any, *, now_ms: int) ->
         transaction.update(
             adjustment_ref,
             {
+                **expected_schedule,
                 "reminderStatus": "sending",
                 "reminderClaimedAtMs": now_ms,
                 "reminderWorkerId": WORKER_ID,

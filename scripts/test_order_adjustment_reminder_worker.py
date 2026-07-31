@@ -3,6 +3,7 @@ from __future__ import annotations
 import pathlib
 import sys
 import unittest
+from datetime import datetime, timezone
 from unittest.mock import patch
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
@@ -63,7 +64,11 @@ class _FakeQuery:
         self.order_field = order_field
         self.limit_value = limit_value
 
-    def where(self, field, op, value):
+    def where(self, field=None, op=None, value=None, *, filter=None):
+        if filter is not None:
+            field = filter.field_path
+            op = filter.op_string
+            value = filter.value
         return _FakeQuery(self.db, self.filters + [(field, op, value)], self.order_field, self.limit_value)
 
     def order_by(self, field):
@@ -165,15 +170,39 @@ def _add_adjustment(db, adjustment_id="adjustment-a", **overrides):
         "userId": "user-1",
         "status": "draft",
         "targetDeliveryDate": "2026-07-09",
-        "cutoffTimeLocal": "14:00",
-        "cutoffAtMs": 1_000_000,
+        "adjustmentDate": "1970-01-01",
+        "timezone": "UTC",
+        "cutoffTimeLocal": "00:20",
+        "reminderLeadMinutes": 5,
+        "cutoffAtMs": 1_200_000,
         "reminderEnabled": True,
         "reminderAtMs": 900_000,
         "reminderStatus": "pending",
         "reminderAttemptCount": 0,
+        "lines": [
+            {
+                "sap": "28934",
+                "direction": "add",
+                "caseQuantity": 1,
+            }
+        ],
     }
     data.update(overrides)
     db.collection("routes").document("989567").collection("orderAdjustments").document(adjustment_id).set(data)
+    return data
+
+
+def _add_source_order(db, order_id="order-a", **overrides):
+    data = {
+        "id": order_id,
+        "routeNumber": "989567",
+        "status": "finalized",
+        "orderDate": "2026-07-30",
+        "submittedAt": datetime(2026, 7, 30, 18, 0, tzinfo=timezone.utc),
+        "createdAt": datetime(2026, 7, 30, 17, 0, tzinfo=timezone.utc),
+    }
+    data.update(overrides)
+    db.collection("routes").document("989567").collection("orders").document(order_id).set(data)
     return data
 
 
@@ -204,7 +233,7 @@ class OrderAdjustmentReminderWorkerTests(unittest.TestCase):
         with patch.object(worker.firestore, "transactional", side_effect=lambda fn: fn), patch.object(
             worker, "_send_expo_push", return_value={"sent": 1, "failed": 0}
         ) as send_push, patch.object(worker, "ORDER_ADJUSTMENT_REMINDER_CLAIM_TTL_MS", 1_000):
-            stats = worker.run_once(db, now_ms=2_000, limit=10)
+            stats = worker.run_once(db, now_ms=901_000, limit=10)
 
         self.assertEqual(stats["claimed"], 1)
         send_push.assert_called_once()
@@ -226,12 +255,12 @@ class OrderAdjustmentReminderWorkerTests(unittest.TestCase):
 
     def test_past_cutoff_reminder_is_skipped(self):
         db = _build_db()
-        _add_adjustment(db, cutoffAtMs=1_000, reminderAtMs=900)
+        _add_adjustment(db)
 
         with patch.object(worker.firestore, "transactional", side_effect=lambda fn: fn), patch.object(
             worker, "_send_expo_push", return_value={"sent": 1, "failed": 0}
         ) as send_push, patch.object(worker, "ORDER_ADJUSTMENT_REMINDER_CUTOFF_GRACE_MS", 100):
-            stats = worker.run_once(db, now_ms=2_000, limit=10)
+            stats = worker.run_once(db, now_ms=2_000_000, limit=10)
 
         self.assertEqual(stats["claimed"], 0)
         self.assertEqual(stats["skipped"], 1)
@@ -253,6 +282,68 @@ class OrderAdjustmentReminderWorkerTests(unittest.TestCase):
         self.assertEqual(stats["failed"], 1)
         adjustment = db.root["routes"]["989567"]["_subcollections"]["orderAdjustments"]["adjustment-a"]
         self.assertEqual(adjustment["reminderStatus"], "failed")
+
+    def test_empty_or_net_zero_adjustment_is_skipped_before_claim(self):
+        db = _build_db()
+        _add_adjustment(
+            db,
+            lines=[
+                {"sap": "28934", "direction": "add", "caseQuantity": 2},
+                {"sap": "28934", "direction": "remove", "caseQuantity": 2},
+            ],
+        )
+
+        with patch.object(worker.firestore, "transactional", side_effect=lambda fn: fn), patch.object(
+            worker, "_send_expo_push", return_value={"sent": 1, "failed": 0}
+        ) as send_push:
+            stats = worker.run_once(db, now_ms=900_000, limit=10)
+
+        self.assertEqual(stats["claimed"], 0)
+        send_push.assert_not_called()
+        adjustment = db.root["routes"]["989567"]["_subcollections"]["orderAdjustments"]["adjustment-a"]
+        self.assertEqual(adjustment["reminderStatus"], "skipped")
+        self.assertEqual(adjustment["reminderSkipReason"], "no_meaningful_lines")
+
+    def test_source_order_window_corrects_dormant_wrong_day_schedule_without_sending(self):
+        db = _build_db()
+        _add_source_order(db)
+        _add_adjustment(
+            db,
+            sourceOrderId="order-a",
+            adjustmentDate="2026-08-02",
+            cutoffTimeLocal="14:00",
+            reminderLeadMinutes=15,
+            cutoffAtMs=1,
+            reminderAtMs=1,
+        )
+        expected_cutoff = int(datetime(2026, 7, 31, 14, 0, tzinfo=timezone.utc).timestamp() * 1000)
+        now_ms = expected_cutoff - 60 * 60_000
+
+        with patch.object(worker.firestore, "transactional", side_effect=lambda fn: fn), patch.object(
+            worker, "_send_expo_push", return_value={"sent": 1, "failed": 0}
+        ) as send_push:
+            stats = worker.run_once(db, now_ms=now_ms, limit=10)
+
+        self.assertEqual(stats["claimed"], 0)
+        send_push.assert_not_called()
+        adjustment = db.root["routes"]["989567"]["_subcollections"]["orderAdjustments"]["adjustment-a"]
+        self.assertEqual(adjustment["adjustmentDate"], "2026-07-31")
+        self.assertEqual(adjustment["cutoffAtMs"], expected_cutoff)
+        self.assertEqual(adjustment["reminderStatus"], "pending")
+
+    def test_missing_source_order_is_skipped_instead_of_using_stale_schedule(self):
+        db = _build_db()
+        _add_adjustment(db, sourceOrderId="missing-order")
+
+        with patch.object(worker.firestore, "transactional", side_effect=lambda fn: fn), patch.object(
+            worker, "_send_expo_push", return_value={"sent": 1, "failed": 0}
+        ) as send_push:
+            stats = worker.run_once(db, now_ms=900_000, limit=10)
+
+        self.assertEqual(stats["claimed"], 0)
+        send_push.assert_not_called()
+        adjustment = db.root["routes"]["989567"]["_subcollections"]["orderAdjustments"]["adjustment-a"]
+        self.assertEqual(adjustment["reminderSkipReason"], "missing_source_order")
 
 
 if __name__ == "__main__":
