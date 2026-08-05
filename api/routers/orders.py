@@ -521,6 +521,8 @@ async def update_order(
         update_data["routeTransfers"] = [t.dict() for t in payload.routeTransfers]
     if payload.routeSplittingEnabled is not None:
         update_data["routeSplittingEnabled"] = payload.routeSplittingEnabled
+    if payload.sapOrder is not None:
+        update_data["sapOrder"] = payload.sapOrder
 
     order_ref.update(update_data)
 
@@ -530,7 +532,10 @@ async def update_order(
         route_number,
         decoded_token["uid"],
         "order_updated",
-        {"storeCount": len(payload.stores)},
+        {
+            "storeCount": len(payload.stores),
+            "sapOrderCount": len(payload.sapOrder) if payload.sapOrder is not None else None,
+        },
     )
 
     updated = order_ref.get().to_dict() or {}

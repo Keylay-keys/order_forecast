@@ -368,6 +368,7 @@ async def get_order_details(
             "storeCount": len(order_data.get("stores") or []),
             "status": str(order_data.get("status") or "finalized"),
             "orderAdjustmentAppliedAtMs": order_data.get("orderAdjustmentAppliedAtMs"),
+            "sapOrder": order_data.get("sapOrder") or [],
             "stores": stores,
         }
         

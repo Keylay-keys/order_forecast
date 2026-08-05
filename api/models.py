@@ -271,6 +271,8 @@ class Order(BaseModel):
     orderAdjustmentAppliedAtMs: Optional[int] = None
     coreItemPolicyVersion: Optional[int] = Field(default=None, ge=1, le=1)
     coreItemOverrides: Optional[List[CoreItemOverride]] = None
+    # User-defined SAP row order for the portal editor and finalized printouts.
+    sapOrder: Optional[List[str]] = None
 
     # Transfer metadata (route splitting)
     routeTransfers: Optional[List[RouteTransferAllocation]] = None
@@ -298,6 +300,17 @@ class OrderUpdateRequest(BaseModel):
     routeTransfers: Optional[List[RouteTransferAllocation]] = None
     inboundTransfersUsed: Optional[List[InboundTransferUse]] = None
     routeSplittingEnabled: Optional[bool] = None
+    sapOrder: Optional[List[str]] = Field(default=None, max_length=2000)
+
+    @validator('sapOrder')
+    def validate_sap_order(cls, v):
+        if v is None:
+            return v
+        if len(v) != len(set(v)):
+            raise ValueError('sapOrder must not contain duplicates')
+        if any(not SAP_PATTERN.match(value) for value in v):
+            raise ValueError('sapOrder contains an invalid SAP')
+        return v
 
     @validator('updatedAt', pre=True)
     def validate_updated_at(cls, v):
