@@ -17,5 +17,6 @@ from . import team
 from . import billing
 from . import archive_exports
 from . import dashboard
+from . import usage
 
-__all__ = ['auth', 'history', 'health', 'orders', 'forecast', 'reference', 'stores', 'catalog', 'low_quantity', 'credits', 'pos', 'deliveries', 'transfers', 'team', 'billing', 'archive_exports', 'dashboard']
+__all__ = ['auth', 'history', 'health', 'orders', 'forecast', 'reference', 'stores', 'catalog', 'low_quantity', 'credits', 'pos', 'deliveries', 'transfers', 'team', 'billing', 'archive_exports', 'dashboard', 'usage']
