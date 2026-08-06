@@ -81,6 +81,48 @@ def _normalize_route_number(value: Any) -> str:
     return v if v.isdigit() and len(v) <= 10 else ""
 
 
+def _owner_route_numbers(owner_data: Dict[str, Any]) -> set[str]:
+    """Return only routes the requester owns, including legacy profile fields."""
+    routes: set[str] = set()
+    profile = owner_data.get("profile", {}) or {}
+    primary = _normalize_route_number(profile.get("routeNumber"))
+    if primary:
+        routes.add(primary)
+
+    assignments = owner_data.get("routeAssignments", {}) or {}
+    if isinstance(assignments, dict):
+        for route_number, assignment in assignments.items():
+            normalized = _normalize_route_number(route_number)
+            if (
+                normalized
+                and isinstance(assignment, dict)
+                and str(assignment.get("role") or "").strip() == "owner"
+            ):
+                routes.add(normalized)
+    return routes
+
+
+def _owner_roster_entries(owner_data: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    """Normalize canonical UID entries and legacy rich-object roster entries."""
+    raw_members = (((owner_data.get("business") or {}).get("team") or {}).get("members") or [])
+    if not isinstance(raw_members, list):
+        return {}
+
+    roster: Dict[str, Dict[str, Any]] = {}
+    for raw_member in raw_members:
+        if isinstance(raw_member, str):
+            uid = raw_member.strip()
+            metadata: Dict[str, Any] = {}
+        elif isinstance(raw_member, dict):
+            uid = str(raw_member.get("uid") or "").strip()
+            metadata = raw_member
+        else:
+            continue
+        if uid and len(uid) <= 128 and uid not in roster:
+            roster[uid] = metadata
+    return roster
+
+
 def _ts_to_millis(value: Any) -> Optional[int]:
     if hasattr(value, "timestamp"):
         return int(value.timestamp() * 1000)
@@ -237,34 +279,82 @@ async def list_team_members_for_route(
     if not _is_owner_for_route(user_data, route):
         raise HTTPException(403, "Owner access required")
 
-    # NOTE: Same reason as above; scan and filter in memory.
-    docs = db.collection("users").stream()
+    owner_uid = decoded_token["uid"]
+    owner_snapshot = db.collection("users").document(owner_uid).get()
+    if not owner_snapshot.exists:
+        raise HTTPException(404, "Owner profile not found")
+
+    owner_data = owner_snapshot.to_dict() or {}
+    roster = _owner_roster_entries(owner_data)
+    owner_routes = _owner_route_numbers(owner_data)
+    owner_routes.add(route)
+
+    # Keep the route-assignment fallback during roster migration, but use the
+    # persistent owner roster as the primary source so zero-route members stay
+    # manageable. The existing scan also avoids one Firestore read per member.
+    user_docs = list(db.collection("users").stream())
+    users_by_uid = {doc.id: (doc.to_dict() or {}) for doc in user_docs}
+    candidate_uids = list(roster.keys())
+    for doc in user_docs:
+        data = users_by_uid[doc.id]
+        assignments = data.get("routeAssignments") or {}
+        current_assignment = assignments.get(route, {}) if isinstance(assignments, dict) else {}
+        if not (
+            isinstance(current_assignment, dict)
+            and str(current_assignment.get("role") or "").strip() == "team_member"
+        ):
+            continue
+        assigned_to = str(current_assignment.get("assignedTo") or "").strip()
+        if assigned_to and assigned_to != owner_uid:
+            continue
+        if doc.id not in roster:
+            candidate_uids.append(doc.id)
 
     members: List[Dict[str, Any]] = []
-    for doc in docs:
-        data = doc.to_dict() or {}
-        assignment = (data.get("routeAssignments") or {}).get(route, {}) if isinstance(data.get("routeAssignments"), dict) else {}
-        if not (isinstance(assignment, dict) and str(assignment.get("role") or "").strip() == "team_member"):
+    for uid in candidate_uids:
+        data = users_by_uid.get(uid)
+        roster_entry = roster.get(uid, {})
+        if data is None:
+            # Keep stale legacy roster entries out of the response. A missing
+            # auth/user document cannot be safely assigned to a route.
             continue
-        needs_approval = bool(assignment.get("needsApproval"))
-        verified = bool(assignment.get("verified"))
+
         assignments = data.get("routeAssignments") or {}
-        assigned_routes: List[str] = []
+        owned_assignments: List[tuple[str, Dict[str, Any]]] = []
         if isinstance(assignments, dict):
-            for rn, a in assignments.items():
-                if isinstance(a, dict) and str(a.get("role") or "").strip() == "team_member":
-                    assigned_routes.append(str(rn))
-        assigned_routes = sorted(set(assigned_routes), key=lambda x: int(x) if str(x).isdigit() else 10**12)
-        added_at = assignment.get("addedAt")
+            for route_number, assignment in assignments.items():
+                normalized = _normalize_route_number(route_number)
+                if (
+                    normalized in owner_routes
+                    and isinstance(assignment, dict)
+                    and str(assignment.get("role") or "").strip() == "team_member"
+                ):
+                    assigned_to = str(assignment.get("assignedTo") or "").strip()
+                    if not assigned_to or assigned_to == owner_uid:
+                        owned_assignments.append((normalized, assignment))
+
+        owned_assignments.sort(key=lambda item: int(item[0]))
+        assigned_routes = [route_number for route_number, _ in owned_assignments]
+        needs_approval = any(bool(assignment.get("needsApproval")) for _, assignment in owned_assignments)
+        verified = any(bool(assignment.get("verified")) for _, assignment in owned_assignments)
+        if not owned_assignments:
+            verified = bool(roster_entry.get("verified", True))
+
+        added_at = next(
+            (assignment.get("addedAt") for _, assignment in owned_assignments if assignment.get("addedAt") is not None),
+            roster_entry.get("addedAt"),
+        )
+        profile = data.get("profile", {}) or {}
+        features = (data.get("trialStatus") or {}).get("features", {}) or {}
         members.append({
-            "uid": doc.id,
-            "email": data.get("profile", {}).get("email"),
-            "name": data.get("profile", {}).get("personalName"),
+            "uid": uid,
+            "email": profile.get("email") or roster_entry.get("email"),
+            "name": profile.get("personalName") or roster_entry.get("name"),
             "verified": verified,
             "needsApproval": needs_approval,
-            "addedAt": int(added_at.timestamp() * 1000) if hasattr(added_at, "timestamp") else None,
-            "scannerAccess": bool((data.get("trialStatus") or {}).get("features", {}).get("scanner")),
-            "managementAccess": bool((data.get("trialStatus") or {}).get("features", {}).get("managementDashboard")),
+            "addedAt": _ts_to_millis(added_at),
+            "scannerAccess": bool(features.get("scanner")),
+            "managementAccess": bool(features.get("managementDashboard")),
             "role": "team_member",
             "assignedRoutes": assigned_routes,
         })
