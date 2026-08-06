@@ -362,6 +362,7 @@ async def verify_firebase_token(
                 _log_auth_failure(request, "future_token", uid=decoded.get('uid'))
                 raise HTTPException(401, "Invalid token timestamp")
         
+        request.state.usage_uid = str(decoded.get("uid") or "")
         return decoded
         
     except auth.RevokedIdTokenError:

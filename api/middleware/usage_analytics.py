@@ -1,0 +1,30 @@
+"""Best-effort request accounting for authenticated API traffic."""
+
+from __future__ import annotations
+
+import logging
+
+from fastapi import FastAPI, Request
+
+from ..usage_analytics import ApiUsageRequest, enqueue_api_request, extract_route_hint
+
+
+def setup_usage_analytics(app: FastAPI, app_logger: logging.Logger) -> None:
+    @app.middleware("http")
+    async def usage_analytics(request: Request, call_next):
+        response = await call_next(request)
+        try:
+            uid = str(getattr(request.state, "usage_uid", "") or "").strip()
+            if uid and request.method != "OPTIONS":
+                enqueue_api_request(
+                    ApiUsageRequest(
+                        uid=uid,
+                        path=request.url.path,
+                        status_code=response.status_code,
+                        route_hint=extract_route_hint(request.url.path, request.query_params),
+                    )
+                )
+        except Exception:
+            # Analytics must never alter an API response or user workflow.
+            app_logger.exception("Could not enqueue API usage")
+        return response

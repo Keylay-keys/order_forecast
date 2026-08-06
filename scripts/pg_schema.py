@@ -1107,27 +1107,18 @@ def _create_notification_tables(cur) -> None:
 # =============================================================================
 
 def _create_usage_analytics_tables(cur) -> None:
-    """Create compact, privacy-limited product usage rollups."""
+    """Create compact, privacy-limited authenticated API rollups."""
 
     cur.execute("""
-        CREATE TABLE IF NOT EXISTS usage_event_batches (
-            batch_id VARCHAR(64) PRIMARY KEY,
-            actor_hash CHAR(64) NOT NULL CHECK (char_length(actor_hash) = 64),
-            received_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS usage_activity_daily (
+        CREATE TABLE IF NOT EXISTS api_usage_daily (
             activity_date DATE NOT NULL,
             actor_hash CHAR(64) NOT NULL CHECK (char_length(actor_hash) = 64),
             route_number VARCHAR(20) NOT NULL CHECK (route_number ~ '^[0-9]{1,10}$'),
             actor_role VARCHAR(20) NOT NULL CHECK (actor_role IN ('owner', 'team_member')),
-            access_tier VARCHAR(20) NOT NULL CHECK (access_tier IN ('paid', 'trial', 'free')),
             feature_key VARCHAR(64) NOT NULL,
-            event_count INTEGER NOT NULL DEFAULT 0 CHECK (event_count >= 0),
-            platform VARCHAR(16) NOT NULL CHECK (platform IN ('android', 'ios', 'web')),
-            app_version VARCHAR(32),
+            request_count INTEGER NOT NULL DEFAULT 0 CHECK (request_count >= 0),
+            error_count INTEGER NOT NULL DEFAULT 0 CHECK (error_count >= 0),
+            last_status INTEGER NOT NULL CHECK (last_status BETWEEN 100 AND 599),
             last_seen_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
             PRIMARY KEY (activity_date, actor_hash, route_number, feature_key)
         )
@@ -1211,9 +1202,8 @@ def _create_indexes(cur) -> None:
         ("idx_archive_export_attempts_export_id_started", "archive_export_attempts", "export_id, started_at DESC"),
 
         # Product usage analytics indexes
-        ("idx_usage_activity_date_feature", "usage_activity_daily", "activity_date, feature_key"),
-        ("idx_usage_activity_route_date", "usage_activity_daily", "route_number, activity_date"),
-        ("idx_usage_batches_received", "usage_event_batches", "received_at"),
+        ("idx_api_usage_date_feature", "api_usage_daily", "activity_date, feature_key"),
+        ("idx_api_usage_route_date", "api_usage_daily", "route_number, activity_date"),
     ]
     
     for name, table, columns in indexes:
@@ -1255,7 +1245,7 @@ def get_table_counts(conn: psycopg2.extensions.connection) -> dict:
         'forecast_finalize_events', 'forecast_generation_jobs',
         'archive_export_jobs', 'archive_export_attempts',
         'low_qty_notifications_sent',
-        'usage_event_batches', 'usage_activity_daily'
+        'api_usage_daily'
     ]
     
     counts = {}

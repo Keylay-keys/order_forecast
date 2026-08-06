@@ -28,6 +28,7 @@ from .middleware.honeypots import setup_honeypots
 from .middleware.brute_force import setup_brute_force_protection
 from .middleware.code_protection import setup_code_protection
 from .middleware.request_context import setup_request_context
+from .middleware.usage_analytics import setup_usage_analytics
 
 # =============================================================================
 # CONFIGURATION
@@ -161,6 +162,7 @@ async def add_security_headers(request: Request, call_next):
 
 
 setup_request_context(app, logger)
+setup_usage_analytics(app, logger)
 
 
 # =============================================================================

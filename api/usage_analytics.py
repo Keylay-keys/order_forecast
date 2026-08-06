@@ -1,38 +1,74 @@
-"""Compact Postgres-backed product usage analytics."""
+"""Server-side API usage rollups for the internal activity dashboard."""
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 import hashlib
 import hmac
+import logging
 import os
-from typing import Any, Dict, Iterable, List, Optional
+from queue import Empty, Full, Queue
+import re
+from threading import Lock, Thread
+import time
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 
 from psycopg2.extras import RealDictCursor
 
 
-ALLOWED_USAGE_FEATURES = frozenset(
-    {
-        "app_session",
-        "dashboard",
-        "item_lookup",
-        "orders",
-        "catalog",
-        "stores",
-        "scanner_load",
-        "scanner_pos",
-        "low_quantity",
-        "order_adjustments",
-        "calendar",
-        "team_tasks",
-        "reminders",
-        "notes",
-    }
+logger = logging.getLogger("api.usage_analytics")
+
+_ROUTE_PATTERN = re.compile(r"^\d{1,10}$")
+_ROUTE_PATH_PATTERN = re.compile(r"/routes/(\d{1,10})(?:/|$)")
+_IDENTITY_CACHE_TTL_SECONDS = 600
+_REQUEST_QUEUE: Queue["ApiUsageRequest"] = Queue(maxsize=2000)
+_WORKER_LOCK = Lock()
+_WORKER_STARTED = False
+_IDENTITY_CACHE: Dict[Tuple[str, str], Tuple[float, "ActorContext"]] = {}
+
+
+_FEATURE_PREFIXES: Tuple[Tuple[str, str], ...] = (
+    ("/api/routes/", "dashboard"),
+    ("/api/catalog/starter", "reference_catalog"),
+    ("/api/catalog/items/search", "reference_catalog"),
+    ("/api/orders", "orders"),
+    ("/api/history", "history"),
+    ("/api/stores", "stores"),
+    ("/api/catalog", "catalog"),
+    ("/api/low-quantity", "low_quantity"),
+    ("/api/pos", "pos"),
+    ("/api/credits", "credits"),
+    ("/api/deliveries", "deliveries"),
+    ("/api/schedule", "schedule"),
+    ("/api/settings", "settings"),
+    ("/api/team-tasks", "team_tasks"),
+    ("/api/team", "team"),
+    ("/api/billing", "billing"),
+    ("/api/archive-exports", "archive_exports"),
+    ("/api/forecast", "forecast"),
+    ("/api/transfers", "transfers"),
+    ("/api/auth", "auth"),
 )
 
 
+@dataclass(frozen=True)
+class ApiUsageRequest:
+    uid: str
+    path: str
+    status_code: int
+    route_hint: str = ""
+
+
+@dataclass(frozen=True)
+class ActorContext:
+    actor_hash: str
+    route_number: str
+    actor_role: str
+
+
 def build_actor_hash(uid: str, secret: Optional[str] = None) -> str:
-    """Return a stable pseudonymous actor key without persisting Firebase UID."""
+    """Return a stable pseudonymous key without persisting Firebase UID."""
 
     key = secret if secret is not None else os.environ.get("USAGE_ANALYTICS_HASH_KEY", "")
     if len(key) < 32:
@@ -40,95 +76,177 @@ def build_actor_hash(uid: str, secret: Optional[str] = None) -> str:
     return hmac.new(key.encode("utf-8"), uid.encode("utf-8"), hashlib.sha256).hexdigest()
 
 
-def record_usage_batch(
+def classify_api_feature(path: str) -> Optional[str]:
+    """Map an API path to a stable reporting bucket."""
+
+    normalized = path.rstrip("/") or "/"
+    if normalized in {"/", "/api", "/api/health"}:
+        return None
+    if normalized.startswith("/api/admin/usage"):
+        return None
+    for prefix, feature_key in _FEATURE_PREFIXES:
+        if normalized == prefix.rstrip("/") or normalized.startswith(prefix):
+            return feature_key
+    return None
+
+
+def extract_route_hint(path: str, query: Mapping[str, str]) -> str:
+    """Extract only explicit, validated route identifiers from a request."""
+
+    for key in ("route", "route_number", "routeNumber"):
+        candidate = str(query.get(key) or "").strip()
+        if _ROUTE_PATTERN.fullmatch(candidate):
+            return candidate
+    match = _ROUTE_PATH_PATTERN.search(path)
+    return match.group(1) if match else ""
+
+
+def record_api_request(
     conn,
     *,
-    batch_id: str,
     actor_hash: str,
     route_number: str,
     actor_role: str,
-    access_tier: str,
-    platform: str,
-    app_version: Optional[str],
-    events: Iterable[Dict[str, Any]],
+    feature_key: str,
+    status_code: int,
     now: Optional[datetime] = None,
-) -> bool:
-    """Atomically apply one idempotent batch to the daily rollup."""
+) -> None:
+    """Increment one compact daily rollup row."""
 
     observed_at = now or datetime.now(timezone.utc)
-    activity_date = observed_at.date()
-    grouped: Dict[str, int] = {}
-    for event in events:
-        feature_key = str(event.get("feature") or "").strip()
-        if feature_key not in ALLOWED_USAGE_FEATURES:
-            raise ValueError(f"Unsupported usage feature: {feature_key}")
-        count = int(event.get("count") or 1)
-        if count < 1 or count > 100:
-            raise ValueError("Usage event count must be between 1 and 100")
-        grouped[feature_key] = grouped.get(feature_key, 0) + count
-
+    error_count = 1 if status_code >= 400 else 0
     try:
         with conn.cursor() as cur:
             cur.execute(
                 """
-                INSERT INTO usage_event_batches (batch_id, actor_hash, received_at)
-                VALUES (%s, %s, %s)
-                ON CONFLICT (batch_id) DO NOTHING
-                RETURNING batch_id
+                INSERT INTO api_usage_daily (
+                    activity_date,
+                    actor_hash,
+                    route_number,
+                    actor_role,
+                    feature_key,
+                    request_count,
+                    error_count,
+                    last_status,
+                    last_seen_at
+                ) VALUES (%s, %s, %s, %s, %s, 1, %s, %s, %s)
+                ON CONFLICT (activity_date, actor_hash, route_number, feature_key)
+                DO UPDATE SET
+                    actor_role = EXCLUDED.actor_role,
+                    request_count = api_usage_daily.request_count + 1,
+                    error_count = api_usage_daily.error_count + EXCLUDED.error_count,
+                    last_status = EXCLUDED.last_status,
+                    last_seen_at = GREATEST(api_usage_daily.last_seen_at, EXCLUDED.last_seen_at)
                 """,
-                (batch_id, actor_hash, observed_at),
+                (
+                    observed_at.date(),
+                    actor_hash,
+                    route_number,
+                    actor_role,
+                    feature_key,
+                    error_count,
+                    status_code,
+                    observed_at,
+                ),
             )
-            if cur.fetchone() is None:
-                conn.rollback()
-                return False
-
-            cur.execute(
-                "DELETE FROM usage_event_batches WHERE received_at < %s",
-                (observed_at - timedelta(days=120),),
-            )
-
-            for feature_key, count in grouped.items():
-                cur.execute(
-                    """
-                    INSERT INTO usage_activity_daily (
-                        activity_date,
-                        actor_hash,
-                        route_number,
-                        actor_role,
-                        access_tier,
-                        feature_key,
-                        event_count,
-                        platform,
-                        app_version,
-                        last_seen_at
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                    ON CONFLICT (activity_date, actor_hash, route_number, feature_key)
-                    DO UPDATE SET
-                        actor_role = EXCLUDED.actor_role,
-                        access_tier = EXCLUDED.access_tier,
-                        event_count = usage_activity_daily.event_count + EXCLUDED.event_count,
-                        platform = EXCLUDED.platform,
-                        app_version = EXCLUDED.app_version,
-                        last_seen_at = GREATEST(usage_activity_daily.last_seen_at, EXCLUDED.last_seen_at)
-                    """,
-                    (
-                        activity_date,
-                        actor_hash,
-                        route_number,
-                        actor_role,
-                        access_tier,
-                        feature_key,
-                        count,
-                        platform,
-                        app_version,
-                        observed_at,
-                    ),
-                )
         conn.commit()
-        return True
     except Exception:
         conn.rollback()
         raise
+
+
+def _resolve_actor_context(uid: str, route_hint: str) -> Optional[ActorContext]:
+    """Resolve route and owner/member role from authoritative Firebase data."""
+
+    from .dependencies import _active_route_for_user, _is_owner_for_route, get_firestore, has_access_to_route
+
+    cache_key = (uid, route_hint)
+    cached = _IDENTITY_CACHE.get(cache_key)
+    now = time.monotonic()
+    if cached and cached[0] > now:
+        return cached[1]
+
+    db = get_firestore()
+    snapshot = db.collection("users").document(uid).get()
+    if not snapshot.exists:
+        return None
+    user_data = snapshot.to_dict() or {}
+    route_number = route_hint if route_hint and has_access_to_route(user_data, route_hint) else _active_route_for_user(user_data)
+    if not route_number:
+        return None
+
+    context = ActorContext(
+        actor_hash=build_actor_hash(uid),
+        route_number=route_number,
+        actor_role="owner" if _is_owner_for_route(user_data, route_number) else "team_member",
+    )
+    _IDENTITY_CACHE[cache_key] = (now + _IDENTITY_CACHE_TTL_SECONDS, context)
+    return context
+
+
+def _record_queued_request(item: ApiUsageRequest) -> None:
+    feature_key = classify_api_feature(item.path)
+    if feature_key is None:
+        return
+    context = _resolve_actor_context(item.uid, item.route_hint)
+    if context is None:
+        return
+
+    from .dependencies import get_pg_connection, return_pg_connection
+
+    conn = None
+    try:
+        conn = get_pg_connection()
+        record_api_request(
+            conn,
+            actor_hash=context.actor_hash,
+            route_number=context.route_number,
+            actor_role=context.actor_role,
+            feature_key=feature_key,
+            status_code=item.status_code,
+        )
+    finally:
+        if conn is not None:
+            return_pg_connection(conn)
+
+
+def _usage_worker() -> None:
+    while True:
+        try:
+            item = _REQUEST_QUEUE.get(timeout=1)
+        except Empty:
+            continue
+        try:
+            _record_queued_request(item)
+        except Exception:
+            logger.exception("Failed to record API usage")
+        finally:
+            _REQUEST_QUEUE.task_done()
+
+
+def _ensure_worker_started() -> None:
+    global _WORKER_STARTED
+    if _WORKER_STARTED:
+        return
+    with _WORKER_LOCK:
+        if _WORKER_STARTED:
+            return
+        Thread(target=_usage_worker, name="api-usage-writer", daemon=True).start()
+        _WORKER_STARTED = True
+
+
+def enqueue_api_request(item: ApiUsageRequest) -> bool:
+    """Queue analytics without delaying or failing the user request."""
+
+    if not item.uid or classify_api_feature(item.path) is None:
+        return False
+    _ensure_worker_started()
+    try:
+        _REQUEST_QUEUE.put_nowait(item)
+        return True
+    except Full:
+        logger.warning("API usage queue full; dropping one analytics record")
+        return False
 
 
 def _rows(cur) -> List[Dict[str, Any]]:
@@ -152,7 +270,7 @@ def get_usage_summary(
     route_number: Optional[str] = None,
     now: Optional[datetime] = None,
 ) -> Dict[str, Any]:
-    """Return aggregate activity for the admin widget."""
+    """Return route/role aggregates without exposing actor identifiers."""
 
     end_date = (now or datetime.now(timezone.utc)).date()
     start_date = end_date - timedelta(days=days - 1)
@@ -165,12 +283,13 @@ def get_usage_summary(
         cur.execute(
             f"""
             SELECT
-                COALESCE(SUM(event_count), 0)::BIGINT AS "eventCount",
+                COALESCE(SUM(request_count), 0)::BIGINT AS "requestCount",
+                COALESCE(SUM(error_count), 0)::BIGINT AS "errorCount",
                 COUNT(DISTINCT actor_hash)::INTEGER AS "uniqueUsers",
                 COUNT(DISTINCT route_number)::INTEGER AS "uniqueRoutes",
                 COUNT(DISTINCT actor_hash) FILTER (WHERE actor_role = 'owner')::INTEGER AS "ownerUsers",
                 COUNT(DISTINCT actor_hash) FILTER (WHERE actor_role = 'team_member')::INTEGER AS "teamMemberUsers"
-            FROM usage_activity_daily
+            FROM api_usage_daily
             WHERE activity_date BETWEEN %s AND %s{route_clause}
             """,
             params,
@@ -181,18 +300,16 @@ def get_usage_summary(
             f"""
             SELECT
                 feature_key AS "featureKey",
-                SUM(event_count)::BIGINT AS "eventCount",
+                SUM(request_count)::BIGINT AS "requestCount",
+                SUM(error_count)::BIGINT AS "errorCount",
                 COUNT(DISTINCT actor_hash)::INTEGER AS "uniqueUsers",
                 COUNT(DISTINCT route_number)::INTEGER AS "uniqueRoutes",
                 COUNT(DISTINCT actor_hash) FILTER (WHERE actor_role = 'owner')::INTEGER AS "ownerUsers",
-                COUNT(DISTINCT actor_hash) FILTER (WHERE actor_role = 'team_member')::INTEGER AS "teamMemberUsers",
-                COUNT(DISTINCT actor_hash) FILTER (WHERE access_tier = 'paid')::INTEGER AS "paidUsers",
-                COUNT(DISTINCT actor_hash) FILTER (WHERE access_tier = 'trial')::INTEGER AS "trialUsers",
-                COUNT(DISTINCT actor_hash) FILTER (WHERE access_tier = 'free')::INTEGER AS "freeUsers"
-            FROM usage_activity_daily
+                COUNT(DISTINCT actor_hash) FILTER (WHERE actor_role = 'team_member')::INTEGER AS "teamMemberUsers"
+            FROM api_usage_daily
             WHERE activity_date BETWEEN %s AND %s{route_clause}
             GROUP BY feature_key
-            ORDER BY "uniqueUsers" DESC, "eventCount" DESC, feature_key
+            ORDER BY "uniqueUsers" DESC, "requestCount" DESC, feature_key
             """,
             params,
         )
@@ -202,10 +319,11 @@ def get_usage_summary(
             f"""
             SELECT
                 activity_date AS "date",
-                SUM(event_count)::BIGINT AS "eventCount",
+                SUM(request_count)::BIGINT AS "requestCount",
+                SUM(error_count)::BIGINT AS "errorCount",
                 COUNT(DISTINCT actor_hash)::INTEGER AS "uniqueUsers",
                 COUNT(DISTINCT route_number)::INTEGER AS "uniqueRoutes"
-            FROM usage_activity_daily
+            FROM api_usage_daily
             WHERE activity_date BETWEEN %s AND %s{route_clause}
             GROUP BY activity_date
             ORDER BY activity_date
@@ -219,14 +337,15 @@ def get_usage_summary(
             SELECT
                 route_number AS "routeNumber",
                 feature_key AS "featureKey",
-                SUM(event_count)::BIGINT AS "eventCount",
+                SUM(request_count)::BIGINT AS "requestCount",
+                SUM(error_count)::BIGINT AS "errorCount",
                 COUNT(DISTINCT actor_hash)::INTEGER AS "uniqueUsers",
                 COUNT(DISTINCT actor_hash) FILTER (WHERE actor_role = 'owner')::INTEGER AS "ownerUsers",
                 COUNT(DISTINCT actor_hash) FILTER (WHERE actor_role = 'team_member')::INTEGER AS "teamMemberUsers"
-            FROM usage_activity_daily
+            FROM api_usage_daily
             WHERE activity_date BETWEEN %s AND %s{route_clause}
             GROUP BY route_number, feature_key
-            ORDER BY "uniqueUsers" DESC, "eventCount" DESC, route_number, feature_key
+            ORDER BY "uniqueUsers" DESC, "requestCount" DESC, route_number, feature_key
             LIMIT 500
             """,
             params,
