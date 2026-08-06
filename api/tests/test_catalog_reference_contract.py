@@ -332,6 +332,12 @@ class CatalogReferenceContractTests(unittest.TestCase):
     def test_reference_like_escape_escapes_wildcards(self):
         self.assertEqual(reference._escape_like(r"100%_chips\\"), r"100\%\_chips\\\\")
 
+    def test_reference_tag_aliases_align_walmart_search_terms(self):
+        self.assertEqual(reference._tag_alias_like_query("walmart"), "%walmart%")
+        self.assertEqual(reference._tag_alias_like_query("wal mart"), "%walmart%")
+        self.assertEqual(reference._tag_alias_like_query("gv"), "%walmart%")
+        self.assertEqual(reference._tag_alias_like_query("wm"), "%walmart%")
+
     def test_reference_catalog_list_defaults_to_active_only(self):
         rows = [
             {

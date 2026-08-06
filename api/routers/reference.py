@@ -31,6 +31,11 @@ IMAGE_ROUTE_PREFIX = "/api/catalog/starter/images"
 REFERENCE_TAG_SEARCH_ALIASES = {
     "bfy": "better_for_you",
     "better for you": "better_for_you",
+    "great value": "walmart",
+    "gv": "walmart",
+    "wal mart": "walmart",
+    "walmart": "walmart",
+    "wm": "walmart",
 }
 
 
