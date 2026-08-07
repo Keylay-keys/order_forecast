@@ -3,7 +3,7 @@ import json
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from fastapi import HTTPException
 
@@ -80,6 +80,39 @@ class LegacyRouteTransferContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(row["reservedBy"], {"consumer-order": 4})
         self.assertEqual(row["reservedTotal"], 4)
         self.assertEqual(row["availableUnits"], 8)
+
+    async def test_history_reports_truncation_without_returning_the_probe_row(self):
+        cursor = Mock()
+        cursor.description = []
+        cursor.fetchall.return_value = [
+            {"transfer_id": "newer", "transfer_date": "2026-08-07"},
+            {"transfer_id": "probe", "transfer_date": "2026-08-06"},
+        ]
+        connection = Mock()
+        connection.cursor.return_value = cursor
+
+        with (
+            patch.object(transfers, "get_pg_connection", return_value=connection),
+            patch.object(transfers, "return_pg_connection") as return_connection,
+        ):
+            result = await self._call(
+                transfers.list_transfers,
+                request=_request("/api/transfers"),
+                route_group_id=FIXTURE["routeGroupId"],
+                route=None,
+                days=30,
+                limit=1,
+                decoded_token=self.token,
+                db=self._db(),
+            )
+
+        self.assertEqual(result["transfers"], [{
+            "transfer_id": "newer",
+            "transfer_date": "2026-08-07",
+        }])
+        self.assertTrue(result["hasMore"])
+        self.assertEqual(cursor.execute.call_args.args[1][-1], 2)
+        return_connection.assert_called_once_with(connection)
 
     async def test_create_update_and_delete_keep_legacy_shapes(self):
         db = self._db()

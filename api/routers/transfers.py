@@ -108,7 +108,7 @@ async def list_transfers(
                 ORDER BY transfer_date DESC, created_at DESC NULLS LAST
                 LIMIT %s
                 """,
-                [route_group_id, cutoff, route, route, limit],
+                [route_group_id, cutoff, route, route, limit + 1],
             )
         else:
             cur.execute(
@@ -137,7 +137,7 @@ async def list_transfers(
                 ORDER BY transfer_date DESC, created_at DESC NULLS LAST
                 LIMIT %s
                 """,
-                [route_group_id, cutoff, limit],
+                [route_group_id, cutoff, limit + 1],
             )
 
         rows = cur.fetchall()
@@ -146,8 +146,9 @@ async def list_transfers(
         return_pg_connection(conn)
         conn = None
 
+        has_more = len(rows) > limit
         out = []
-        for r in rows:
+        for r in rows[:limit]:
             d = _row_to_dict(r, columns)
             # Convert datetimes to ISO strings for JSON.
             for k in ("created_at", "updated_at", "synced_at"):
@@ -156,7 +157,7 @@ async def list_transfers(
                     d[k] = v.isoformat()
             out.append(d)
 
-        return {"ok": True, "transfers": out}
+        return {"ok": True, "transfers": out, "hasMore": has_more}
     finally:
         if conn is not None:
             return_pg_connection(conn)
