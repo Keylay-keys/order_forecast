@@ -7,7 +7,7 @@ to ensure compatibility between mobile app and web portal.
 from __future__ import annotations
 
 from datetime import date, datetime
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Literal
 from pydantic import BaseModel, Field, validator
 import re
 
@@ -414,6 +414,17 @@ class ForecastResponse(BaseModel):
     forecast: Optional[ForecastPayload] = None
     isStale: Optional[bool] = None
     staleReason: Optional[str] = None
+
+
+class ForecastStatusResponse(BaseModel):
+    """Route forecast readiness and model-training status."""
+    orderCount: Optional[int] = None
+    minOrdersRequired: Optional[int] = None
+    hasTrainedModel: bool = False
+    forecastAvailable: bool = False
+    forecastMode: Optional[Literal['last_order', 'model']] = None
+    lastUpdated: Optional[datetime] = None
+    lastFinalizedAt: Optional[datetime] = None
 
 
 class ApplyForecastItem(BaseModel):

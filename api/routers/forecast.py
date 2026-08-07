@@ -22,6 +22,7 @@ from ..dependencies import (
 from ..middleware.rate_limit import rate_limit_history, rate_limit_write
 from ..models import (
     ForecastResponse,
+    ForecastStatusResponse,
     ForecastPayload,
     ForecastItem,
     ErrorResponse,
@@ -275,6 +276,41 @@ def _to_naive_utc(value: Any) -> Optional[datetime]:
     return None
 
 
+def _get_cached_forecast_readiness(
+    db: firestore.Client,
+    route_number: str,
+    schedule_key: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Return availability and mode for the newest non-expired cached forecast."""
+    cached_ref = db.collection("forecasts").document(route_number).collection("cached")
+    docs = cached_ref.where("scheduleKey", "==", schedule_key).stream() if schedule_key else cached_ref.stream()
+    now = _to_naive_utc(datetime.now(timezone.utc))
+    available: List[Dict[str, Any]] = []
+
+    for snapshot in docs:
+        data = snapshot.to_dict() or {}
+        expires_at = _to_naive_utc(data.get("expiresAt"))
+        if expires_at and now and expires_at <= now:
+            continue
+        available.append(data)
+
+    if not available:
+        return {"forecastAvailable": False, "forecastMode": None}
+
+    available.sort(
+        key=lambda item: _to_naive_utc(item.get("generatedAt") or item.get("createdAt")) or datetime.min,
+        reverse=True,
+    )
+    latest = available[0]
+    item_sources = {
+        str(item.get("source") or "").lower()
+        for item in (latest.get("items") or [])
+        if isinstance(item, dict)
+    }
+    mode = "last_order" if item_sources and item_sources == {"last_order"} else "model"
+    return {"forecastAvailable": True, "forecastMode": mode}
+
+
 def _get_last_finalized_at(route_number: str, schedule_key: Optional[str]) -> Optional[datetime]:
     """Get the last finalized order timestamp using direct PostgreSQL.
     
@@ -425,6 +461,7 @@ async def get_forecast_learning(
 
 @router.get(
     "/forecast/status",
+    response_model=ForecastStatusResponse,
     responses={
         401: {"model": ErrorResponse},
         403: {"model": ErrorResponse},
@@ -437,7 +474,7 @@ async def get_forecast_status(
     scheduleKey: Optional[str] = Query(default=None),
     decoded_token: dict = Depends(verify_firebase_token),
     db: firestore.Client = Depends(get_firestore),
-) -> Dict[str, Any]:
+) -> ForecastStatusResponse:
     """Return forecast status for a route (history count + last update).
     
     Performance: Direct PostgreSQL connection for lastFinalizedAt.
@@ -448,14 +485,17 @@ async def get_forecast_status(
     status_data = status_doc.to_dict() or {}
 
     last_finalized = _get_last_finalized_at(route, scheduleKey)
+    cached_status = _get_cached_forecast_readiness(db, route, scheduleKey)
 
-    return {
-        "orderCount": status_data.get("orderCount"),
-        "minOrdersRequired": status_data.get("minOrdersRequired"),
-        "hasTrainedModel": status_data.get("hasTrainedModel", False),
-        "lastUpdated": status_data.get("lastUpdated"),
-        "lastFinalizedAt": last_finalized,
-    }
+    return ForecastStatusResponse(
+        orderCount=status_data.get("orderCount"),
+        minOrdersRequired=status_data.get("minOrdersRequired"),
+        hasTrainedModel=status_data.get("hasTrainedModel", False),
+        forecastAvailable=cached_status["forecastAvailable"],
+        forecastMode=cached_status["forecastMode"],
+        lastUpdated=status_data.get("lastUpdated"),
+        lastFinalizedAt=last_finalized,
+    )
 
 
 @router.post(
