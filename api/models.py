@@ -330,6 +330,8 @@ class UserInfo(BaseModel):
     routes: List[str]  # Routes user has access to
     currentRoute: Optional[str] = None
     role: Optional[str] = None  # 'owner' or 'team_member'
+    ownedPrimaryRoute: Optional[str] = None
+    ownedRoutes: List[str] = Field(default_factory=list)
 
 
 class HealthStatus(BaseModel):

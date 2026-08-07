@@ -12,6 +12,7 @@ from fastapi import APIRouter, Depends, Request
 from ..dependencies import verify_firebase_token, get_firestore
 from ..models import UserInfo
 from ..middleware.rate_limit import rate_limit_auth
+from ..route_ownership import extract_owned_routes_for_owner, normalize_route
 
 router = APIRouter()
 
@@ -50,6 +51,7 @@ async def verify_token(
     
     user_data = user_doc.to_dict()
     profile = user_data.get('profile', {})
+    is_owner = str(profile.get('role') or '').strip() == 'owner'
     
     # Build list of accessible routes
     routes: List[str] = []
@@ -77,5 +79,7 @@ async def verify_token(
         displayName=decoded_token.get('name') or profile.get('displayName'),
         routes=routes,
         currentRoute=str(primary_route) if primary_route else None,
-        role=profile.get('role')
+        role=profile.get('role'),
+        ownedPrimaryRoute=(normalize_route(profile.get('routeNumber')) if is_owner else None),
+        ownedRoutes=extract_owned_routes_for_owner(user_data),
     )

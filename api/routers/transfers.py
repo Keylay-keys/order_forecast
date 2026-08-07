@@ -30,51 +30,18 @@ from ..dependencies import (
     get_firestore,
 )
 from ..middleware.rate_limit import rate_limit_history, rate_limit_write
+from ..route_ownership import extract_owned_routes_for_owner, normalize_route
 
 router = APIRouter()
-
-def _normalize_route_number(value: Any) -> str:
-    v = str(value or "").strip()
-    return v if v.isdigit() and len(v) <= 10 else ""
-
 
 def _require_owner_master_route(user_data: Dict[str, Any]) -> str:
     profile = (user_data or {}).get("profile", {}) or {}
     if str(profile.get("role") or "").strip() != "owner":
         raise HTTPException(403, "Owner access required")
-    master = _normalize_route_number(profile.get("routeNumber"))
+    master = normalize_route(profile.get("routeNumber"))
     if not master:
         raise HTTPException(403, "Owner primary route not set")
     return master
-
-
-def _extract_owned_routes_for_owner(user_data: Dict[str, Any]) -> set[str]:
-    """Mirror functions/src/route-transfers.ts extractOwnedRoutes semantics."""
-    profile = (user_data or {}).get("profile", {}) or {}
-    owned: set[str] = set()
-
-    master = _normalize_route_number(profile.get("routeNumber"))
-    if master:
-        owned.add(master)
-
-    additional = profile.get("additionalRoutes") or []
-    if isinstance(additional, list):
-        for r in additional:
-            nr = _normalize_route_number(r)
-            if nr:
-                owned.add(nr)
-
-    assignments = user_data.get("routeAssignments") or {}
-    if isinstance(assignments, dict):
-        for route, assignment in assignments.items():
-            nr = _normalize_route_number(route)
-            if not nr:
-                continue
-            if isinstance(assignment, dict) and str(assignment.get("role") or "").strip() == "owner":
-                owned.add(nr)
-
-    return owned
-
 
 def _row_to_dict(row: Any, columns: List[str]) -> Dict[str, Any]:
     if isinstance(row, dict):
@@ -325,7 +292,7 @@ async def reserve_transfer(
         if status == "canceled":
             raise HTTPException(409, "Transfer canceled")
 
-        to_route_number = _normalize_route_number(data.get("toRouteNumber"))
+        to_route_number = normalize_route(data.get("toRouteNumber"))
         if not to_route_number or not has_access_to_route(user_data, to_route_number):
             raise HTTPException(403, "Access denied")
 
@@ -385,7 +352,7 @@ async def create_transfer(
 
     # Validate both routes are owned by caller
     uid = decoded_token["uid"]
-    owned_routes = _extract_owned_routes_for_owner(user_data)
+    owned_routes = extract_owned_routes_for_owner(user_data)
 
     if payload.fromRouteNumber not in owned_routes or payload.toRouteNumber not in owned_routes:
         raise HTTPException(403, "Must own both fromRoute and toRoute")

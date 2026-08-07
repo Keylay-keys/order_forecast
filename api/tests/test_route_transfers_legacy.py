@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, patch
 from fastapi import HTTPException
 
 from order_forecast.api.routers import transfers
+from order_forecast.api.route_ownership import extract_owned_routes_for_owner
 from order_forecast.api.tests.route_transfer_fakes import FakeFirestore
 
 
@@ -55,8 +56,8 @@ class LegacyRouteTransferContractTests(unittest.IsolatedAsyncioTestCase):
 
     def test_owner_route_extraction_preserves_legacy_contract(self):
         self.assertEqual(
-            transfers._extract_owned_routes_for_owner(self.owner),
-            {FIXTURE["routeGroupId"], FIXTURE["secondaryRoute"]},
+            extract_owned_routes_for_owner(self.owner),
+            sorted([FIXTURE["routeGroupId"], FIXTURE["secondaryRoute"]], key=int),
         )
         with self.assertRaises(HTTPException) as context:
             transfers._require_owner_master_route({"profile": {"role": "team_member"}})
