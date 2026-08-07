@@ -37,6 +37,14 @@ class ScheduleResponse(BaseModel):
     nextDelivery: Optional[Dict[str, Any]] = None  # {date, scheduleKey, cycleName}
 
 
+class ScheduleKeyResponse(BaseModel):
+    scheduleKey: str
+    deliveryDate: str
+    orderDayName: str
+    deliveryDayName: str
+    matched: bool
+
+
 DAY_NAMES = ['', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
 
 
@@ -180,6 +188,7 @@ async def get_schedule(
 
 @router.get(
     "/schedule/delivery-date",
+    response_model=ScheduleKeyResponse,
     responses={
         401: {"description": "Unauthorized"},
         403: {"description": "Access denied to route"},
@@ -191,7 +200,7 @@ async def get_schedule_key_for_date(
     deliveryDate: str = Query(..., pattern=r"^\d{4}-\d{2}-\d{2}$", description="Delivery date (YYYY-MM-DD)"),
     decoded_token: dict = Depends(verify_firebase_token),
     db: firestore.Client = Depends(get_firestore),
-) -> Dict[str, str]:
+) -> ScheduleKeyResponse:
     """Get the schedule key for a specific delivery date.
     
     Maps a delivery date back to the order day (e.g., Thursday delivery → 'monday').
@@ -210,19 +219,19 @@ async def get_schedule_key_for_date(
     resolution = get_schedule_key_for_delivery_date(deliveryDate, cycles)
     if resolution:
         order_day = resolution['orderDay']
-        return {
-            'scheduleKey': resolution['scheduleKey'],
-            'deliveryDate': deliveryDate,
-            'orderDayName': get_day_name(order_day),
-            'deliveryDayName': get_day_name(delivery_dow),
-            'matched': True,
-        }
+        return ScheduleKeyResponse(
+            scheduleKey=resolution['scheduleKey'],
+            deliveryDate=deliveryDate,
+            orderDayName=get_day_name(order_day),
+            deliveryDayName=get_day_name(delivery_dow),
+            matched=True,
+        )
     
     # No matching cycle, use delivery day as schedule key
-    return {
-        'scheduleKey': get_day_name(delivery_dow).lower(),
-        'deliveryDate': deliveryDate,
-        'orderDayName': get_day_name(delivery_dow),
-        'deliveryDayName': get_day_name(delivery_dow),
-        'matched': False,
-    }
+    return ScheduleKeyResponse(
+        scheduleKey=get_day_name(delivery_dow).lower(),
+        deliveryDate=deliveryDate,
+        orderDayName=get_day_name(delivery_dow),
+        deliveryDayName=get_day_name(delivery_dow),
+        matched=False,
+    )
