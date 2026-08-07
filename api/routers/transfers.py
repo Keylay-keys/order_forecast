@@ -1,32 +1,30 @@
 """Route transfers router - audit queries for cross-route transfers.
 
 Endpoints:
-  GET /api/transfers - list transfer entries for a route group (PostgreSQL-backed)
+  GET /api/transfers - list transfer entries for a route group (Firestore-backed)
   GET /api/transfers/ledger - real-time ledger with reservations (Firestore-backed)
   POST /api/transfers/reserve - reserve units from a transfer (inbound)
   POST /api/transfers/create - create/upsert a transfer (outbound)
 
 Notes:
 - Phase 1 only: transfers are an accounting layer and do not mutate order totals.
-- Data source for /transfers is PostgreSQL table route_transfers (synced by route_transfer_sync_listener.py).
-- Ledger/reserve/create use Firestore directly for real-time reservation tracking.
+- History, ledger, reserve, and create use the authoritative Firestore transfer documents.
 """
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta
-from typing import Optional, Any, Dict, List
+from datetime import datetime, timedelta, timezone
+from typing import Optional, Any, Dict
 
 from fastapi import APIRouter, Depends, Query, Request, HTTPException
 from pydantic import BaseModel, Field
 from google.cloud import firestore
+from google.cloud.firestore_v1.base_query import FieldFilter
 
 from ..dependencies import (
     verify_firebase_token,
     require_route_access,
     has_access_to_route,
-    get_pg_connection,
-    return_pg_connection,
     get_firestore,
 )
 from ..middleware.rate_limit import rate_limit_history, rate_limit_write
@@ -43,12 +41,44 @@ def _require_owner_master_route(user_data: Dict[str, Any]) -> str:
         raise HTTPException(403, "Owner primary route not set")
     return master
 
-def _row_to_dict(row: Any, columns: List[str]) -> Dict[str, Any]:
-    if isinstance(row, dict):
-        return row
-    if isinstance(row, (list, tuple)):
-        return {columns[i]: row[i] for i in range(len(columns))}
-    return {"value": row}
+def _history_timestamp(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+    return str(value)
+
+
+def _history_created_sort_value(value: Any) -> float:
+    if hasattr(value, "timestamp"):
+        return float(value.timestamp())
+    if isinstance(value, (int, float)):
+        return float(value)
+    return 0.0
+
+
+def _history_row(route_group_id: str, doc: Any) -> Dict[str, Any]:
+    data = doc.to_dict() or {}
+    return {
+        "fs_doc_path": f"routeTransfers/{route_group_id}/transfers/{doc.id}",
+        "route_group_id": route_group_id,
+        "transfer_id": doc.id,
+        "transfer_date": str(data.get("transferDate") or ""),
+        "purchase_route_number": data.get("purchaseRouteNumber") or data.get("fromRouteNumber"),
+        "from_route_number": data.get("fromRouteNumber") or "",
+        "to_route_number": data.get("toRouteNumber") or "",
+        "sap": str(data.get("sap") or ""),
+        "units": int(data.get("units") or 0),
+        "case_pack": int(data.get("casePack") or 0),
+        "status": str(data.get("status") or "planned"),
+        "reason": data.get("reason"),
+        "source_order_id": data.get("sourceOrderId"),
+        "created_by": data.get("createdByUid"),
+        "created_at": _history_timestamp(data.get("createdAt")),
+        "updated_at": _history_timestamp(data.get("updatedAt")),
+        "synced_at": None,
+        "_created_sort": _history_created_sort_value(data.get("createdAt")),
+    }
 
 
 @router.get("/transfers")
@@ -73,94 +103,40 @@ async def list_transfers(
     if route_group_id != master_route:
         raise HTTPException(403, "routeGroupId must be the owner's primary route number")
 
-    cutoff = (datetime.utcnow() - timedelta(days=days)).date().isoformat()
-
-    conn = None
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).date().isoformat()
     try:
-        conn = get_pg_connection()
-        cur = conn.cursor()
+        snapshots = (
+            db.collection("routeTransfers")
+            .document(route_group_id)
+            .collection("transfers")
+            .where(filter=FieldFilter("transferDate", ">=", cutoff))
+            .get()
+        )
 
-        if route:
-            cur.execute(
-                """
-                SELECT
-                    fs_doc_path,
-                    route_group_id,
-                    transfer_id,
-                    transfer_date,
-                    purchase_route_number,
-                    from_route_number,
-                    to_route_number,
-                    sap,
-                    units,
-                    case_pack,
-                    status,
-                    reason,
-                    source_order_id,
-                    created_by,
-                    created_at,
-                    updated_at,
-                    synced_at
-                FROM route_transfers
-                WHERE route_group_id = %s
-                  AND transfer_date >= %s
-                  AND (from_route_number = %s OR to_route_number = %s)
-                ORDER BY transfer_date DESC, created_at DESC NULLS LAST
-                LIMIT %s
-                """,
-                [route_group_id, cutoff, route, route, limit + 1],
-            )
-        else:
-            cur.execute(
-                """
-                SELECT
-                    fs_doc_path,
-                    route_group_id,
-                    transfer_id,
-                    transfer_date,
-                    purchase_route_number,
-                    from_route_number,
-                    to_route_number,
-                    sap,
-                    units,
-                    case_pack,
-                    status,
-                    reason,
-                    source_order_id,
-                    created_by,
-                    created_at,
-                    updated_at,
-                    synced_at
-                FROM route_transfers
-                WHERE route_group_id = %s
-                  AND transfer_date >= %s
-                ORDER BY transfer_date DESC, created_at DESC NULLS LAST
-                LIMIT %s
-                """,
-                [route_group_id, cutoff, limit + 1],
-            )
+        rows = []
+        for doc in snapshots:
+            data = doc.to_dict() or {}
+            if route and route not in {
+                normalize_route(data.get("fromRouteNumber")),
+                normalize_route(data.get("toRouteNumber")),
+            }:
+                continue
+            rows.append(_history_row(route_group_id, doc))
 
-        rows = cur.fetchall()
-        columns = [d[0] for d in cur.description] if cur.description else []
-        cur.close()
-        return_pg_connection(conn)
-        conn = None
-
+        rows.sort(
+            key=lambda row: (row["transfer_date"], row["_created_sort"]),
+            reverse=True,
+        )
         has_more = len(rows) > limit
-        out = []
-        for r in rows[:limit]:
-            d = _row_to_dict(r, columns)
-            # Convert datetimes to ISO strings for JSON.
-            for k in ("created_at", "updated_at", "synced_at"):
-                v = d.get(k)
-                if hasattr(v, "isoformat"):
-                    d[k] = v.isoformat()
-            out.append(d)
+        out = rows[:limit]
+        for row in out:
+            row.pop("_created_sort", None)
 
         return {"ok": True, "transfers": out, "hasMore": has_more}
-    finally:
-        if conn is not None:
-            return_pg_connection(conn)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(500, f"Failed to read transfer history: {str(exc)}")
 
 
 # =============================================================================

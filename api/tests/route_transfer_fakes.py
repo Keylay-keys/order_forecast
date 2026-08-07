@@ -19,19 +19,46 @@ class FakeSnapshot:
 
 
 class FakeQuery:
-    def __init__(self, db, collection_path, *, limit_value=None):
+    def __init__(self, db, collection_path, *, limit_value=None, filters=None):
         self.db = db
         self.collection_path = tuple(collection_path)
         self.limit_value = limit_value
+        self.filters = tuple(filters or ())
 
     def order_by(self, *_args, **_kwargs):
         return self
 
     def limit(self, value):
-        return FakeQuery(self.db, self.collection_path, limit_value=value)
+        return FakeQuery(
+            self.db,
+            self.collection_path,
+            limit_value=value,
+            filters=self.filters,
+        )
+
+    def where(self, field=None, op=None, value=None, *, filter=None):
+        if filter is not None:
+            field = filter.field_path
+            op = filter.op_string
+            value = filter.value
+        return FakeQuery(
+            self.db,
+            self.collection_path,
+            limit_value=self.limit_value,
+            filters=(*self.filters, (field, op, value)),
+        )
 
     def get(self):
         snapshots = self.db.collection_snapshots(self.collection_path)
+        for field, op, value in self.filters:
+            if op != ">=":
+                raise AssertionError(f"Unsupported fake query operator: {op}")
+            snapshots = [
+                snapshot
+                for snapshot in snapshots
+                if (snapshot.to_dict() or {}).get(field) is not None
+                and (snapshot.to_dict() or {}).get(field) >= value
+            ]
         return snapshots[: self.limit_value] if self.limit_value else snapshots
 
     def stream(self):
@@ -129,4 +156,3 @@ class FakeFirestore:
 
     def delete_document(self, path):
         self.documents.pop(self._normalize_path(path), None)
-
