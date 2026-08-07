@@ -47,7 +47,13 @@ _FEATURE_PREFIXES: Tuple[Tuple[str, str], ...] = (
     ("/api/billing", "billing"),
     ("/api/archive-exports", "archive_exports"),
     ("/api/forecast", "forecast"),
-    ("/api/transfers", "transfers"),
+    # Keep specific transfer paths before the base history endpoint. Matching
+    # stops at the first prefix, and the split is how rollout proves that idle
+    # clients no longer generate ledger reads.
+    ("/api/transfers/ledger", "transfer_ledger_read"),
+    ("/api/transfers/reserve", "transfer_reserve"),
+    ("/api/transfers/create", "transfer_create"),
+    ("/api/transfers", "transfer_history_read"),
     ("/api/auth", "auth"),
 )
 
@@ -318,6 +324,23 @@ def get_usage_summary(
         cur.execute(
             f"""
             SELECT
+                COALESCE(SUM(request_count), 0)::BIGINT AS "requestCount",
+                COALESCE(SUM(error_count), 0)::BIGINT AS "errorCount",
+                COUNT(DISTINCT actor_hash)::INTEGER AS "uniqueUsers",
+                COUNT(DISTINCT route_number)::INTEGER AS "uniqueRoutes",
+                COUNT(DISTINCT actor_hash) FILTER (WHERE actor_role = 'owner')::INTEGER AS "ownerUsers",
+                COUNT(DISTINCT actor_hash) FILTER (WHERE actor_role = 'team_member')::INTEGER AS "teamMemberUsers"
+            FROM api_usage_daily
+            WHERE activity_date BETWEEN %s AND %s{route_clause}
+              AND (feature_key = 'transfers' OR feature_key LIKE 'transfer_%%')
+            """,
+            params,
+        )
+        transfer_rollup = dict(cur.fetchone() or {})
+
+        cur.execute(
+            f"""
+            SELECT
                 activity_date AS "date",
                 SUM(request_count)::BIGINT AS "requestCount",
                 SUM(error_count)::BIGINT AS "errorCount",
@@ -356,6 +379,10 @@ def get_usage_summary(
         "range": {"days": days, "startDate": start_date.isoformat(), "endDate": end_date.isoformat()},
         "totals": {key: int(value or 0) for key, value in totals.items()},
         "features": _serialize_rows(features),
+        "transferRollup": {
+            key: int(value or 0)
+            for key, value in transfer_rollup.items()
+        },
         "trend": _serialize_rows(trend),
         "routeFeatures": _serialize_rows(route_features),
     }
