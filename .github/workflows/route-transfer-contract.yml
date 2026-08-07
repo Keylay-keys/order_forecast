@@ -1,0 +1,25 @@
+name: Route Transfer Contract
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  route-transfer-contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements_docker.txt
+      - name: Install backend dependencies
+        run: python -m pip install -r requirements_docker.txt
+      - name: Run focused route-transfer contracts
+        working-directory: ..
+        run: |
+          python -m unittest \
+            order_forecast.api.tests.test_route_transfers_legacy \
+            order_forecast.api.tests.test_route_transfer_access_core

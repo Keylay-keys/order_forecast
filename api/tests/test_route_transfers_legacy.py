@@ -13,7 +13,12 @@ from order_forecast.api.tests.route_transfer_fakes import FakeFirestore
 
 
 FIXTURE = json.loads(
-    (Path(__file__).parent / "fixtures" / "route-transfer-legacy-owner.json").read_text()
+    (
+        Path(__file__).parents[2]
+        / "contracts"
+        / "route-transfers"
+        / "legacy-owner.json"
+    ).read_text()
 )
 
 
