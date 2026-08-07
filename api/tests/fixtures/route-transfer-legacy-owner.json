@@ -1,0 +1,53 @@
+{
+  "routeGroupId": "989262",
+  "secondaryRoute": "988200",
+  "ownerUid": "owner-1",
+  "ownerData": {
+    "profile": {
+      "role": "owner",
+      "routeNumber": "989262",
+      "additionalRoutes": ["988200"]
+    },
+    "routeAssignments": {
+      "988200": {
+        "role": "owner"
+      },
+      "777777": {
+        "role": "team_member"
+      }
+    }
+  },
+  "transfer": {
+    "routeGroupId": "989262",
+    "purchaseRouteNumber": "989262",
+    "fromRouteNumber": "989262",
+    "toRouteNumber": "988200",
+    "sap": "31032",
+    "units": 12,
+    "casePack": 12,
+    "status": "planned",
+    "reservedBy": {
+      "consumer-order": 4
+    },
+    "createdAt": 1000,
+    "updatedAt": 1000
+  },
+  "createRequest": {
+    "routeGroupId": "989262",
+    "transferKey": "source-order:989262:988200:31032",
+    "fromRouteNumber": "989262",
+    "toRouteNumber": "988200",
+    "sap": "31032",
+    "units": 12,
+    "casePack": 12,
+    "transferDate": "2026-08-07",
+    "status": "planned",
+    "sourceOrderId": "source-order"
+  },
+  "reserveRequest": {
+    "routeGroupId": "989262",
+    "transferKey": "source-order:989262:988200:31032",
+    "consumerOrderId": "consumer-order-2",
+    "units": 3
+  }
+}
