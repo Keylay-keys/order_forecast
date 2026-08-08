@@ -359,6 +359,29 @@ def get_usage_summary(
             f"""
             SELECT
                 route_number AS "routeNumber",
+                SUM(request_count)::BIGINT AS "requestCount",
+                SUM(error_count)::BIGINT AS "errorCount",
+                COUNT(DISTINCT actor_hash)::INTEGER AS "uniqueUsers",
+                COUNT(DISTINCT actor_hash) FILTER (WHERE actor_role = 'owner')::INTEGER AS "ownerUsers",
+                COUNT(DISTINCT actor_hash) FILTER (WHERE actor_role = 'team_member')::INTEGER AS "teamMemberUsers",
+                COUNT(DISTINCT feature_key)::INTEGER AS "featureCount",
+                COUNT(DISTINCT activity_date)::INTEGER AS "activeDays",
+                MIN(first_seen_at) AS "firstSeenAt",
+                MAX(last_seen_at) AS "lastSeenAt"
+            FROM api_usage_daily
+            WHERE activity_date BETWEEN %s AND %s{route_clause}
+            GROUP BY route_number
+            ORDER BY "errorCount" DESC, "requestCount" DESC, route_number
+            LIMIT 500
+            """,
+            params,
+        )
+        route_summaries = _rows(cur)
+
+        cur.execute(
+            f"""
+            SELECT
+                route_number AS "routeNumber",
                 feature_key AS "featureKey",
                 SUM(request_count)::BIGINT AS "requestCount",
                 SUM(error_count)::BIGINT AS "errorCount",
@@ -384,5 +407,6 @@ def get_usage_summary(
             for key, value in transfer_rollup.items()
         },
         "trend": _serialize_rows(trend),
+        "routeSummaries": _serialize_rows(route_summaries),
         "routeFeatures": _serialize_rows(route_features),
     }

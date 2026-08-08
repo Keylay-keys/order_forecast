@@ -190,6 +190,18 @@ class UsageAnalyticsTests(unittest.TestCase):
                 [{"featureKey": "reference_catalog", "requestCount": 9, "uniqueUsers": 2}],
                 {"requestCount": 4, "errorCount": 0, "uniqueUsers": 1, "uniqueRoutes": 1, "ownerUsers": 1, "teamMemberUsers": 0},
                 [{"date": datetime(2026, 8, 6, tzinfo=timezone.utc).date(), "requestCount": 9, "uniqueUsers": 2}],
+                [{
+                    "routeNumber": "989262",
+                    "requestCount": 9,
+                    "errorCount": 1,
+                    "uniqueUsers": 2,
+                    "ownerUsers": 1,
+                    "teamMemberUsers": 1,
+                    "featureCount": 1,
+                    "activeDays": 1,
+                    "firstSeenAt": datetime(2026, 8, 6, 11, 0, tzinfo=timezone.utc),
+                    "lastSeenAt": datetime(2026, 8, 6, 12, 0, tzinfo=timezone.utc),
+                }],
                 [{"routeNumber": "989262", "featureKey": "reference_catalog", "requestCount": 9, "uniqueUsers": 2}],
             ]
         )
@@ -207,6 +219,8 @@ class UsageAnalyticsTests(unittest.TestCase):
         self.assertEqual(result["transferRollup"]["requestCount"], 4)
         self.assertEqual(result["transferRollup"]["uniqueUsers"], 1)
         self.assertEqual(result["trend"][0]["date"], "2026-08-06")
+        self.assertEqual(result["routeSummaries"][0]["uniqueUsers"], 2)
+        self.assertEqual(result["routeSummaries"][0]["lastSeenAt"], "2026-08-06T12:00:00+00:00")
         self.assertEqual(result["routeFeatures"][0]["routeNumber"], "989262")
         self.assertNotIn("actor_hash", str(result))
         self.assertNotIn("firebase", str(result))
