@@ -669,6 +669,181 @@ class CatalogReferenceContractTests(unittest.TestCase):
 
 
 class ReferenceCatalogAvailabilityTests(unittest.IsolatedAsyncioTestCase):
+    def _demo_db(self):
+        db = _FakeDB()
+        db.set_document(("masterCatalog", "900000"), {"routeNumber": "900000"})
+        db.set_document(
+            ("masterCatalog", "900000", "products", "90001"),
+            {
+                "sap": "90001",
+                "fullName": "Generic Inventory Item A",
+                "brand": "Generic",
+                "category": "general",
+                "casePack": 6,
+                "displayOrder": 1,
+                "active": True,
+            },
+        )
+        db.set_document(
+            ("masterCatalog", "900000", "products", "90002"),
+            {
+                "sap": "90002",
+                "fullName": "Generic Inventory Item B",
+                "brand": "Generic",
+                "category": "general",
+                "casePack": 8,
+                "displayOrder": 2,
+                "active": False,
+            },
+        )
+        return db
+
+    def test_reference_override_parser_accepts_only_uid_route_pairs(self):
+        self.assertEqual(
+            reference._parse_reference_catalog_route_overrides(
+                "apple-review=900000, malformed,missing-route=,bad-route=abc"
+            ),
+            {"apple-review": "900000"},
+        )
+
+    async def test_starter_catalog_override_returns_only_protected_route_products(self):
+        endpoint = inspect.unwrap(reference.get_starter_catalog)
+        db = self._demo_db()
+
+        with patch.object(reference, "REFERENCE_CATALOG_ROUTE_OVERRIDES", {"apple-review": "900000"}), patch.object(
+            reference,
+            "_fetch_reference_catalog_items",
+        ) as fetch_postgres:
+            response = await endpoint(
+                _FakeRequest(),
+                500,
+                True,
+                {"uid": "apple-review"},
+                db,
+            )
+
+        fetch_postgres.assert_not_called()
+        self.assertEqual(response["catalogId"], "routespark-starter-catalog")
+        self.assertEqual(response["version"], 1)
+        self.assertEqual(response["productCount"], 2)
+        self.assertEqual([item["sap"] for item in response["items"]], ["90001", "90002"])
+        self.assertEqual(response["items"][0]["source"], "protected-demo-route")
+
+    async def test_starter_catalog_override_hides_inactive_products_by_default(self):
+        endpoint = inspect.unwrap(reference.get_starter_catalog)
+        db = self._demo_db()
+
+        with patch.object(reference, "REFERENCE_CATALOG_ROUTE_OVERRIDES", {"apple-review": "900000"}):
+            response = await endpoint(
+                _FakeRequest(),
+                500,
+                False,
+                {"uid": "apple-review"},
+                db,
+            )
+
+        self.assertEqual(response["productCount"], 1)
+        self.assertEqual([item["sap"] for item in response["items"]], ["90001"])
+
+    async def test_reference_search_override_never_returns_global_products(self):
+        endpoint = inspect.unwrap(reference.search_reference_catalog)
+        db = self._demo_db()
+
+        with patch.object(reference, "REFERENCE_CATALOG_ROUTE_OVERRIDES", {"apple-review": "900000"}), patch.object(
+            reference,
+            "_fetch_reference_items_by_search",
+        ) as fetch_postgres:
+            response = await endpoint(
+                _FakeRequest(),
+                "Inventory Item B",
+                25,
+                True,
+                {"uid": "apple-review"},
+                db,
+            )
+
+        fetch_postgres.assert_not_called()
+        self.assertEqual([item["sap"] for item in response["items"]], ["90002"])
+
+    async def test_reference_item_override_rejects_non_demo_sap(self):
+        endpoint = inspect.unwrap(reference.get_reference_catalog_item)
+        db = self._demo_db()
+
+        with patch.object(reference, "REFERENCE_CATALOG_ROUTE_OVERRIDES", {"apple-review": "900000"}), patch.object(
+            reference,
+            "_fetch_reference_item_by_sap",
+        ) as fetch_postgres:
+            with self.assertRaises(HTTPException) as raised:
+                await endpoint(
+                    _FakeRequest(),
+                    "31032",
+                    True,
+                    {"uid": "apple-review"},
+                    db,
+                )
+
+        fetch_postgres.assert_not_called()
+        self.assertEqual(raised.exception.status_code, 404)
+
+    async def test_reference_item_override_returns_generic_item(self):
+        endpoint = inspect.unwrap(reference.get_reference_catalog_item)
+        db = self._demo_db()
+
+        with patch.object(reference, "REFERENCE_CATALOG_ROUTE_OVERRIDES", {"apple-review": "900000"}):
+            response = await endpoint(
+                _FakeRequest(),
+                "90001",
+                True,
+                {"uid": "apple-review"},
+                db,
+            )
+
+        self.assertEqual(response["item"]["sap"], "90001")
+        self.assertEqual(response["item"]["fullName"], "Generic Inventory Item A")
+        self.assertEqual(response["item"]["casePack"], 6)
+
+    async def test_reference_image_override_never_exposes_global_brand_image(self):
+        endpoint = inspect.unwrap(reference.get_reference_catalog_image)
+
+        with patch.object(reference, "REFERENCE_CATALOG_ROUTE_OVERRIDES", {"apple-review": "900000"}), patch.object(
+            reference,
+            "_fetch_reference_image_path",
+        ) as fetch_postgres:
+            with self.assertRaises(HTTPException) as raised:
+                await endpoint(
+                    _FakeRequest(),
+                    "31032",
+                    {"uid": "apple-review"},
+                )
+
+        fetch_postgres.assert_not_called()
+        self.assertEqual(raised.exception.status_code, 404)
+
+    async def test_unmapped_user_still_uses_global_postgres_reference(self):
+        endpoint = inspect.unwrap(reference.get_starter_catalog)
+        db = self._demo_db()
+        global_items = [{"sap": "31032"}]
+
+        with patch.object(reference, "REFERENCE_CATALOG_ROUTE_OVERRIDES", {"apple-review": "900000"}), patch.object(
+            reference,
+            "_fetch_reference_catalog_items",
+            return_value=global_items,
+        ) as fetch_postgres, patch.object(
+            reference,
+            "_reference_catalog_response",
+            return_value={"catalogId": "routespark-starter-catalog", "items": global_items},
+        ):
+            response = await endpoint(
+                _FakeRequest(),
+                500,
+                True,
+                {"uid": "normal-user"},
+                db,
+            )
+
+        fetch_postgres.assert_called_once()
+        self.assertEqual(response["items"], global_items)
+
     async def test_starter_catalog_reports_item_query_database_failure_as_retryable(self):
         endpoint = inspect.unwrap(reference.get_starter_catalog)
         with patch.object(

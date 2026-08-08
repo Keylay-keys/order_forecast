@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from pathlib import Path as FilePath
 from typing import Dict, Any, List, NoReturn, Optional
 
@@ -28,6 +29,7 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_REFERENCE_CATALOG_ID = "routespark-starter-catalog"
 IMAGE_ROUTE_PREFIX = "/api/catalog/starter/images"
+DEMO_REFERENCE_CATALOG_VERSION = 1
 REFERENCE_TAG_SEARCH_ALIASES = {
     "bfy": "better_for_you",
     "better for you": "better_for_you",
@@ -37,6 +39,24 @@ REFERENCE_TAG_SEARCH_ALIASES = {
     "walmart": "walmart",
     "wm": "walmart",
 }
+
+
+def _parse_reference_catalog_route_overrides(value: str) -> Dict[str, str]:
+    """Parse the trusted deployment mapping ``firebase_uid=route``."""
+    overrides: Dict[str, str] = {}
+    for raw_entry in value.split(","):
+        uid, separator, route = raw_entry.strip().partition("=")
+        uid = uid.strip()
+        route = route.strip()
+        if not separator or not uid or not re.fullmatch(r"\d{1,10}", route):
+            continue
+        overrides[uid] = route
+    return overrides
+
+
+REFERENCE_CATALOG_ROUTE_OVERRIDES = _parse_reference_catalog_route_overrides(
+    os.environ.get("REFERENCE_CATALOG_ROUTE_OVERRIDES", "")
+)
 
 
 def _raise_reference_catalog_unavailable(
@@ -200,6 +220,96 @@ def _normalize_reference_meta(row: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         "productCount": _clean_int(row.get("product_count") or row.get("productCount"), 0) or None,
         "updatedAt": updated_at.isoformat() if hasattr(updated_at, "isoformat") else _clean_optional_text(updated_at),
     }
+
+
+def _reference_catalog_override_route(decoded_token: Dict[str, Any]) -> Optional[str]:
+    uid = _clean_text(decoded_token.get("uid"))
+    return REFERENCE_CATALOG_ROUTE_OVERRIDES.get(uid)
+
+
+def _fetch_route_reference_catalog_items(
+    *,
+    db: firestore.Client,
+    route: str,
+    include_inactive: bool,
+) -> List[Dict[str, Any]]:
+    """Return a protected demo route's catalog through the reference contract."""
+    products_ref = db.collection("masterCatalog").document(route).collection("products")
+    items: List[Dict[str, Any]] = []
+    for doc in products_ref.stream():
+        data = doc.to_dict() or {}
+        active = data.get("active") is not False
+        if not include_inactive and not active:
+            continue
+        items.append(
+            _normalize_reference_item(
+                {
+                    **data,
+                    "catalog_id": DEFAULT_REFERENCE_CATALOG_ID,
+                    "sap": data.get("sap") or doc.id,
+                    "fullName": data.get("fullName") or data.get("description"),
+                    "active": active,
+                    "source": "protected-demo-route",
+                }
+            )
+        )
+    items.sort(key=lambda item: (item.get("displayOrder", 0), item["sap"]))
+    return items
+
+
+def _route_reference_catalog_response(
+    *,
+    all_items: List[Dict[str, Any]],
+    items: Optional[List[Dict[str, Any]]] = None,
+    extra: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    response: Dict[str, Any] = {
+        "catalogId": DEFAULT_REFERENCE_CATALOG_ID,
+        "version": DEMO_REFERENCE_CATALOG_VERSION,
+        "productCount": len(all_items),
+        "updatedAt": None,
+    }
+    if items is not None:
+        response["items"] = items
+    if extra:
+        response.update(extra)
+    return response
+
+
+def _search_route_reference_catalog_items(
+    items: List[Dict[str, Any]],
+    query: str,
+    *,
+    limit: int,
+) -> List[Dict[str, Any]]:
+    normalized_query = query.strip().lower()
+    normalized_upc = _normalize_upc(normalized_query)
+
+    def rank(item: Dict[str, Any]) -> Optional[int]:
+        sap = _clean_text(item.get("sap")).lower()
+        upc = _clean_text(item.get("upc")).lower()
+        upc_digits = _normalize_upc(upc)
+        text = " ".join(
+            [
+                _clean_text(item.get("fullName")),
+                _clean_text(item.get("brand")),
+                _clean_text(item.get("category")),
+                " ".join(_clean_tags(item.get("tags"))),
+            ]
+        ).lower()
+        if sap == normalized_query:
+            return 0
+        if upc == normalized_query or (normalized_upc and upc_digits == normalized_upc):
+            return 1
+        if normalized_query in sap or normalized_query in text:
+            return 2
+        if normalized_upc and normalized_upc in upc_digits:
+            return 2
+        return None
+
+    matches = [(match_rank, item) for item in items if (match_rank := rank(item)) is not None]
+    matches.sort(key=lambda entry: (entry[0], entry[1].get("displayOrder", 0), entry[1]["sap"]))
+    return [item for _, item in matches[:limit]]
 
 
 def _fetch_reference_catalog_meta(
@@ -422,9 +532,18 @@ async def get_starter_catalog(
     limit: int = Query(250, ge=1, le=500),
     includeInactive: bool = Query(False, description="Include inactive reference rows"),
     decoded_token: dict = Depends(verify_firebase_token),
+    db: firestore.Client = Depends(get_firestore),
 ) -> Dict[str, Any]:
     """Return the shared RouteSpark starter/reference catalog."""
-    del decoded_token
+    override_route = _reference_catalog_override_route(decoded_token)
+    if override_route:
+        all_items = _fetch_route_reference_catalog_items(
+            db=db,
+            route=override_route,
+            include_inactive=includeInactive,
+        )
+        return _route_reference_catalog_response(all_items=all_items, items=all_items[:limit])
+
     try:
         items = _fetch_reference_catalog_items(
             limit=limit,
@@ -448,14 +567,28 @@ async def search_reference_catalog(
     limit: int = Query(25, ge=1, le=50),
     includeInactive: bool = Query(False, description="Include inactive reference rows"),
     decoded_token: dict = Depends(verify_firebase_token),
+    db: firestore.Client = Depends(get_firestore),
 ) -> Dict[str, Any]:
     """Search the shared RouteSpark reference catalog.
 
     This data is not route-private, but reads still require Firebase auth so the
     endpoint cannot be scraped anonymously.
     """
-    del decoded_token
     query = q.strip()
+    override_route = _reference_catalog_override_route(decoded_token)
+    if override_route:
+        all_items = _fetch_route_reference_catalog_items(
+            db=db,
+            route=override_route,
+            include_inactive=includeInactive,
+        )
+        items = _search_route_reference_catalog_items(all_items, query, limit=limit)
+        return _route_reference_catalog_response(
+            all_items=all_items,
+            items=items,
+            extra={"query": query},
+        )
+
     items = _fetch_reference_items_by_search(
         query,
         limit=limit,
@@ -472,9 +605,24 @@ async def get_reference_catalog_item(
     sap: str = Path(..., pattern=r"^[A-Za-z0-9_-]{1,20}$"),
     includeInactive: bool = Query(False, description="Include inactive reference rows"),
     decoded_token: dict = Depends(verify_firebase_token),
+    db: firestore.Client = Depends(get_firestore),
 ) -> Dict[str, Any]:
     """Return one item from the shared RouteSpark reference catalog by SAP."""
-    del decoded_token
+    override_route = _reference_catalog_override_route(decoded_token)
+    if override_route:
+        all_items = _fetch_route_reference_catalog_items(
+            db=db,
+            route=override_route,
+            include_inactive=includeInactive,
+        )
+        item = next((candidate for candidate in all_items if candidate["sap"] == sap.strip()), None)
+        if not item:
+            raise HTTPException(status_code=404, detail="Reference catalog item not found")
+        return _route_reference_catalog_response(
+            all_items=all_items,
+            extra={"sap": item["sap"], "item": item},
+        )
+
     item = _fetch_reference_item_by_sap(
         sap.strip(),
         base_url=_public_base_url(request),
@@ -493,7 +641,11 @@ async def get_reference_catalog_image(
     decoded_token: dict = Depends(verify_firebase_token),
 ) -> FileResponse:
     """Return a reviewed reference product image by SAP."""
-    del request, decoded_token
+    del request
+    if _reference_catalog_override_route(decoded_token):
+        # Protected demo products intentionally have no brand imagery.
+        raise HTTPException(status_code=404, detail="Reference catalog image not found")
+
     image_path = _fetch_reference_image_path(sap.strip())
     if not image_path:
         raise HTTPException(status_code=404, detail="Reference catalog image not found")
