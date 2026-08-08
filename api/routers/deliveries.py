@@ -43,6 +43,12 @@ router = APIRouter()
 HDD_ARCHIVE_BASE = os.environ.get(
     "PCF_ARCHIVE_PATH", "/mnt/archive/pcf/pcf_archive"
 )
+PCF_RESOURCE_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
+
+
+def _is_safe_pcf_resource_id(value: str) -> bool:
+    """Allow existing Firestore-style IDs without permitting path traversal."""
+    return bool(PCF_RESOURCE_ID_PATTERN.fullmatch(str(value or "")))
 
 
 # ---------------------------------------------------------------------------
@@ -374,6 +380,9 @@ async def get_archived_delivery(
     """
     await require_route_access(route, decoded_token, db)
 
+    if not _is_safe_pcf_resource_id(delivery_id):
+        raise HTTPException(400, "Invalid delivery ID")
+
     # Try Firebase first
     detail = _firebase_doc_to_detail(db, route, delivery_id)
 
@@ -473,9 +482,9 @@ async def get_archived_image(
     await require_route_access(route, decoded_token, db)
 
     # Validate inputs (prevent path traversal)
-    if not re.match(r"^\d+$", delivery_id):
+    if not _is_safe_pcf_resource_id(delivery_id):
         raise HTTPException(400, "Invalid delivery ID")
-    if not re.match(r"^\d+$", container):
+    if not _is_safe_pcf_resource_id(container):
         raise HTTPException(400, "Invalid container code")
 
     # Try HDD first (images that have been cleaned up from Firebase)
@@ -671,7 +680,7 @@ async def get_active_delivery(
     await require_route_access(route, decoded_token, db)
 
     # Validate delivery ID
-    if not re.match(r"^\d+$", delivery_id):
+    if not _is_safe_pcf_resource_id(delivery_id):
         raise HTTPException(400, "Invalid delivery ID")
 
     try:
@@ -738,9 +747,9 @@ async def get_active_image(
     await require_route_access(route, decoded_token, db)
 
     # Validate inputs
-    if not re.match(r"^\d+$", delivery_id):
+    if not _is_safe_pcf_resource_id(delivery_id):
         raise HTTPException(400, "Invalid delivery ID")
-    if not re.match(r"^\d+$", container):
+    if not _is_safe_pcf_resource_id(container):
         raise HTTPException(400, "Invalid container code")
 
     try:
