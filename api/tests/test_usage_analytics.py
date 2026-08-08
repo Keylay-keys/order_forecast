@@ -249,12 +249,15 @@ class UsageAnalyticsTests(unittest.TestCase):
 
     def test_middleware_captures_route_template_code_and_request_id(self):
         app = FastAPI()
+        router = APIRouter()
 
-        @app.get("/api/orders/{order_id}")
+        @router.get("/orders/{order_id}")
         async def order_error(order_id: str, request: Request):
             _ = order_id
             request.state.usage_uid = "firebase-user-123"
             raise StructuredApiError(409, "Order already finalized", "ORDER_ALREADY_FINALIZED")
+
+        app.include_router(router, prefix="/api")
 
         setup_request_context(app, usage_analytics.logger)
         setup_usage_analytics(app, usage_analytics.logger)
