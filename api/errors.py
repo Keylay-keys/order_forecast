@@ -64,6 +64,7 @@ def install_api_error_handlers(
         request: Request,
         exc: StructuredApiError,
     ) -> JSONResponse:
+        request.state.api_error_code = exc.code
         request_id = get_request_id(request)
         app_logger.warning(
             "api_error request_id=%s method=%s path=%s status=%s code=%s",
@@ -85,6 +86,7 @@ def install_api_error_handlers(
         request: Request,
         exc: Exception,
     ) -> JSONResponse:
+        request.state.api_error_code = "INTERNAL_ERROR"
         request_id = get_request_id(request)
         app_logger.exception(
             "api_unhandled request_id=%s method=%s path=%s error_type=%s",

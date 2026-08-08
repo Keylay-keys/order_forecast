@@ -1124,6 +1124,21 @@ def _create_usage_analytics_tables(cur) -> None:
         )
     """)
 
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS api_usage_errors (
+            id BIGSERIAL PRIMARY KEY,
+            occurred_at TIMESTAMP WITH TIME ZONE NOT NULL,
+            route_number VARCHAR(20) NOT NULL CHECK (route_number ~ '^[0-9]{1,10}$'),
+            actor_role VARCHAR(20) NOT NULL CHECK (actor_role IN ('owner', 'team_member')),
+            feature_key VARCHAR(64) NOT NULL,
+            method VARCHAR(8) NOT NULL CHECK (method IN ('DELETE', 'GET', 'HEAD', 'PATCH', 'POST', 'PUT')),
+            endpoint VARCHAR(200) NOT NULL CHECK (endpoint LIKE '/api/%'),
+            status_code INTEGER NOT NULL CHECK (status_code BETWEEN 400 AND 599),
+            error_code VARCHAR(64) NOT NULL CHECK (error_code ~ '^[A-Z0-9_.:-]{1,64}$'),
+            request_id UUID NOT NULL UNIQUE
+        )
+    """)
+
     print("  ✓ Usage analytics tables created")
 
 
@@ -1204,6 +1219,8 @@ def _create_indexes(cur) -> None:
         # Product usage analytics indexes
         ("idx_api_usage_date_feature", "api_usage_daily", "activity_date, feature_key"),
         ("idx_api_usage_route_date", "api_usage_daily", "route_number, activity_date"),
+        ("idx_api_usage_errors_occurred", "api_usage_errors", "occurred_at DESC"),
+        ("idx_api_usage_errors_route_occurred", "api_usage_errors", "route_number, occurred_at DESC"),
     ]
     
     for name, table, columns in indexes:
@@ -1245,7 +1262,7 @@ def get_table_counts(conn: psycopg2.extensions.connection) -> dict:
         'forecast_finalize_events', 'forecast_generation_jobs',
         'archive_export_jobs', 'archive_export_attempts',
         'low_qty_notifications_sent',
-        'api_usage_daily'
+        'api_usage_daily', 'api_usage_errors'
     ]
     
     counts = {}

@@ -13,6 +13,7 @@ import re
 from threading import Lock, Thread
 import time
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
+from uuid import UUID
 
 from psycopg2.extras import RealDictCursor
 
@@ -21,6 +22,9 @@ logger = logging.getLogger("api.usage_analytics")
 
 _ROUTE_PATTERN = re.compile(r"^\d{1,10}$")
 _ROUTE_PATH_PATTERN = re.compile(r"/routes/(\d{1,10})(?:/|$)")
+_SAFE_ENDPOINT_PATTERN = re.compile(r"^/api/[A-Za-z0-9_./{}:-]{0,195}$")
+_SAFE_ERROR_CODE_PATTERN = re.compile(r"^[A-Z0-9_.:-]{1,64}$")
+_SAFE_METHODS = {"DELETE", "GET", "HEAD", "PATCH", "POST", "PUT"}
 _IDENTITY_CACHE_TTL_SECONDS = 600
 _REQUEST_QUEUE: Queue["ApiUsageRequest"] = Queue(maxsize=2000)
 _WORKER_LOCK = Lock()
@@ -64,6 +68,10 @@ class ApiUsageRequest:
     path: str
     status_code: int
     route_hint: str = ""
+    method: str = "GET"
+    endpoint: str = ""
+    error_code: str = ""
+    request_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -107,6 +115,34 @@ def extract_route_hint(path: str, query: Mapping[str, str]) -> str:
     return match.group(1) if match else ""
 
 
+def normalize_endpoint_path(path: str, route_template: str = "") -> str:
+    """Return a route template without retaining resource identifiers."""
+
+    candidate = str(route_template or "").strip()
+    if _SAFE_ENDPOINT_PATTERN.fullmatch(candidate):
+        return candidate
+
+    normalized = str(path or "").strip().rstrip("/") or "/"
+    for prefix, _feature_key in _FEATURE_PREFIXES:
+        if normalized == prefix.rstrip("/") or normalized.startswith(prefix):
+            return f"{prefix.rstrip('/')}/*"
+    return "/api/unmatched"
+
+
+def normalize_error_code(value: str, status_code: int) -> str:
+    candidate = str(value or "").strip().upper()
+    if _SAFE_ERROR_CODE_PATTERN.fullmatch(candidate):
+        return candidate
+    return f"HTTP_{int(status_code)}"
+
+
+def normalize_request_id(value: str) -> Optional[str]:
+    try:
+        return str(UUID(str(value or "").strip()))
+    except (TypeError, ValueError):
+        return None
+
+
 def record_api_request(
     conn,
     *,
@@ -115,9 +151,13 @@ def record_api_request(
     actor_role: str,
     feature_key: str,
     status_code: int,
+    method: str = "GET",
+    endpoint: str = "",
+    error_code: str = "",
+    request_id: str = "",
     now: Optional[datetime] = None,
 ) -> None:
-    """Increment one compact daily rollup row."""
+    """Increment a daily rollup and retain safe error metadata for 30 days."""
 
     observed_at = now or datetime.now(timezone.utc)
     error_count = 1 if status_code >= 400 else 0
@@ -155,6 +195,42 @@ def record_api_request(
                     observed_at,
                 ),
             )
+            normalized_request_id = normalize_request_id(request_id)
+            if status_code >= 400 and normalized_request_id:
+                normalized_method = str(method or "").strip().upper()
+                if normalized_method not in _SAFE_METHODS:
+                    normalized_method = "GET"
+                cur.execute(
+                    """
+                    INSERT INTO api_usage_errors (
+                        occurred_at,
+                        route_number,
+                        actor_role,
+                        feature_key,
+                        method,
+                        endpoint,
+                        status_code,
+                        error_code,
+                        request_id
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s::uuid)
+                    ON CONFLICT (request_id) DO NOTHING
+                    """,
+                    (
+                        observed_at,
+                        route_number,
+                        actor_role,
+                        feature_key,
+                        normalized_method,
+                        normalize_endpoint_path("", endpoint),
+                        status_code,
+                        normalize_error_code(error_code, status_code),
+                        normalized_request_id,
+                    ),
+                )
+                cur.execute(
+                    "DELETE FROM api_usage_errors WHERE occurred_at < %s - INTERVAL '30 days'",
+                    (observed_at,),
+                )
         conn.commit()
     except Exception:
         conn.rollback()
@@ -210,6 +286,10 @@ def _record_queued_request(item: ApiUsageRequest) -> None:
             actor_role=context.actor_role,
             feature_key=feature_key,
             status_code=item.status_code,
+            method=item.method,
+            endpoint=item.endpoint,
+            error_code=item.error_code,
+            request_id=item.request_id,
         )
     finally:
         if conn is not None:
@@ -398,6 +478,33 @@ def get_usage_summary(
         )
         route_features = _rows(cur)
 
+        error_params: List[Any] = [start_date, end_date]
+        error_route_clause = ""
+        if route_number:
+            error_route_clause = " AND route_number = %s"
+            error_params.append(route_number)
+        cur.execute(
+            f"""
+            SELECT
+                occurred_at AS "occurredAt",
+                route_number AS "routeNumber",
+                actor_role AS "actorRole",
+                feature_key AS "featureKey",
+                method,
+                endpoint,
+                status_code AS "statusCode",
+                error_code AS "errorCode",
+                request_id::TEXT AS "requestId"
+            FROM api_usage_errors
+            WHERE occurred_at >= %s::DATE
+              AND occurred_at < (%s::DATE + INTERVAL '1 day'){error_route_clause}
+            ORDER BY occurred_at DESC
+            LIMIT 201
+            """,
+            error_params,
+        )
+        recent_errors = _rows(cur)
+
     return {
         "range": {"days": days, "startDate": start_date.isoformat(), "endDate": end_date.isoformat()},
         "totals": {key: int(value or 0) for key, value in totals.items()},
@@ -409,4 +516,6 @@ def get_usage_summary(
         "trend": _serialize_rows(trend),
         "routeSummaries": _serialize_rows(route_summaries),
         "routeFeatures": _serialize_rows(route_features),
+        "recentErrors": _serialize_rows(recent_errors[:200]),
+        "errorsTruncated": len(recent_errors) > 200,
     }

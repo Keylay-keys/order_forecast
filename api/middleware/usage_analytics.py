@@ -6,7 +6,12 @@ import logging
 
 from fastapi import FastAPI, Request
 
-from ..usage_analytics import ApiUsageRequest, enqueue_api_request, extract_route_hint
+from ..usage_analytics import (
+    ApiUsageRequest,
+    enqueue_api_request,
+    extract_route_hint,
+    normalize_endpoint_path,
+)
 
 
 def setup_usage_analytics(app: FastAPI, app_logger: logging.Logger) -> None:
@@ -16,12 +21,18 @@ def setup_usage_analytics(app: FastAPI, app_logger: logging.Logger) -> None:
         try:
             uid = str(getattr(request.state, "usage_uid", "") or "").strip()
             if uid and request.method != "OPTIONS":
+                route = request.scope.get("route")
+                route_template = str(getattr(route, "path", "") or "")
                 enqueue_api_request(
                     ApiUsageRequest(
                         uid=uid,
                         path=request.url.path,
                         status_code=response.status_code,
                         route_hint=extract_route_hint(request.url.path, request.query_params),
+                        method=request.method,
+                        endpoint=normalize_endpoint_path(request.url.path, route_template),
+                        error_code=str(getattr(request.state, "api_error_code", "") or ""),
+                        request_id=str(getattr(request.state, "request_id", "") or ""),
                     )
                 )
         except Exception:

@@ -3,8 +3,13 @@ import unittest
 from datetime import datetime, timezone
 from unittest.mock import patch
 
+from fastapi import FastAPI, Request
+from fastapi.testclient import TestClient
+
 from order_forecast.api import usage_analytics
-from order_forecast.api.errors import StructuredApiError
+from order_forecast.api.errors import StructuredApiError, install_api_error_handlers
+from order_forecast.api.middleware.request_context import setup_request_context
+from order_forecast.api.middleware.usage_analytics import setup_usage_analytics
 from order_forecast.api.routers import usage
 
 
@@ -139,6 +144,27 @@ class UsageAnalyticsTests(unittest.TestCase):
         self.assertEqual(usage_analytics.extract_route_hint("/api/orders/123", {}), "")
         self.assertEqual(usage_analytics.extract_route_hint("/api/orders", {"route": "bad"}), "")
 
+    def test_normalizes_error_metadata_without_resource_identifiers(self):
+        self.assertEqual(
+            usage_analytics.normalize_endpoint_path(
+                "/api/orders/customer-order-123",
+                "/api/orders/{order_id}",
+            ),
+            "/api/orders/{order_id}",
+        )
+        self.assertEqual(
+            usage_analytics.normalize_endpoint_path("/api/orders/customer-order-123"),
+            "/api/orders/*",
+        )
+        self.assertEqual(
+            usage_analytics.normalize_error_code("core_items_required", 409),
+            "CORE_ITEMS_REQUIRED",
+        )
+        self.assertEqual(
+            usage_analytics.normalize_error_code("unsafe error text", 422),
+            "HTTP_422",
+        )
+
     def test_resolves_owner_and_team_member_from_server_data(self):
         db = _FirestoreDB(
             {
@@ -183,6 +209,65 @@ class UsageAnalyticsTests(unittest.TestCase):
         self.assertEqual(params[5], 1)
         self.assertEqual(params[6], 404)
 
+    def test_records_safe_error_event_and_prunes_old_events(self):
+        connection = _FakeConnection()
+        request_id = "77ee4c94-0265-43bc-9d66-288573534bb9"
+        usage_analytics.record_api_request(
+            connection,
+            actor_hash="a" * 64,
+            route_number="989262",
+            actor_role="team_member",
+            feature_key="orders",
+            status_code=409,
+            method="POST",
+            endpoint="/api/orders/{order_id}",
+            error_code="ORDER_ALREADY_FINALIZED",
+            request_id=request_id,
+            now=datetime(2026, 8, 6, 12, 0, tzinfo=timezone.utc),
+        )
+
+        self.assertEqual(connection.commits, 1)
+        self.assertEqual(len(connection.statements), 3)
+        event_sql, event_params = connection.statements[1]
+        self.assertIn("INSERT INTO api_usage_errors", event_sql)
+        self.assertEqual(event_params[1:8], (
+            "989262",
+            "team_member",
+            "orders",
+            "POST",
+            "/api/orders/{order_id}",
+            409,
+            "ORDER_ALREADY_FINALIZED",
+        ))
+        self.assertEqual(event_params[8], request_id)
+        self.assertNotIn("a" * 64, event_params)
+        self.assertIn("INTERVAL '30 days'", connection.statements[2][0])
+
+    def test_middleware_captures_route_template_code_and_request_id(self):
+        app = FastAPI()
+
+        @app.get("/api/orders/{order_id}")
+        async def order_error(order_id: str, request: Request):
+            _ = order_id
+            request.state.usage_uid = "firebase-user-123"
+            raise StructuredApiError(409, "Order already finalized", "ORDER_ALREADY_FINALIZED")
+
+        setup_request_context(app, usage_analytics.logger)
+        setup_usage_analytics(app, usage_analytics.logger)
+        install_api_error_handlers(app, debug_mode=False, app_logger=usage_analytics.logger)
+
+        with patch("order_forecast.api.middleware.usage_analytics.enqueue_api_request") as enqueue:
+            with TestClient(app, raise_server_exceptions=False) as client:
+                response = client.get("/api/orders/customer-order-123")
+
+        self.assertEqual(response.status_code, 409)
+        item = enqueue.call_args.args[0]
+        self.assertEqual(item.endpoint, "/api/orders/{order_id}")
+        self.assertEqual(item.error_code, "ORDER_ALREADY_FINALIZED")
+        self.assertEqual(item.method, "GET")
+        self.assertEqual(item.request_id, response.headers["x-request-id"])
+        self.assertNotIn("customer-order-123", item.endpoint)
+
     def test_summary_exposes_route_and_role_aggregates_without_actor_hashes(self):
         connection = _SummaryConnection(
             [
@@ -203,6 +288,17 @@ class UsageAnalyticsTests(unittest.TestCase):
                     "lastSeenAt": datetime(2026, 8, 6, 12, 0, tzinfo=timezone.utc),
                 }],
                 [{"routeNumber": "989262", "featureKey": "reference_catalog", "requestCount": 9, "uniqueUsers": 2}],
+                [{
+                    "occurredAt": datetime(2026, 8, 6, 12, 0, tzinfo=timezone.utc),
+                    "routeNumber": "989262",
+                    "actorRole": "owner",
+                    "featureKey": "reference_catalog",
+                    "method": "GET",
+                    "endpoint": "/api/catalog/starter/items/{sap}",
+                    "statusCode": 404,
+                    "errorCode": "HTTP_404",
+                    "requestId": "77ee4c94-0265-43bc-9d66-288573534bb9",
+                }],
             ]
         )
 
@@ -223,6 +319,9 @@ class UsageAnalyticsTests(unittest.TestCase):
         self.assertEqual(result["routeSummaries"][0]["firstSeenDate"], "2026-08-06")
         self.assertEqual(result["routeSummaries"][0]["lastSeenAt"], "2026-08-06T12:00:00+00:00")
         self.assertEqual(result["routeFeatures"][0]["routeNumber"], "989262")
+        self.assertEqual(result["recentErrors"][0]["endpoint"], "/api/catalog/starter/items/{sap}")
+        self.assertEqual(result["recentErrors"][0]["statusCode"], 404)
+        self.assertFalse(result["errorsTruncated"])
         self.assertNotIn("actor_hash", str(result))
         self.assertNotIn("firebase", str(result))
 
