@@ -9,7 +9,7 @@ from fastapi.testclient import TestClient
 from order_forecast.api import usage_analytics
 from order_forecast.api.errors import StructuredApiError, install_api_error_handlers
 from order_forecast.api.middleware.request_context import setup_request_context
-from order_forecast.api.middleware.usage_analytics import setup_usage_analytics
+from order_forecast.api.middleware.usage_analytics import _resolve_route_template, setup_usage_analytics
 from order_forecast.api.routers import usage
 
 
@@ -157,6 +157,10 @@ class UsageAnalyticsTests(unittest.TestCase):
             "/api/orders/*",
         )
         self.assertEqual(
+            usage_analytics.normalize_endpoint_path("", "/api/orders/*"),
+            "/api/orders/*",
+        )
+        self.assertEqual(
             usage_analytics.normalize_error_code("core_items_required", 409),
             "CORE_ITEMS_REQUIRED",
         )
@@ -267,6 +271,24 @@ class UsageAnalyticsTests(unittest.TestCase):
         self.assertEqual(item.method, "GET")
         self.assertEqual(item.request_id, response.headers["x-request-id"])
         self.assertNotIn("customer-order-123", item.endpoint)
+
+    def test_route_template_fallback_matches_without_scope_route(self):
+        app = FastAPI()
+
+        @app.get("/api/catalog/starter/items/{sap}")
+        async def catalog_item(sap: str):
+            return {"sap": sap}
+
+        scope = {
+            "type": "http",
+            "path": "/api/catalog/starter/items/DO_NOT_STORE_988200",
+            "root_path": "",
+            "method": "GET",
+        }
+        self.assertEqual(
+            _resolve_route_template(app, scope),
+            "/api/catalog/starter/items/{sap}",
+        )
 
     def test_summary_exposes_route_and_role_aggregates_without_actor_hashes(self):
         connection = _SummaryConnection(

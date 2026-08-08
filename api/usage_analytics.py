@@ -22,7 +22,7 @@ logger = logging.getLogger("api.usage_analytics")
 
 _ROUTE_PATTERN = re.compile(r"^\d{1,10}$")
 _ROUTE_PATH_PATTERN = re.compile(r"/routes/(\d{1,10})(?:/|$)")
-_SAFE_ENDPOINT_PATTERN = re.compile(r"^/api/[A-Za-z0-9_./{}:-]{0,195}$")
+_SAFE_ENDPOINT_PATTERN = re.compile(r"^/api/[A-Za-z0-9_./{}:*-]{0,195}$")
 _SAFE_ERROR_CODE_PATTERN = re.compile(r"^[A-Z0-9_.:-]{1,64}$")
 _SAFE_METHODS = {"DELETE", "GET", "HEAD", "PATCH", "POST", "PUT"}
 _IDENTITY_CACHE_TTL_SECONDS = 600
