@@ -42,3 +42,107 @@ class LowQtyNotificationReliabilityTests(unittest.TestCase):
             failure_count = daemon.check_and_notify(MagicMock())
 
         self.assertEqual(failure_count, 1)
+
+    def test_push_delivery_uses_receipts_and_identifies_dead_tokens(self):
+        stale_token = "ExponentPushToken[stale]"
+        live_token = "ExponentPushToken[live]"
+        response = MagicMock()
+        response.json.return_value = {
+            "data": [
+                {"status": "ok", "id": "ticket-stale"},
+                {"status": "ok", "id": "ticket-live"},
+            ]
+        }
+
+        with patch.object(daemon.requests, "post", return_value=response), patch.object(
+            daemon,
+            "_wait_for_push_receipts",
+            return_value={
+                "ticket-stale": {
+                    "status": "error",
+                    "details": {"error": "DeviceNotRegistered"},
+                },
+                "ticket-live": {"status": "ok"},
+            },
+        ):
+            result = daemon.send_push_notification(
+                [stale_token, live_token],
+                "Low Stock Alert",
+                "2 items need to be ordered today",
+                {"type": "low_quantity"},
+            )
+
+        self.assertTrue(result.successful)
+        self.assertEqual(result.delivered_count, 1)
+        self.assertEqual(result.failed_count, 1)
+        self.assertEqual(result.invalid_tokens, [stale_token])
+
+    def test_push_delivery_does_not_succeed_when_all_receipts_fail(self):
+        token = "ExponentPushToken[stale]"
+        response = MagicMock()
+        response.json.return_value = {
+            "data": [{"status": "ok", "id": "ticket-stale"}]
+        }
+
+        with patch.object(daemon.requests, "post", return_value=response), patch.object(
+            daemon,
+            "_wait_for_push_receipts",
+            return_value={
+                "ticket-stale": {
+                    "status": "error",
+                    "details": {
+                        "error": "DeveloperError",
+                        "apns": {"reason": "BadDeviceToken"},
+                    },
+                }
+            },
+        ):
+            result = daemon.send_push_notification(
+                [token],
+                "Low Stock Alert",
+                "1 item needs to be ordered today",
+                {"type": "low_quantity"},
+            )
+
+        self.assertFalse(result.successful)
+        self.assertEqual(result.invalid_tokens, [token])
+
+    def test_push_delivery_keeps_pending_ticket_deduplicated(self):
+        token = "ExponentPushToken[pending]"
+        response = MagicMock()
+        response.json.return_value = {
+            "data": [{"status": "ok", "id": "ticket-pending"}]
+        }
+
+        with patch.object(daemon.requests, "post", return_value=response), patch.object(
+            daemon,
+            "_wait_for_push_receipts",
+            return_value={},
+        ):
+            result = daemon.send_push_notification(
+                [token],
+                "Low Stock Alert",
+                "1 item needs to be ordered today",
+                {"type": "low_quantity"},
+            )
+
+        self.assertTrue(result.successful)
+        self.assertEqual(result.pending_count, 1)
+
+    def test_invalid_push_tokens_are_removed_with_array_transform(self):
+        db = MagicMock()
+
+        daemon.remove_invalid_push_tokens(
+            db,
+            "owner-1",
+            ["ExponentPushToken[stale]", "ExponentPushToken[stale]"],
+        )
+
+        update = db.collection.return_value.document.return_value.update
+        update.assert_called_once()
+        payload = update.call_args.args[0]
+        self.assertIn("fcmTokens", payload)
+        self.assertEqual(
+            payload["fcmTokens"]._values,
+            ["ExponentPushToken[stale]"],
+        )

@@ -16,8 +16,9 @@ import json
 import os
 import socket
 import time
+from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Tuple
 
 import pytz
 import requests
@@ -33,9 +34,12 @@ except ImportError:
 
 WORKER_ID = f"low-qty-notif-{socket.gethostname()}-{os.getpid()}"
 EXPO_PUSH_URL = "https://exp.host/--/api/v2/push/send"
+EXPO_RECEIPTS_URL = "https://exp.host/--/api/v2/push/getReceipts"
 LOW_QTY_NOTIFICATIONS_ENABLED = os.environ.get("LOW_QTY_NOTIFICATIONS_ENABLED", "true").lower() == "true"
 LOW_QTY_NOTIFICATION_DRY_RUN = os.environ.get("LOW_QTY_NOTIFICATION_DRY_RUN", "false").lower() == "true"
 CHECK_INTERVAL_SECONDS = int(os.environ.get("LOW_QTY_NOTIFICATION_CHECK_INTERVAL_SECONDS", "60"))
+EXPO_RECEIPT_POLL_SECONDS = int(os.environ.get("LOW_QTY_EXPO_RECEIPT_POLL_SECONDS", "5"))
+EXPO_RECEIPT_MAX_WAIT_SECONDS = int(os.environ.get("LOW_QTY_EXPO_RECEIPT_MAX_WAIT_SECONDS", "30"))
 DEFAULT_REMINDER_TOLERANCE_MINUTES = int(os.environ.get("LOW_QTY_NOTIFICATION_TOLERANCE_MINUTES", "2"))
 DEFAULT_ONCE_LATE_TOLERANCE_MINUTES = int(
     os.environ.get("LOW_QTY_NOTIFICATION_ONCE_LATE_TOLERANCE_MINUTES", "20")
@@ -323,7 +327,87 @@ def is_valid_expo_token(token: str) -> bool:
     return token.startswith("ExponentPushToken[") or token.startswith("ExpoPushToken[")
 
 
-def send_push_notification(fcm_tokens: List[str], title: str, body: str, data: Dict) -> bool:
+@dataclass
+class PushDeliveryResult:
+    delivered_count: int = 0
+    pending_count: int = 0
+    failed_count: int = 0
+    invalid_tokens: List[str] = field(default_factory=list)
+
+    @property
+    def successful(self) -> bool:
+        # A receipt can remain pending beyond this short-lived CronJob. Keep
+        # accepted pending tickets deduplicated to avoid duplicate pushes.
+        return self.delivered_count > 0 or self.pending_count > 0
+
+
+def _receipt_invalidates_token(receipt: Dict[str, Any]) -> bool:
+    details = receipt.get("details") or {}
+    if details.get("error") == "DeviceNotRegistered":
+        return True
+    apns = details.get("apns") or {}
+    return apns.get("reason") == "BadDeviceToken"
+
+
+def _fetch_push_receipts(ticket_tokens: List[Tuple[str, str]]) -> Dict[str, Dict[str, Any]]:
+    if not ticket_tokens:
+        return {}
+
+    ticket_ids = [ticket_id for ticket_id, _token in ticket_tokens]
+    response = requests.post(
+        EXPO_RECEIPTS_URL,
+        json={"ids": ticket_ids},
+        headers={"Content-Type": "application/json"},
+        timeout=10,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    receipts = payload.get("data")
+    return receipts if isinstance(receipts, dict) else {}
+
+
+def _wait_for_push_receipts(ticket_tokens: List[Tuple[str, str]]) -> Dict[str, Dict[str, Any]]:
+    if not ticket_tokens or EXPO_RECEIPT_MAX_WAIT_SECONDS <= 0:
+        return {}
+
+    receipts: Dict[str, Dict[str, Any]] = {}
+    waited = 0
+    while waited < EXPO_RECEIPT_MAX_WAIT_SECONDS:
+        sleep_seconds = min(
+            max(EXPO_RECEIPT_POLL_SECONDS, 1),
+            EXPO_RECEIPT_MAX_WAIT_SECONDS - waited,
+        )
+        time.sleep(sleep_seconds)
+        waited += sleep_seconds
+        try:
+            receipts.update(_fetch_push_receipts(ticket_tokens))
+        except Exception as error:
+            print(f"    [push] Receipt check failed: {error}")
+        if all(ticket_id in receipts for ticket_id, _token in ticket_tokens):
+            break
+    return receipts
+
+
+def remove_invalid_push_tokens(
+    db: firestore.Client,
+    user_id: str,
+    invalid_tokens: List[str],
+) -> None:
+    unique_tokens = list(dict.fromkeys(invalid_tokens))
+    if not unique_tokens:
+        return
+    db.collection("users").document(user_id).update({
+        "fcmTokens": firestore.ArrayRemove(unique_tokens),
+    })
+    print(f"    [push] Removed {len(unique_tokens)} invalid token(s)")
+
+
+def send_push_notification(
+    fcm_tokens: List[str],
+    title: str,
+    body: str,
+    data: Dict,
+) -> PushDeliveryResult:
     """Send push notification via Expo Push API.
     
     Args:
@@ -333,10 +417,11 @@ def send_push_notification(fcm_tokens: List[str], title: str, body: str, data: D
         data: Data payload for deep linking
     
     Returns:
-        True if at least one notification was sent successfully
+        Delivery result based on Expo receipts when available.
     """
+    delivery = PushDeliveryResult()
     if not fcm_tokens:
-        return False
+        return delivery
     
     messages = []
     for token in fcm_tokens:
@@ -352,12 +437,11 @@ def send_push_notification(fcm_tokens: List[str], title: str, body: str, data: D
         })
     
     if not messages:
-        return False
+        return delivery
     
     # Expo Push API limits batches to 100 messages
     BATCH_SIZE = 100
-    total_success = 0
-    total_error = 0
+    ticket_tokens: List[Tuple[str, str]] = []
     
     for i in range(0, len(messages), BATCH_SIZE):
         batch = messages[i:i + BATCH_SIZE]
@@ -368,25 +452,43 @@ def send_push_notification(fcm_tokens: List[str], title: str, body: str, data: D
                 headers={"Content-Type": "application/json"},
                 timeout=10,
             )
-            result = response.json()
-            
-            # Check for errors
-            if "data" in result:
-                success_count = sum(1 for r in result["data"] if r.get("status") == "ok")
-                error_count = len(result["data"]) - success_count
-                total_success += success_count
-                total_error += error_count
-            elif response.status_code == 200:
-                total_success += len(batch)
+            response.raise_for_status()
+            tickets = response.json().get("data") or []
+            for message, ticket in zip(batch, tickets):
+                token = message["to"]
+                if ticket.get("status") == "ok" and ticket.get("id"):
+                    ticket_tokens.append((ticket["id"], token))
+                    continue
+                delivery.failed_count += 1
+                if ticket.get("details", {}).get("error") == "DeviceNotRegistered":
+                    delivery.invalid_tokens.append(token)
+            if len(tickets) < len(batch):
+                delivery.failed_count += len(batch) - len(tickets)
                 
         except Exception as e:
             print(f"    [push] Batch error: {e}")
-            total_error += len(batch)
-    
-    if total_error > 0:
-        print(f"    [push] {total_success} sent, {total_error} failed")
-    
-    return total_success > 0
+            delivery.failed_count += len(batch)
+
+    receipts = _wait_for_push_receipts(ticket_tokens)
+    for ticket_id, token in ticket_tokens:
+        receipt = receipts.get(ticket_id)
+        if not receipt:
+            delivery.pending_count += 1
+        elif receipt.get("status") == "ok":
+            delivery.delivered_count += 1
+        else:
+            delivery.failed_count += 1
+            if _receipt_invalidates_token(receipt):
+                delivery.invalid_tokens.append(token)
+
+    delivery.invalid_tokens = list(dict.fromkeys(delivery.invalid_tokens))
+    print(
+        "    [push] "
+        f"{delivery.delivered_count} delivered, "
+        f"{delivery.pending_count} pending, "
+        f"{delivery.failed_count} failed"
+    )
+    return delivery
 
 
 def check_and_notify(
@@ -484,7 +586,11 @@ def check_and_notify(
                 )
                 continue
 
-            if send_push_notification(tokens, title, body, data):
+            delivery = send_push_notification(tokens, title, body, data)
+            if delivery.invalid_tokens:
+                remove_invalid_push_tokens(db, user_id, delivery.invalid_tokens)
+
+            if delivery.successful:
                 mark_as_sent(route_number, user_id, today, saps, saps_hash)
                 print(f"    ✅ Sent notification: {item_count} items")
             else:
