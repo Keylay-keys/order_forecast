@@ -23,7 +23,15 @@ def _resolve_route_template(app: FastAPI, scope) -> str:
     for candidate in app.routes:
         match, _child_scope = candidate.matches(scope)
         if match == Match.FULL:
-            return str(getattr(candidate, "path", "") or "")
+            candidate_path = str(getattr(candidate, "path", "") or "")
+            if candidate_path:
+                return candidate_path
+            effective_candidates = getattr(candidate, "effective_candidates", None)
+            if callable(effective_candidates):
+                for effective in effective_candidates():
+                    effective_match, _effective_scope = effective.matches(scope)
+                    if effective_match == Match.FULL:
+                        return str(getattr(effective, "path", "") or "")
     return ""
 
 

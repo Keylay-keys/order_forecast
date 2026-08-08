@@ -3,7 +3,7 @@ import unittest
 from datetime import datetime, timezone
 from unittest.mock import patch
 
-from fastapi import FastAPI, Request
+from fastapi import APIRouter, FastAPI, Request
 from fastapi.testclient import TestClient
 
 from order_forecast.api import usage_analytics
@@ -274,10 +274,13 @@ class UsageAnalyticsTests(unittest.TestCase):
 
     def test_route_template_fallback_matches_without_scope_route(self):
         app = FastAPI()
+        router = APIRouter()
 
-        @app.get("/api/catalog/starter/items/{sap}")
+        @router.get("/catalog/starter/items/{sap}")
         async def catalog_item(sap: str):
             return {"sap": sap}
+
+        app.include_router(router, prefix="/api")
 
         scope = {
             "type": "http",
