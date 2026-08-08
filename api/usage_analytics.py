@@ -366,7 +366,7 @@ def get_usage_summary(
                 COUNT(DISTINCT actor_hash) FILTER (WHERE actor_role = 'team_member')::INTEGER AS "teamMemberUsers",
                 COUNT(DISTINCT feature_key)::INTEGER AS "featureCount",
                 COUNT(DISTINCT activity_date)::INTEGER AS "activeDays",
-                MIN(first_seen_at) AS "firstSeenAt",
+                MIN(activity_date) AS "firstSeenDate",
                 MAX(last_seen_at) AS "lastSeenAt"
             FROM api_usage_daily
             WHERE activity_date BETWEEN %s AND %s{route_clause}
