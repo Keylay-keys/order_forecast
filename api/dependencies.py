@@ -51,6 +51,16 @@ DEBUG_MODE = os.environ.get("DEBUG", "false").lower() == "true"
 MAX_TOKEN_AGE_SECONDS = int(os.environ.get("MAX_TOKEN_AGE_SECONDS", 3600))  # Default 1 hour
 CLOCK_SKEW_SECONDS = int(os.environ.get("CLOCK_SKEW_SECONDS", 300))  # Default 5 min
 ENFORCE_ROUTE_ENTITLEMENTS = os.environ.get("ENFORCE_ROUTE_ENTITLEMENTS", "false").lower() == "true"
+APPLE_SANDBOX_BILLING_ALLOWED_UIDS = {
+    uid.strip()
+    for uid in os.environ.get("APPLE_SANDBOX_BILLING_ALLOWED_UIDS", "").split(",")
+    if uid.strip()
+}
+APPLE_SANDBOX_BILLING_ALLOWED_ROUTES = {
+    route.strip()
+    for route in os.environ.get("APPLE_SANDBOX_BILLING_ALLOWED_ROUTES", "").split(",")
+    if route.strip()
+}
 SKIP_TOKEN_AGE_CHECK = (
     DEBUG_MODE
     and os.environ.get("SKIP_TOKEN_AGE_CHECK", "").lower() in ("1", "true")
@@ -574,7 +584,13 @@ def _has_route_entitlement_feature(
     provider = str(data.get("provider") or data.get("source") or "").strip().lower()
     apple_environment = str(data.get("appleEnvironment") or "").strip().lower()
     if provider in ("apple", "app_store", "appstore", "ios") and apple_environment == "sandbox":
-        return False
+        owner_uid = str(data.get("ownerUid") or "").strip()
+        sandbox_allowed = (
+            route_number in APPLE_SANDBOX_BILLING_ALLOWED_ROUTES
+            or owner_uid in APPLE_SANDBOX_BILLING_ALLOWED_UIDS
+        )
+        if not sandbox_allowed:
+            return False
     features = data.get("features") if isinstance(data.get("features"), dict) else {}
     if feature_key in features:
         return bool(features.get(feature_key))

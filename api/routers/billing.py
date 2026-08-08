@@ -1083,7 +1083,14 @@ def _coerce_entitlement_from_route_doc(
     interval = _normalize_interval(doc_data.get("interval"))
     active = bool(doc_data.get("active"))
     provider = _normalize_provider(doc_data.get("provider")) or _normalize_provider(doc_data.get("source"))
-    if active and _is_apple_sandbox_document(doc_data):
+    if (
+        active
+        and _is_apple_sandbox_document(doc_data)
+        and not _is_apple_sandbox_billing_allowed(
+            owner_uid=str(doc_data.get("ownerUid") or "").strip(),
+            route_number=route_number,
+        )
+    ):
         active = False
     features = doc_data.get("features") if isinstance(doc_data.get("features"), dict) else {}
     if not features and plan:

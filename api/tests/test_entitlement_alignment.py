@@ -1,5 +1,6 @@
 import unittest
 from datetime import datetime, timedelta, timezone
+from unittest.mock import patch
 
 from order_forecast.api import dependencies
 
@@ -39,6 +40,58 @@ class _FakeDB:
 
 
 class EntitlementAlignmentTests(unittest.TestCase):
+    def test_allowlisted_apple_sandbox_route_can_use_entitled_feature(self):
+        db = _FakeDB(
+            {
+                "routeEntitlements": {
+                    "900000": {
+                        "active": True,
+                        "provider": "apple",
+                        "appleEnvironment": "Sandbox",
+                        "ownerUid": "apple-review-owner",
+                        "features": {"managementDashboard": True},
+                    }
+                }
+            }
+        )
+
+        with patch.object(dependencies, "APPLE_SANDBOX_BILLING_ALLOWED_ROUTES", {"900000"}):
+            self.assertTrue(
+                dependencies._has_route_entitlement_feature(
+                    db=db,
+                    route_number="900000",
+                    feature_key="managementDashboard",
+                )
+            )
+
+    def test_unlisted_apple_sandbox_route_remains_blocked(self):
+        db = _FakeDB(
+            {
+                "routeEntitlements": {
+                    "961767": {
+                        "active": True,
+                        "provider": "apple",
+                        "appleEnvironment": "Sandbox",
+                        "ownerUid": "sandbox-owner",
+                        "features": {"managementDashboard": True},
+                    }
+                }
+            }
+        )
+
+        with patch.object(dependencies, "APPLE_SANDBOX_BILLING_ALLOWED_ROUTES", {"900000"}), patch.object(
+            dependencies,
+            "APPLE_SANDBOX_BILLING_ALLOWED_UIDS",
+            set(),
+        ):
+            self.assertFalse(
+                dependencies._has_route_entitlement_feature(
+                    db=db,
+                    route_number="961767",
+                    feature_key="managementDashboard",
+                )
+            )
+
     def test_trial_feature_uses_current_route_fallback(self):
         owner_data = {
             "profile": {

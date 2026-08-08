@@ -282,6 +282,42 @@ class AppleSandboxEntitlementGuardTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.entitlement.provider, "apple")
         self.assertEqual(response.entitlement.resolvedFrom, "route_entitlements")
 
+    async def test_entitlement_read_allows_allowlisted_sandbox_route(self):
+        db = _FakeDB(
+            {
+                "routeEntitlements": {
+                    "900000": {
+                        "active": True,
+                        "provider": "apple",
+                        "appleEnvironment": "Sandbox",
+                        "ownerUid": "apple-review-owner",
+                        "plan": "solo",
+                        "interval": "monthly",
+                        "features": {"managementDashboard": True},
+                    }
+                },
+                "users": {},
+                "routes": {},
+                "routeNumbers": {},
+            }
+        )
+
+        with patch.object(billing, "APPLE_SANDBOX_BILLING_ALLOWED_ROUTES", {"900000"}), patch.object(
+            billing,
+            "require_route_access",
+            return_value={"profile": {"role": "owner", "routeNumber": "900000"}},
+        ):
+            response = await billing.get_billing_entitlement(
+                request=_build_request(),
+                route="900000",
+                decoded_token={"uid": "apple-review-owner"},
+                db=db,
+            )
+
+        self.assertTrue(response.ok)
+        self.assertTrue(response.entitlement.active)
+        self.assertTrue(response.entitlement.features["managementDashboard"])
+
 
 if __name__ == "__main__":
     unittest.main()
