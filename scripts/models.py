@@ -128,6 +128,7 @@ class ForecastPayload:
     items: List[ForecastItem] = field(default_factory=list)
     generation_mode: str = "model"
     generation_input_fingerprint: str = ""
+    generation_timings_ms: Dict[str, float] = field(default_factory=dict)
 
 
 @dataclass

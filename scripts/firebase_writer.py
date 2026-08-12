@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import time
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 
@@ -65,7 +66,7 @@ def _serialize_whole_case_adjustment(adj: object) -> Optional[dict]:
         return None
 
 
-def _archive_forecast_to_disk(route_number: str, forecast: ForecastPayload, payload: dict) -> None:
+def _archive_forecast_to_disk(route_number: str, forecast: ForecastPayload, payload: dict) -> bool:
     """Persist a copy of a forecast to local disk (server HDD).
 
     This is intentionally separate from Firestore. Cached forecasts in Firestore are TTL-based
@@ -73,7 +74,7 @@ def _archive_forecast_to_disk(route_number: str, forecast: ForecastPayload, payl
     """
     root = os.environ.get("ROUTESPARK_FORECAST_ARCHIVE_DIR")
     if not root:
-        return
+        return False
 
     # Layout: {root}/{route}/{deliveryDate}/{scheduleKey}/{forecastId}.json
     target_dir = os.path.join(
@@ -99,6 +100,11 @@ def _archive_forecast_to_disk(route_number: str, forecast: ForecastPayload, payl
             json.dump(archive_payload, f, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
             f.write("\n")
         os.replace(tmp_path, final_path)
+        with open(final_path, "r", encoding="utf-8") as handle:
+            verified = json.load(handle)
+        if verified.get("artifactFingerprint") != payload.get("artifactFingerprint"):
+            raise ValueError("forecast_archive_verification_failed")
+        return True
     finally:
         try:
             if os.path.exists(tmp_path):
@@ -783,18 +789,27 @@ def write_cached_forecast(
     route_number: str,
     forecast: ForecastPayload,
     ttl_days: int = 7,
-) -> None:
+) -> Dict[str, float]:
     """Validate, archive, then safely publish one ready schema-v2 forecast."""
     # Just use datetime - Firestore auto-converts to Timestamp
+    publisher_started = time.perf_counter()
     expires_at = forecast.generated_at + timedelta(days=ttl_days)
     
     cached_ref = db.collection("forecasts").document(route_number).collection("cached")
     published_at = datetime.utcnow()
+    validation_started = time.perf_counter()
     payload = _build_ready_forecast_payload(route_number, forecast, expires_at, published_at)
-    _archive_forecast_to_disk(route_number=route_number, forecast=forecast, payload=payload)
+    dense_validation_ms = round((time.perf_counter() - validation_started) * 1000, 3)
+    archive_started = time.perf_counter()
+    archive_written = _archive_forecast_to_disk(
+        route_number=route_number, forecast=forecast, payload=payload
+    )
+    archive_write_verification_ms = round((time.perf_counter() - archive_started) * 1000, 3)
 
     # Publish first. A failed set leaves the previous exact artifact available.
+    publication_started = time.perf_counter()
     cached_ref.document(forecast.forecast_id).set(payload)
+    firestore_publication_ms = round((time.perf_counter() - publication_started) * 1000, 3)
 
     existing = cached_ref.where(filter=FieldFilter("deliveryDate", "==", forecast.delivery_date))\
         .where(filter=FieldFilter("scheduleKey", "==", forecast.schedule_key))\
@@ -803,7 +818,27 @@ def write_cached_forecast(
     for old_doc in existing:
         if getattr(old_doc, "id", None) == forecast.forecast_id:
             continue
+        old_data = old_doc.to_dict() or {}
+        if old_data.get("schemaVersion") != 2:
+            continue
         old_doc.reference.delete()
         deleted_count += 1
     if deleted_count:
         print(f"[firebase_writer] Removed {deleted_count} superseded forecast(s) after safe publication")
+    timings = {
+        "denseValidationMs": dense_validation_ms,
+        "archiveWriteVerificationMs": archive_write_verification_ms,
+        "firestorePublicationMs": firestore_publication_ms,
+        "publisherTotalMs": round((time.perf_counter() - publisher_started) * 1000, 3),
+    }
+    print(json.dumps({
+        "event": "forecast_publisher_timing",
+        "routeNumber": str(route_number),
+        "deliveryDate": forecast.delivery_date,
+        "scheduleKey": forecast.schedule_key,
+        "generationMode": forecast.generation_mode,
+        "forecastId": forecast.forecast_id,
+        "archiveEnabled": archive_written,
+        "timings": timings,
+    }, sort_keys=True), flush=True)
+    return timings

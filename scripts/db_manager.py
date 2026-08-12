@@ -193,6 +193,15 @@ def handle_sync_order(conn: duckdb.DuckDBPyConnection, db: firestore.Client, pay
             return {'error': f'Order {order_id} not found'}
         
         data = order_doc.to_dict()
+        attached_context = data.get('forecastContext') if isinstance(data, dict) else None
+        if isinstance(attached_context, dict) and attached_context.get('schemaVersion') == 2:
+            # PostgreSQL owns schema-v2 correction projection. The legacy sparse
+            # DuckDB path cannot safely infer zero omissions from the snapshot.
+            return {
+                'error': 'forecast_context_v2_requires_postgres_sync',
+                'retiredCorrectionPath': True,
+                'orderId': order_id,
+            }
         now = datetime.now(timezone.utc)
         
         delivery_date = data.get('expectedDeliveryDate', '')

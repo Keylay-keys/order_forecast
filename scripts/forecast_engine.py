@@ -6,8 +6,10 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Iterable, List, Optional, Dict, Tuple
+import json
 import os
 import sys
+import time
 import uuid
 
 import pandas as pd
@@ -189,7 +191,7 @@ try:
         load_promotions,
     )
     from .firebase_writer import write_cached_forecast, write_forecast_transfer_suggestions
-    from .forecast_contract import generation_input_fingerprint
+    from .forecast_contract import generation_input_fingerprint, load_authority_generation_state
     from .schedule_utils import (
         normalize_delivery_date,
         weekday_key,
@@ -215,7 +217,7 @@ except ImportError:
         load_promotions,
     )
     from firebase_writer import write_cached_forecast, write_forecast_transfer_suggestions
-    from forecast_contract import generation_input_fingerprint
+    from forecast_contract import generation_input_fingerprint, load_authority_generation_state
     from schedule_utils import (
         normalize_delivery_date,
         weekday_key,
@@ -1449,6 +1451,28 @@ def _generation_input_fingerprint(
     )
 
 
+def _validate_dense_items_against_authority(
+    db,
+    route_number: str,
+    delivery_date: str,
+    schedule_key: str,
+    dense_items: List[ForecastItem],
+) -> str:
+    """Fail closed if generator inputs drifted from Firebase before publication."""
+    active_keys, revision = load_authority_generation_state(
+        db, route_number, delivery_date, schedule_key
+    )
+    emitted_keys = {(str(item.store_id), str(item.sap)) for item in dense_items}
+    if emitted_keys != active_keys:
+        missing = sorted(active_keys - emitted_keys)
+        extra = sorted(emitted_keys - active_keys)
+        raise ValueError(
+            "active_carry_changed_during_generation:"
+            f"missing={missing[:10]}:extra={extra[:10]}"
+        )
+    return revision
+
+
 def _filter_orders_by_schedule(orders, schedule_key: str):
     return [o for o in orders if o.schedule_key == schedule_key]
 
@@ -2610,6 +2634,8 @@ def _get_stores_for_order_cycle(stores_cfg: List[StoreConfig], order_cycles: Lis
 
 
 def generate_forecast(config: ForecastConfig) -> ForecastPayload:
+    generation_started = time.perf_counter()
+    configuration_started = generation_started
     db = get_firestore_client(config.service_account)
     use_postgres = os.environ.get("FORECAST_USE_POSTGRES", "1").lower() in ("1", "true", "yes")
     
@@ -2854,8 +2880,12 @@ def generate_forecast(config: ForecastConfig) -> ForecastPayload:
     schedule_orders = _filter_orders_by_schedule(all_orders, schedule_key)
     schedule_order_count = len(schedule_orders)
     last_order_for_schedule = _select_last_order_for_schedule(all_orders, schedule_key) if all_orders else None
+    configuration_projection_load_ms = round(
+        (time.perf_counter() - configuration_started) * 1000, 3
+    )
     if fallback_enabled and mode_decision.mode == "copy_last_order" and all_orders:
         if last_order_for_schedule:
+            fallback_started = time.perf_counter()
             fallback_items = _build_items_from_last_order(
                 last_order=last_order_for_schedule,
                 stores_cfg=stores_cfg,
@@ -2864,9 +2894,21 @@ def generate_forecast(config: ForecastConfig) -> ForecastPayload:
                 active_promos=active_promos,
             )
             if fallback_items:
+                model_or_fallback_generation_ms = round(
+                    (time.perf_counter() - fallback_started) * 1000, 3
+                )
+                dense_started = time.perf_counter()
                 fallback_items = _complete_dense_active_carry(
                     fallback_items, stores_cfg, products, valid_store_ids
                 )
+                generation_revision = _validate_dense_items_against_authority(
+                    db,
+                    config.route_number,
+                    delivery_iso,
+                    schedule_key,
+                    fallback_items,
+                )
+                dense_completion_ms = round((time.perf_counter() - dense_started) * 1000, 3)
                 print(
                     f"[forecast] Fallback to last order (schedule={schedule_key}) "
                     f"mode={mode_decision.mode} reason={mode_decision.reason} "
@@ -2882,21 +2924,34 @@ def generate_forecast(config: ForecastConfig) -> ForecastPayload:
                     generated_at=datetime.utcnow(),
                     items=fallback_items,
                     generation_mode="last_order",
-                    generation_input_fingerprint=_generation_input_fingerprint(
-                        config.route_number,
-                        delivery_iso,
-                        schedule_key,
-                        fallback_items,
-                        products,
-                    ),
+                    generation_input_fingerprint=generation_revision,
                 )
                 # Write to Firebase cache (same as ML path)
-                write_cached_forecast(
+                publisher_timings = write_cached_forecast(
                     db=db,
                     route_number=config.route_number,
                     forecast=fallback_forecast,
                     ttl_days=config.ttl_days,
                 )
+                timings = {
+                    "configurationProjectionLoadMs": configuration_projection_load_ms,
+                    "modelOrFallbackGenerationMs": model_or_fallback_generation_ms,
+                    "denseCompletionMs": dense_completion_ms,
+                    **publisher_timings,
+                    "totalGenerationToReadyMs": round(
+                        (time.perf_counter() - generation_started) * 1000, 3
+                    ),
+                }
+                fallback_forecast.generation_timings_ms = timings
+                print(json.dumps({
+                    "event": "forecast_generation_timing",
+                    "routeNumber": config.route_number,
+                    "deliveryDate": delivery_iso,
+                    "scheduleKey": schedule_key,
+                    "generationMode": "last_order",
+                    "forecastId": fallback_forecast.forecast_id,
+                    "timings": timings,
+                }, sort_keys=True), flush=True)
                 try:
                     write_forecast_transfer_suggestions(
                         db=db,
@@ -2913,6 +2968,8 @@ def generate_forecast(config: ForecastConfig) -> ForecastPayload:
             f"insufficient_history: Only {len(orders)} orders found, "
             f"need at least {MIN_ORDERS_FOR_FORECAST} for forecasting"
         )
+
+    model_generation_started = time.perf_counter()
     last_order_qty_map = _build_last_order_quantity_map(last_order_for_schedule)
 
     # Load promo history (last promo quantities per store+SAP)
@@ -3789,7 +3846,19 @@ def generate_forecast(config: ForecastConfig) -> ForecastPayload:
     except Exception:
         pass
 
+    model_or_fallback_generation_ms = round(
+        (time.perf_counter() - model_generation_started) * 1000, 3
+    )
+    dense_started = time.perf_counter()
     items = _complete_dense_active_carry(items, stores_cfg, products, valid_store_ids)
+    generation_revision = _validate_dense_items_against_authority(
+        db,
+        config.route_number,
+        delivery_iso,
+        schedule_key,
+        items,
+    )
+    dense_completion_ms = round((time.perf_counter() - dense_started) * 1000, 3)
     forecast = ForecastPayload(
         forecast_id=str(uuid.uuid4()),
         route_number=config.route_number,
@@ -3798,22 +3867,35 @@ def generate_forecast(config: ForecastConfig) -> ForecastPayload:
         generated_at=datetime.utcnow(),
         items=items,
         generation_mode="model",
-        generation_input_fingerprint=_generation_input_fingerprint(
-            config.route_number,
-            delivery_iso,
-            schedule_key,
-            items,
-            products,
-        ),
+        generation_input_fingerprint=generation_revision,
     )
 
     # Write to Firestore cache
-    write_cached_forecast(
+    publisher_timings = write_cached_forecast(
         db=db,
         route_number=config.route_number,
         forecast=forecast,
         ttl_days=config.ttl_days,
     )
+    timings = {
+        "configurationProjectionLoadMs": configuration_projection_load_ms,
+        "modelOrFallbackGenerationMs": model_or_fallback_generation_ms,
+        "denseCompletionMs": dense_completion_ms,
+        **publisher_timings,
+        "totalGenerationToReadyMs": round(
+            (time.perf_counter() - generation_started) * 1000, 3
+        ),
+    }
+    forecast.generation_timings_ms = timings
+    print(json.dumps({
+        "event": "forecast_generation_timing",
+        "routeNumber": config.route_number,
+        "deliveryDate": delivery_iso,
+        "scheduleKey": schedule_key,
+        "generationMode": "model",
+        "forecastId": forecast.forecast_id,
+        "timings": timings,
+    }, sort_keys=True), flush=True)
     try:
         write_forecast_transfer_suggestions(
             db=db,
