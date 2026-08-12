@@ -667,6 +667,13 @@ class CatalogReferenceContractTests(unittest.TestCase):
             self.assertEqual(safe, image.resolve())
             self.assertIsNone(escape)
 
+    def test_reference_image_root_honors_deployment_configuration(self):
+        with TemporaryDirectory() as tmp, patch.dict(
+            reference.os.environ,
+            {"REFERENCE_CATALOG_IMAGE_ROOT": tmp},
+        ):
+            self.assertEqual(reference._image_root(), Path(tmp))
+
 
 class ReferenceCatalogAvailabilityTests(unittest.IsolatedAsyncioTestCase):
     def _demo_db(self):
