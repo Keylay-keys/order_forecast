@@ -38,9 +38,15 @@ class ForecastStatusTests(unittest.IsolatedAsyncioTestCase):
                 "lastUpdated": now,
             },
             cached=[{
+                "schemaVersion": 2,
+                "state": "ready",
+                "generationMode": "last_order",
                 "generatedAt": now,
                 "expiresAt": now + timedelta(days=2),
-                "items": [{"source": "last_order"}],
+                "items": [
+                    {"source": "last_order"},
+                    {"source": "suppressed_zero"},
+                ],
             }],
         )
 

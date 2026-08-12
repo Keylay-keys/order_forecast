@@ -273,6 +273,7 @@ class Order(BaseModel):
     coreItemOverrides: Optional[List[CoreItemOverride]] = None
     # User-defined SAP row order for the portal editor and finalized printouts.
     sapOrder: Optional[List[str]] = None
+    forecastContext: Optional[Dict[str, Any]] = None
 
     # Transfer metadata (route splitting)
     routeTransfers: Optional[List[RouteTransferAllocation]] = None
@@ -407,6 +408,42 @@ class ForecastPayload(BaseModel):
     scheduleKey: str
     generatedAt: datetime
     items: List[ForecastItem]
+
+
+class OrderForecastSnapshotItem(BaseModel):
+    storeId: str
+    sap: str
+    recommendedUnits: int = Field(..., ge=0)
+    source: str
+    promoActive: Optional[bool] = None
+
+
+class OrderForecastContext(BaseModel):
+    schemaVersion: Literal[2]
+    forecastId: str
+    generationMode: Literal['model', 'last_order']
+    forecastDeliveryDate: str
+    orderDeliveryDate: str
+    scheduleKey: str
+    generatedAt: str
+    attachedAt: datetime
+    activeCarryItemCount: int = Field(..., ge=0)
+    eligibleItemCount: int = Field(..., ge=0)
+    artifactFingerprint: str
+    generationInputFingerprint: str
+    activeCarryFingerprint: str
+    eligibilityFingerprint: str
+    items: List[OrderForecastSnapshotItem]
+
+
+class AttachForecastResponse(BaseModel):
+    orderId: str
+    forecastId: str
+    forecastItemCount: int
+    forecastContext: OrderForecastContext
+    updatedAt: datetime
+    attachedAt: datetime
+    idempotent: bool
 
 
 class ForecastResponse(BaseModel):

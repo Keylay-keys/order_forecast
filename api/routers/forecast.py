@@ -1,4 +1,4 @@
-"""Forecast router - retrieve and apply forecasts."""
+"""Forecast router - retrieve and attach forecasts."""
 
 from __future__ import annotations
 
@@ -26,7 +26,12 @@ from ..models import (
     ForecastPayload,
     ForecastItem,
     ErrorResponse,
-    ApplyForecastRequest,
+    AttachForecastResponse,
+)
+from forecast_contract import (
+    ForecastContractError,
+    build_order_snapshot,
+    validate_ready_artifact,
 )
 
 
@@ -289,6 +294,8 @@ def _get_cached_forecast_readiness(
 
     for snapshot in docs:
         data = snapshot.to_dict() or {}
+        if data.get("schemaVersion") != 2 or data.get("state") != "ready":
+            continue
         expires_at = _to_naive_utc(data.get("expiresAt"))
         if expires_at and now and expires_at <= now:
             continue
@@ -302,12 +309,9 @@ def _get_cached_forecast_readiness(
         reverse=True,
     )
     latest = available[0]
-    item_sources = {
-        str(item.get("source") or "").lower()
-        for item in (latest.get("items") or [])
-        if isinstance(item, dict)
-    }
-    mode = "last_order" if item_sources and item_sources == {"last_order"} else "model"
+    mode = latest.get("generationMode")
+    if mode not in {"last_order", "model"}:
+        return {"forecastAvailable": False, "forecastMode": None}
     return {"forecastAvailable": True, "forecastMode": mode}
 
 
@@ -499,7 +503,8 @@ async def get_forecast_status(
 
 
 @router.post(
-    "/forecast/apply/{order_id}",
+    "/forecast/attach/{order_id}",
+    response_model=AttachForecastResponse,
     responses={
         400: {"model": ErrorResponse},
         401: {"model": ErrorResponse},
@@ -508,15 +513,14 @@ async def get_forecast_status(
     },
 )
 @rate_limit_write
-async def apply_forecast(
+async def attach_forecast(
     request: Request,
     order_id: str,
-    payload: ApplyForecastRequest,
     route: str = Query(..., pattern=r"^\d{1,10}$", description="Route number"),
     decoded_token: dict = Depends(verify_firebase_token),
     db: firestore.Client = Depends(get_firestore),
-) -> Dict[str, Any]:
-    """Apply forecast items to a draft order."""
+) -> AttachForecastResponse:
+    """Attach an exact, validated schema-v2 snapshot without editing stores."""
     await require_route_feature_access(route, "forecasting", decoded_token, db)
 
     order_ref = db.collection("routes").document(route).collection("orders").document(order_id)
@@ -530,130 +534,114 @@ async def apply_forecast(
     if order_data.get("status") != "draft":
         raise HTTPException(400, "Order is not editable")
 
-    forecast_id = payload.forecastId
-    items: List[Dict[str, Any]] = [item.model_dump() for item in payload.items]
+    delivery_date = str(order_data.get("expectedDeliveryDate") or "")
+    schedule_key = str(order_data.get("scheduleKey") or "").lower()
+    if not delivery_date or not schedule_key:
+        raise HTTPException(400, "Order target is incomplete")
 
-    stores = order_data.get("stores") or []
-    stores_updated = set()
-    items_applied = 0
-    items_preserved = 0
-    now = datetime.utcnow()
+    cached_ref = db.collection("forecasts").document(route).collection("cached")
+    candidates = list(
+        cached_ref.where("deliveryDate", "==", delivery_date)
+        .where("scheduleKey", "==", schedule_key)
+        .where("schemaVersion", "==", 2)
+        .where("state", "==", "ready")
+        .order_by("publishedAt", direction=firestore.Query.DESCENDING)
+        .limit(5)
+        .stream()
+    )
+    now = datetime.now(timezone.utc)
+    artifact = next((doc.to_dict() or {} for doc in candidates if (
+        not _to_naive_utc((doc.to_dict() or {}).get("expiresAt"))
+        or _to_naive_utc((doc.to_dict() or {}).get("expiresAt")) > _to_naive_utc(now)
+    )), None)
+    if artifact is None:
+        raise HTTPException(409, "Exact forecast unavailable; try again shortly")
 
-    for item in items:
-        has_prior = bool(item.get("priorOrderContext"))
-        if item.get("recommendedUnits", 0) <= 0 and not has_prior:
-            continue
-        store_id = item.get("storeId")
-        sap = item.get("sap")
-        if not store_id or not sap:
-            continue
-
-        store_order = next((s for s in stores if s.get("storeId") == store_id), None)
-        if not store_order:
-            store_order = {
-                "storeId": store_id,
-                "storeName": item.get("storeName") or f"Store-{store_id[-6:]}",
-                "items": [],
-            }
-            stores.append(store_order)
-        elif not store_order.get("storeName") and item.get("storeName"):
-            store_order["storeName"] = item.get("storeName")
-
-        existing_index = next((i for i, it in enumerate(store_order["items"]) if it.get("sap") == sap), -1)
-        forecast_units = item.get("recommendedUnits", 0)
-        forecast_cases = item.get("recommendedCases")
-        item_data = {
-            "sap": sap,
-            "quantity": forecast_units,
-            "enteredAt": now,
-            "forecastRecommendedUnits": forecast_units,
-            "forecastRecommendedCases": forecast_cases,
-            "forecastSuggestedUnits": forecast_units,  # legacy
-            "forecastSuggestedCases": forecast_cases,  # legacy
-            "userAdjusted": False,
-            "userDelta": 0,
-            "forecastId": forecast_id,
+    try:
+        artifact_items = validate_ready_artifact(
+            artifact,
+            route_number=route,
+            delivery_date=delivery_date,
+            schedule_key=schedule_key,
+        )
+        active_keys = {(row["storeId"], row["sap"]) for row in artifact_items}
+        order_keys = {
+            (str(store.get("storeId") or ""), str(item.get("sap") or ""))
+            for store in (order_data.get("stores") or [])
+            for item in (store.get("items") or [])
+            if store.get("storeId") and item.get("sap")
         }
+        snapshot_items, eligibility_fingerprint = build_order_snapshot(
+            artifact_items, active_keys, order_keys
+        )
+    except ForecastContractError as exc:
+        raise HTTPException(409, f"Forecast incomplete; try again ({exc})") from exc
 
-        for key in (
-            "promoActive",
-            "promoLiftPct",
-            "isFirstWeekend",
-            "p10Units",
-            "p50Units",
-            "p90Units",
-            "confidence",
-            "source",
-            "priorOrderContext",
-            "expiryReplacement",
-        ):
-            if key in item:
-                item_data[key] = item.get(key)
+    existing = order_data.get("forecastContext") or {}
+    if existing and existing.get("forecastId") != artifact.get("forecastId"):
+        raise HTTPException(409, "A different forecast is already attached")
 
-        if existing_index >= 0:
-            existing_item = store_order["items"][existing_index] or {}
-            existing_quantity = existing_item.get("quantity", 0)
-            merged_item = {
-                **existing_item,
-                "sap": sap,
-                "quantity": existing_quantity,
-                "forecastRecommendedUnits": forecast_units,
-                "forecastRecommendedCases": forecast_cases,
-                "forecastSuggestedUnits": forecast_units,  # legacy
-                "forecastSuggestedCases": forecast_cases,  # legacy
-                "forecastId": forecast_id,
-                "userAdjusted": existing_quantity != forecast_units,
-                "userDelta": existing_quantity - forecast_units,
-                "preexistingBeforeForecast": True,
-            }
-            for key in (
-                "promoActive",
-                "promoLiftPct",
-                "isFirstWeekend",
-                "p10Units",
-                "p50Units",
-                "p90Units",
-                "confidence",
-                "source",
-                "priorOrderContext",
-                "expiryReplacement",
-            ):
-                if key in item:
-                    merged_item[key] = item.get(key)
-            store_order["items"][existing_index] = merged_item
-            items_preserved += 1
-        else:
-            store_order["items"].append(item_data)
-            items_applied += 1
-
-        stores_updated.add(store_id)
-
-    order_ref.update({
-        "stores": stores,
-        "updatedAt": now,
-    })
+    attached_at = now
+    context = {
+        "schemaVersion": 2,
+        "forecastId": artifact["forecastId"],
+        "generationMode": artifact["generationMode"],
+        "forecastDeliveryDate": artifact["deliveryDate"],
+        "orderDeliveryDate": delivery_date,
+        "scheduleKey": schedule_key,
+        "generatedAt": _to_naive_utc(artifact.get("generatedAt")).replace(tzinfo=timezone.utc).isoformat(),
+        "attachedAt": attached_at,
+        "activeCarryItemCount": len(active_keys),
+        "eligibleItemCount": len(snapshot_items),
+        "artifactFingerprint": artifact["artifactFingerprint"],
+        "generationInputFingerprint": artifact["generationInputFingerprint"],
+        "activeCarryFingerprint": artifact["eligibility"]["activeCarryFingerprint"],
+        "eligibilityFingerprint": eligibility_fingerprint,
+        "items": snapshot_items,
+    }
+    idempotent = bool(existing)
+    if not idempotent:
+        # Field-scoped Admin write: never read/merge/write stores here.
+        order_ref.update({"forecastContext": context, "updatedAt": attached_at})
 
     _log_order_audit(
         db,
         order_id,
         route_number,
         decoded_token["uid"],
-        "forecast_applied",
+        "forecast_attached",
         {
-            "forecastId": forecast_id,
-            "itemsApplied": items_applied,
-            "itemsPreserved": items_preserved,
-            "storesUpdated": len(stores_updated),
+            "forecastId": artifact["forecastId"],
+            "schemaVersion": 2,
+            "generationMode": artifact["generationMode"],
+            "forecastItemCount": len(snapshot_items),
+            "artifactFingerprint": artifact["artifactFingerprint"],
+            "eligibilityFingerprint": eligibility_fingerprint,
         },
     )
 
-    return {
+    return AttachForecastResponse(**{
         "orderId": order_id,
-        "forecastId": forecast_id,
-        "itemsApplied": items_applied,
-        "itemsPreserved": items_preserved,
-        "storesUpdated": len(stores_updated),
-    }
+        "forecastId": artifact["forecastId"],
+        "forecastItemCount": len(snapshot_items),
+        "forecastContext": existing or context,
+        "updatedAt": (existing or context).get("attachedAt", attached_at),
+        "attachedAt": (existing or context).get("attachedAt", attached_at),
+        "idempotent": idempotent,
+    })
+
+
+@router.post("/forecast/apply/{order_id}", status_code=410)
+async def retired_apply_forecast(
+    request: Request,
+    order_id: str,
+    route: str = Query(..., pattern=r"^\d{1,10}$"),
+    decoded_token: dict = Depends(verify_firebase_token),
+    db: firestore.Client = Depends(get_firestore),
+) -> None:
+    """Prevent legacy clients from prefilling quantities during the cutover."""
+    await require_route_feature_access(route, "forecasting", decoded_token, db)
+    raise HTTPException(410, "Forecast prefill retired; update the app to show forecast references")
 
 
 @router.get(
