@@ -119,6 +119,31 @@ class ForecastGenerationFreshnessV2Test(unittest.TestCase):
         )
         retry.assert_not_called()
 
+    def test_worker_terminally_records_insufficient_history_without_retry(self):
+        job = {
+            "job_key": "988200::tuesday::2026-08-17",
+            "route_number": "988200",
+            "schedule_key": "tuesday",
+            "delivery_date": "2026-08-17",
+            "job_type": queue.JOB_TYPE_FORECAST_ONLY,
+            "desired_revision": "revision-1",
+        }
+        error = "insufficient_history: Only 1 orders found, need at least 4 for forecasting"
+        with patch.object(
+            queue, "_evaluate_job_freshness", return_value=(False, "missing")
+        ), patch.object(
+            queue, "generate_forecast", side_effect=ValueError(error)
+        ), patch.object(queue, "_finish_job") as finish, patch.object(
+            queue, "_retry_or_fail_job"
+        ) as retry:
+            result = queue._process_claimed_job(
+                object(), "/tmp/service-account.json", job
+            )
+
+        self.assertEqual(result, "terminal_error")
+        finish.assert_called_once_with(job["job_key"], "error", error_text=error)
+        retry.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

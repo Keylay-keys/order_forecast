@@ -37,6 +37,7 @@ from forecast_contract import (
     validate_ready_artifact,
 )
 from forecast_reference_rollout import forecast_reference_enabled_for_route
+from forecast_generation_queue import get_generation_job_status
 
 
 router = APIRouter()
@@ -342,6 +343,38 @@ def _get_cached_forecast_readiness(
     return {"forecastAvailable": True, "forecastMode": mode}
 
 
+def _get_exact_preparation_state(
+    route_number: str,
+    schedule_key: Optional[str],
+    delivery_date: Optional[str],
+    forecast_available: bool,
+) -> Dict[str, Optional[str]]:
+    """Translate the durable exact-target job into a stable public status."""
+    if forecast_available or not schedule_key or not delivery_date:
+        return {"status": None, "failureReason": None}
+    try:
+        job = get_generation_job_status(route_number, schedule_key, delivery_date)
+    except Exception:
+        # Readiness remains usable if the queue database is temporarily down.
+        return {"status": None, "failureReason": None}
+    if not job:
+        return {"status": None, "failureReason": None}
+
+    raw_status = str(job.get("status") or "").lower()
+    last_error = str(job.get("last_error") or "").strip().lower()
+    # Older workers may have left a deterministic failure queued for retry.
+    # Surface it immediately instead of making the client wait for max attempts.
+    if last_error.startswith("insufficient_history:"):
+        return {"status": "failed", "failureReason": "insufficient_history"}
+    if raw_status == "error":
+        return {"status": "failed", "failureReason": "generation_failed"}
+    if raw_status == "running":
+        return {"status": "running", "failureReason": None}
+    if raw_status == "queued":
+        return {"status": "queued", "failureReason": None}
+    return {"status": None, "failureReason": None}
+
+
 def _get_last_finalized_at(route_number: str, schedule_key: Optional[str]) -> Optional[datetime]:
     """Get the last finalized order timestamp using direct PostgreSQL.
     
@@ -535,6 +568,9 @@ async def get_forecast_status(
         if forecast_reference_enabled_for_route(route)
         else {"forecastAvailable": False, "forecastMode": None}
     )
+    preparation = _get_exact_preparation_state(
+        route, scheduleKey, deliveryDate, cached_status["forecastAvailable"]
+    )
 
     return ForecastStatusResponse(
         orderCount=status_data.get("orderCount"),
@@ -542,6 +578,8 @@ async def get_forecast_status(
         hasTrainedModel=status_data.get("hasTrainedModel", False),
         forecastAvailable=cached_status["forecastAvailable"],
         forecastMode=cached_status["forecastMode"],
+        preparationStatus=preparation["status"],
+        preparationFailureReason=preparation["failureReason"],
         lastUpdated=status_data.get("lastUpdated"),
         lastFinalizedAt=last_finalized,
     )
@@ -599,6 +637,11 @@ async def attach_forecast(
         active_keys, current_input_fingerprint = None, None
     if authority_error and authority_error.startswith("schedule_not_active:"):
         raise HTTPException(409, "order_schedule_no_longer_active; recreate the draft")
+    if active_keys is not None and not active_keys:
+        raise HTTPException(
+            409,
+            "forecast_no_eligible_items; no stores with active items are assigned to this cycle's delivery day",
+        )
 
     cached_ref = db.collection("forecasts").document(route).collection("cached")
     candidates = list(

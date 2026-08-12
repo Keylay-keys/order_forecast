@@ -471,6 +471,10 @@ class ForecastStatusResponse(BaseModel):
     hasTrainedModel: bool = False
     forecastAvailable: bool = False
     forecastMode: Optional[Literal['last_order', 'model']] = None
+    preparationStatus: Optional[Literal['queued', 'running', 'failed']] = None
+    preparationFailureReason: Optional[
+        Literal['insufficient_history', 'generation_failed']
+    ] = None
     lastUpdated: Optional[datetime] = None
     lastFinalizedAt: Optional[datetime] = None
 

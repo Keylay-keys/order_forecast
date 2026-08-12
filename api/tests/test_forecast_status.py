@@ -89,6 +89,8 @@ class ForecastStatusTests(unittest.IsolatedAsyncioTestCase):
             forecast, "_get_last_finalized_at", return_value=None
         ), patch.object(
             forecast, "load_authority_generation_state", return_value=(keys, "revision-1")
+        ), patch.object(
+            forecast, "get_generation_job_status", return_value=None
         ):
             result = await endpoint(
                 request=None,
@@ -104,6 +106,24 @@ class ForecastStatusTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result.hasTrainedModel)
         self.assertTrue(result.forecastAvailable)
         self.assertEqual(result.forecastMode, "last_order")
+
+    def test_insufficient_history_job_is_a_typed_terminal_preparation_failure(self):
+        with patch.object(
+            forecast,
+            "get_generation_job_status",
+            return_value={
+                "status": "queued",
+                "last_error": "insufficient_history: Only 1 orders found, need at least 4",
+            },
+        ):
+            result = forecast._get_exact_preparation_state(
+                "988200", "tuesday", "2026-08-17", False
+            )
+
+        self.assertEqual(result, {
+            "status": "failed",
+            "failureReason": "insufficient_history",
+        })
 
     def test_expired_cache_is_not_available(self):
         now = datetime.now(timezone.utc)

@@ -218,6 +218,40 @@ def build_job_key(route_number: str, schedule_key: str, delivery_date: str) -> s
     return f"{str(route_number).strip()}::{str(schedule_key).strip().lower()}::{str(delivery_date).strip()}"
 
 
+def get_generation_job_status(
+    route_number: str,
+    schedule_key: str,
+    delivery_date: str,
+) -> Optional[Dict[str, Any]]:
+    """Return non-sensitive state for one exact generation target."""
+    sk = normalize_schedule_key(schedule_key)
+    dd = normalize_delivery_date(delivery_date)
+    if not sk or not dd:
+        return None
+    conn = _pg_connect(autocommit=True)
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT job_key, status, attempts, max_attempts, last_error,
+                       available_at, started_at, finished_at, updated_at
+                FROM forecast_generation_jobs
+                WHERE job_key = %s
+                """,
+                [build_job_key(route_number, sk, dd)],
+            )
+            row = cur.fetchone()
+            return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def _is_terminal_generation_error(error_text: str) -> bool:
+    """Identify deterministic failures that retries cannot repair."""
+    normalized = str(error_text or "").strip().lower()
+    return normalized.startswith("insufficient_history:")
+
+
 def _register_finalize_event(
     route_number: str,
     order_id: str,
@@ -978,7 +1012,11 @@ def _process_claimed_job(
         _finish_job(job_key, "done")
         return "done"
     except Exception as exc:
-        _retry_or_fail_job(job, str(exc))
+        error_text = str(exc)
+        if _is_terminal_generation_error(error_text):
+            _finish_job(job_key, "error", error_text=error_text)
+            return "terminal_error"
+        _retry_or_fail_job(job, error_text)
         return "retry_or_error"
 
 

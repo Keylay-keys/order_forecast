@@ -208,6 +208,31 @@ class ForecastAttachTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(getattr(raised.exception, "status_code", None), 409)
         self.assertEqual(transaction.updates, [])
 
+    async def test_cycle_without_eligible_store_items_is_rejected_before_enqueue(self):
+        db, _order_ref, transaction = _db(self.order, [])
+        endpoint = inspect.unwrap(forecast.attach_forecast)
+        with patch.object(
+            forecast, "require_route_feature_access", new=AsyncMock()
+        ), patch.object(
+            forecast, "forecast_reference_enabled_for_route", return_value=True
+        ), patch.object(
+            forecast, "load_authority_generation_state", return_value=(set(), "revision-empty")
+        ), patch(
+            "forecast_generation_queue.enqueue_generation_job"
+        ) as enqueue:
+            with self.assertRaisesRegex(Exception, "forecast_no_eligible_items") as raised:
+                await endpoint(
+                    request=None,
+                    order_id="draft-1",
+                    route="988200",
+                    decoded_token={"uid": "owner"},
+                    db=db,
+                )
+
+        self.assertEqual(getattr(raised.exception, "status_code", None), 409)
+        enqueue.assert_not_called()
+        self.assertEqual(transaction.updates, [])
+
 
 if __name__ == "__main__":
     unittest.main()
