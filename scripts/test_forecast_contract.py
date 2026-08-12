@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 
 from forecast_contract import (
     ForecastContractError,
@@ -7,7 +8,9 @@ from forecast_contract import (
     key_fingerprint,
     stable_fingerprint,
     validate_ready_artifact,
+    load_authority_generation_state,
 )
+from models import Product, StoreConfig
 
 
 class ForecastContractTest(unittest.TestCase):
@@ -74,6 +77,25 @@ class ForecastContractTest(unittest.TestCase):
                 schedule_key="tuesday",
                 active_carry_keys=keys,
             )
+
+    def test_firebase_schedule_authority_rejects_obsolete_draft_schedule(self):
+        with patch(
+            "firebase_loader.load_master_catalog",
+            return_value=[Product(sap="100", name="One", case_pack=12)],
+        ), patch(
+            "firebase_loader.load_store_configs",
+            return_value=[StoreConfig(
+                store_id="store-1", store_name="One",
+                delivery_days=["thursday"], active_saps=["100"],
+            )],
+        ), patch(
+            "schedule_utils.get_order_cycles_from_firebase",
+            return_value=[{"orderDay": 7, "deliveryDay": 4, "loadDay": 3}],
+        ):
+            with self.assertRaisesRegex(ForecastContractError, "schedule_not_active:monday"):
+                load_authority_generation_state(
+                    object(), "988200", "2026-08-13", "monday"
+                )
 
 
 if __name__ == "__main__":

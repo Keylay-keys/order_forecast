@@ -158,23 +158,8 @@ def get_order_cycles_from_postgres(route_number: str) -> list:
             pass
 
 
-def get_order_cycles(db, route_number: str) -> list:
-    """Get user's order cycles - tries PostgreSQL first, falls back to Firebase.
-    
-    Args:
-        db: Firestore client (for fallback)
-        route_number: Route to look up
-    
-    Returns list of cycles like:
-        [{'orderDay': 1, 'loadDay': 3, 'deliveryDay': 4}, 
-         {'orderDay': 2, 'loadDay': 5, 'deliveryDay': 1}]
-    """
-    # Try PostgreSQL first
-    cycles = get_order_cycles_from_postgres(route_number)
-    if cycles:
-        return cycles
-
-    # Fallback to Firebase
+def get_order_cycles_from_firebase(db, route_number: str) -> list:
+    """Read current schedule authority directly from the owner user document."""
     from google.cloud.firestore_v1.base_query import FieldFilter
     
     try:
@@ -216,22 +201,37 @@ def get_order_cycles(db, route_number: str) -> list:
             user_doc = user_ref.get()
             if user_doc.exists:
                 user_data = user_doc.to_dict() or {}
-                
+
                 # Path: userSettings.notifications.scheduling.orderCycles
                 user_settings = user_data.get('userSettings', {})
                 notifications = user_settings.get('notifications', {})
                 scheduling = notifications.get('scheduling', {})
                 cycles = scheduling.get('orderCycles', [])
-                
+
                 if cycles:
                     return [normalize_order_cycle(cycle) for cycle in cycles]
-                
+
                 # Fallback: check old path settings.orderCycles
                 settings = user_data.get('settings', {})
                 return [normalize_order_cycle(cycle) for cycle in settings.get('orderCycles', [])]
     except Exception as e:
         print(f"[schedule_utils] Warning: Could not get order cycles from Firebase: {e}")
     return []
+
+
+def get_order_cycles(db, route_number: str) -> list:
+    """Get user's order cycles - tries PostgreSQL first, falls back to Firebase.
+
+    Args:
+        db: Firestore client (for fallback)
+        route_number: Route to look up
+
+    Returns list of cycles like:
+        [{'orderDay': 1, 'loadDay': 3, 'deliveryDay': 4},
+         {'orderDay': 2, 'loadDay': 5, 'deliveryDay': 1}]
+    """
+    cycles = get_order_cycles_from_postgres(route_number)
+    return cycles or get_order_cycles_from_firebase(db, route_number)
 
 
 def get_days_until_next_delivery(db, route_number: str, current_delivery_dow: int) -> int:

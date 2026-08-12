@@ -102,6 +102,17 @@ def make_specs(python: str) -> Dict[str, List[ServiceSpec]]:
                 ],
                 log_name="retrain_daemon.log",
             ),
+            ServiceSpec(
+                key="forecast_generation",
+                name="Forecast Generation Worker",
+                cmd=[
+                    python,
+                    str(SCRIPTS_DIR / "forecast_generation_worker.py"),
+                    "--serviceAccount",
+                    SA_PATH,
+                ],
+                log_name="forecast_generation_worker.log",
+            ),
         ],
         "listeners": [
             ServiceSpec(

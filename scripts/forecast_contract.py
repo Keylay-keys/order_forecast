@@ -49,6 +49,51 @@ def generation_input_fingerprint(
     })
 
 
+def load_authority_generation_state(
+    db: Any,
+    route_number: str,
+    delivery_date: str,
+    schedule_key: str,
+) -> Tuple[set[Key], str]:
+    """Build the generator's active-carry/input contract from Firebase authority."""
+    from firebase_loader import load_master_catalog, load_store_configs
+    from schedule_utils import (
+        day_name_to_num,
+        get_cycle_delivery_days,
+        get_order_cycles_from_firebase,
+    )
+
+    products = load_master_catalog(db, route_number)
+    stores = load_store_configs(db, route_number)
+    cycles = get_order_cycles_from_firebase(db, route_number)
+    order_day = day_name_to_num(schedule_key)
+    cycle = next((item for item in cycles if item.get("orderDay") == order_day), None)
+    if not cycle:
+        raise ForecastContractError(f"schedule_not_active:{schedule_key}")
+    cycle_days = get_cycle_delivery_days(cycle)
+    valid_store_ids = {
+        str(store.store_id)
+        for store in stores
+        if {str(day).lower() for day in (store.delivery_days or [])} & cycle_days
+    }
+
+    case_pack_by_sap = {
+        str(product.sap): int(product.case_pack or product.tray or 0)
+        for product in products
+    }
+    rows = {
+        (str(store.store_id), str(sap), case_pack_by_sap[str(sap)])
+        for store in stores
+        if str(store.store_id) in valid_store_ids
+        for sap in (store.active_saps or [])
+        if str(sap) in case_pack_by_sap
+    }
+    return (
+        {(store_id, sap) for store_id, sap, _case_pack in rows},
+        generation_input_fingerprint(route_number, delivery_date, schedule_key, rows),
+    )
+
+
 def normalize_units(value: Any) -> int:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ForecastContractError("recommended_units_not_numeric")

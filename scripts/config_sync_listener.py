@@ -81,6 +81,39 @@ def get_firestore_client(sa_path: str) -> firestore.Client:
     return firestore.Client.from_service_account_json(sa_path)
 
 
+def _store_forecast_signature(data: dict) -> str:
+    active_items = []
+    for item in (data.get("items") or data.get("activeItems") or []):
+        if isinstance(item, dict):
+            if item.get("isActive") is False or item.get("is_active") is False or item.get("active") is False:
+                continue
+            sap = item.get("sap") or item.get("SAP") or item.get("id") or ""
+        else:
+            sap = item
+        if str(sap).strip():
+            active_items.append(str(sap).strip())
+    return json.dumps({
+        "deliveryDays": sorted(
+            str(day).lower() for day in (data.get("deliveryDays") or data.get("delivery_days") or [])
+        ),
+        "items": sorted(active_items),
+        "active": data.get("isActive", True),
+    }, sort_keys=True, separators=(",", ":"))
+
+
+def _product_forecast_signature(data: dict) -> str:
+    return json.dumps({
+        "sap": str(data.get("sap") or ""),
+        "effectiveCasePack": data.get("casePack") or data.get("tray") or 0,
+        "active": data.get("active", data.get("isActive", data.get("is_active", True))),
+    }, sort_keys=True, separators=(",", ":"))
+
+
+def _schedule_forecast_signature(order_cycles: List[dict]) -> str:
+    normalized = [normalize_order_cycle(cycle) for cycle in order_cycles]
+    return json.dumps(normalized, sort_keys=True, separators=(",", ":"))
+
+
 # =============================================================================
 # Route Discovery
 # =============================================================================
@@ -102,7 +135,7 @@ def get_known_routes() -> Set[str]:
 # Store Sync
 # =============================================================================
 
-def sync_store_to_pg(route_number: str, store_id: str, data: dict, deleted: bool = False) -> None:
+def sync_store_to_pg(route_number: str, store_id: str, data: dict, deleted: bool = False) -> bool:
     """Sync a single store document to PostgreSQL.
 
     Args:
@@ -131,10 +164,10 @@ def sync_store_to_pg(route_number: str, store_id: str, data: dict, deleted: bool
                     """, [now, now, store_id])
 
                     print(f"  [Store] Marked inactive: {store_id}")
-                    return
+                    return True
 
                 # Extract delivery_days - can be array or string
-                delivery_days = data.get('deliveryDays', [])
+                delivery_days = data.get('deliveryDays') or data.get('delivery_days') or []
                 if isinstance(delivery_days, list):
                     delivery_days_str = json.dumps(delivery_days)
                 else:
@@ -163,14 +196,15 @@ def sync_store_to_pg(route_number: str, store_id: str, data: dict, deleted: bool
                 ])
 
                 # Sync store items (items is an array field on the store doc, not a subcollection)
-                items = data.get('items', [])
-                if items:
-                    sync_store_items(route_number, store_id, items, conn=conn)
+                items = data.get('items') or data.get('activeItems') or []
+                sync_store_items(route_number, store_id, items, conn=conn)
 
                 print(f"  [Store] Synced: {store_id} ({data.get('name', 'unnamed')}) - {len(items)} items")
+                return True
 
     except Exception as e:
         print(f"  [!] Error syncing store {store_id}: {e}")
+        return False
 
 
 def _sync_store_items_inner(
@@ -183,9 +217,14 @@ def _sync_store_items_inner(
     # Get current SAPs from the items array
     current_saps = set()
     for item in items:
-        sap = item.get('sap') if isinstance(item, dict) else str(item)
+        if isinstance(item, dict):
+            if item.get('isActive') is False or item.get('is_active') is False or item.get('active') is False:
+                continue
+            sap = item.get('sap') or item.get('SAP') or item.get('id')
+        else:
+            sap = str(item)
         if sap:
-            current_saps.add(sap)
+            current_saps.add(str(sap))
 
     with conn.cursor() as cur:
         # Get existing SAPs for this store
@@ -264,7 +303,7 @@ def sync_store_items(
 # Product Catalog Sync
 # =============================================================================
 
-def sync_product_to_pg(route_number: str, sap: str, data: dict, deleted: bool = False) -> None:
+def sync_product_to_pg(route_number: str, sap: str, data: dict, deleted: bool = False) -> bool:
     """Sync a single product document to PostgreSQL.
 
     Args:
@@ -285,7 +324,7 @@ def sync_product_to_pg(route_number: str, sap: str, data: dict, deleted: bool = 
                         WHERE sap = %s AND route_number = %s
                     """, [now, sap, route_number])
                     print(f"  [Product] Marked inactive: {sap}")
-                    return
+                    return True
 
                 # Get SAP from data if available (some docs use doc ID, some have sap field)
                 actual_sap = data.get('sap', sap)
@@ -316,23 +355,25 @@ def sync_product_to_pg(route_number: str, sap: str, data: dict, deleted: bool = 
                     data.get('brand', ''),
                     data.get('category', ''),
                     data.get('subCategory', ''),
-                    data.get('casePack', 1),
+                    data.get('casePack') or data.get('tray'),
                     data.get('tray'),  # Can be None
-                    data.get('active', data.get('isActive', True)),
+                    data.get('active', data.get('isActive', data.get('is_active', True))),
                     now,
                 ])
 
                 print(f"  [Product] Synced: {actual_sap} ({data.get('fullName', data.get('name', 'unnamed'))})")
+                return True
 
     except Exception as e:
         print(f"  [!] Error syncing product {sap}: {e}")
+        return False
 
 
 # =============================================================================
 # User Schedule Sync
 # =============================================================================
 
-def sync_user_schedules_to_pg(route_number: str, user_id: str, order_cycles: List[dict]) -> None:
+def sync_user_schedules_to_pg(route_number: str, user_id: str, order_cycles: List[dict]) -> bool:
     """Sync user order cycles to user_schedules table.
 
     Args:
@@ -406,9 +447,11 @@ def sync_user_schedules_to_pg(route_number: str, user_id: str, order_cycles: Lis
                     ])
 
                 print(f"  [Schedule] Synced {len(order_cycles)} cycles for route {route_number}")
+                return True
 
     except Exception as e:
         print(f"  [!] Error syncing schedules for route {route_number}: {e}")
+        return False
 
 
 # =============================================================================
@@ -422,21 +465,82 @@ class ConfigSyncManager:
         self.fb_client = fb_client
         self.watchers: List = []
         self.known_routes: Set[str] = set()
+        self._store_signatures: Dict[tuple, str] = {}
+        self._product_signatures: Dict[tuple, str] = {}
+        self._schedule_signatures: Dict[str, str] = {}
+        self._stores_initialized: Set[str] = set()
+        self._products_initialized: Set[str] = set()
+        self._schedules_initialized: Set[str] = set()
+        self._refresh_timers: Dict[str, threading.Timer] = {}
+
+    def _schedule_forecast_refresh(self, route_number: str, reason: str) -> None:
+        previous = self._refresh_timers.pop(route_number, None)
+        if previous:
+            previous.cancel()
+
+        def flush() -> None:
+            self._refresh_timers.pop(route_number, None)
+            try:
+                from forecast_contract import load_authority_generation_state
+                from forecast_generation_queue import (
+                    derive_upcoming_generation_targets,
+                    enqueue_generation_job,
+                )
+                for target in derive_upcoming_generation_targets(route_number):
+                    _keys, revision = load_authority_generation_state(
+                        self.fb_client,
+                        route_number,
+                        target["delivery_date"],
+                        target["schedule_key"],
+                    )
+                    enqueue_generation_job(
+                        route_number,
+                        target["schedule_key"],
+                        target["delivery_date"],
+                        source="config_sync_listener",
+                        desired_revision=revision,
+                        refresh_reason="config_change",
+                    )
+            except Exception as exc:
+                print(f"  [Forecast] Could not enqueue config refresh for {route_number}: {exc}")
+
+        timer = threading.Timer(2.0, flush)
+        timer.daemon = True
+        self._refresh_timers[route_number] = timer
+        timer.start()
+        print(f"  [Forecast] Debounced refresh scheduled for {route_number}: {reason}")
 
     def start_stores_listener(self, route_number: str) -> None:
         """Start listening to stores collection for a route."""
         stores_ref = self.fb_client.collection('routes').document(route_number).collection('stores')
 
         def on_stores_snapshot(col_snapshot, changes, read_time):
+            initial_batch = route_number not in self._stores_initialized
+            changed = False
             for change in changes:
                 doc = change.document
                 store_id = doc.id
                 data = doc.to_dict() or {}
 
+                key = (route_number, store_id)
+                previous_signature = self._store_signatures.get(key)
+                next_signature = _store_forecast_signature(data)
                 if change.type.name == 'ADDED' or change.type.name == 'MODIFIED':
-                    sync_store_to_pg(route_number, store_id, data, deleted=False)
+                    synced = sync_store_to_pg(route_number, store_id, data, deleted=False)
+                    self._store_signatures[key] = next_signature
                 elif change.type.name == 'REMOVED':
-                    sync_store_to_pg(route_number, store_id, data, deleted=True)
+                    synced = sync_store_to_pg(route_number, store_id, data, deleted=True)
+                    self._store_signatures.pop(key, None)
+                else:
+                    synced = False
+                changed = changed or bool(
+                    synced and not initial_batch and (
+                        change.type.name == 'REMOVED' or previous_signature != next_signature
+                    )
+                )
+            self._stores_initialized.add(route_number)
+            if changed:
+                self._schedule_forecast_refresh(route_number, "store_or_carry_change")
 
         watcher = stores_ref.on_snapshot(on_stores_snapshot)
         self.watchers.append(watcher)
@@ -451,15 +555,32 @@ class ConfigSyncManager:
         products_ref = self.fb_client.collection('masterCatalog').document(route_number).collection('products')
 
         def on_products_snapshot(col_snapshot, changes, read_time):
+            initial_batch = route_number not in self._products_initialized
+            changed = False
             for change in changes:
                 doc = change.document
                 sap = doc.id
                 data = doc.to_dict() or {}
 
+                key = (route_number, sap)
+                previous_signature = self._product_signatures.get(key)
+                next_signature = _product_forecast_signature(data)
                 if change.type.name == 'ADDED' or change.type.name == 'MODIFIED':
-                    sync_product_to_pg(route_number, sap, data, deleted=False)
+                    synced = sync_product_to_pg(route_number, sap, data, deleted=False)
+                    self._product_signatures[key] = next_signature
                 elif change.type.name == 'REMOVED':
-                    sync_product_to_pg(route_number, sap, data, deleted=True)
+                    synced = sync_product_to_pg(route_number, sap, data, deleted=True)
+                    self._product_signatures.pop(key, None)
+                else:
+                    synced = False
+                changed = changed or bool(
+                    synced and not initial_batch and (
+                        change.type.name == 'REMOVED' or previous_signature != next_signature
+                    )
+                )
+            self._products_initialized.add(route_number)
+            if changed:
+                self._schedule_forecast_refresh(route_number, "product_or_case_pack_change")
 
         watcher = products_ref.on_snapshot(on_products_snapshot)
         self.watchers.append(watcher)
@@ -509,9 +630,16 @@ class ConfigSyncManager:
                         od = days.get(c.get('orderDay'), '?')
                         dd = days.get(c.get('deliveryDay'), '?')
                         print(f"    Cycle {i}: Order={od} -> Delivery={dd}")
-                    sync_user_schedules_to_pg(route_number, user_id, order_cycles)
                 else:
                     print(f"  [Schedule] ⚠️ No orderCycles found for user {user_id}")
+                signature = _schedule_forecast_signature(order_cycles)
+                previous_signature = self._schedule_signatures.get(route_number)
+                synced = sync_user_schedules_to_pg(route_number, user_id, order_cycles)
+                self._schedule_signatures[route_number] = signature
+                initialized = route_number in self._schedules_initialized
+                self._schedules_initialized.add(route_number)
+                if synced and initialized and previous_signature != signature:
+                    self._schedule_forecast_refresh(route_number, "schedule_change")
             except Exception as e:
                 print(f"  [Schedule] ❌ Error processing snapshot for {user_id}: {e}")
                 import traceback
@@ -580,6 +708,9 @@ class ConfigSyncManager:
             except:
                 pass
         self.watchers.clear()
+        for timer in self._refresh_timers.values():
+            timer.cancel()
+        self._refresh_timers.clear()
         self.known_routes.clear()
         print("\n[*] All listeners stopped")
 

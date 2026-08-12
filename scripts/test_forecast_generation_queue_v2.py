@@ -65,6 +65,35 @@ class ForecastGenerationFreshnessV2Test(unittest.TestCase):
         self.assertFalse(fresh)
         self.assertEqual(reason, "generation_input_changed")
 
+    def test_missing_expiry_is_not_attachable_freshness(self):
+        fresh, reason = self.evaluate({
+            "schemaVersion": 2,
+            "state": "ready",
+            "generationInputFingerprint": "revision",
+            "publishedAt": datetime.now(timezone.utc),
+        }, desired_revision="revision")
+        self.assertFalse(fresh)
+        self.assertEqual(reason, "missing_expiry")
+
+    def test_worker_derives_authority_revision_for_legacy_queue_row(self):
+        job = {
+            "job_key": "988200::tuesday::2026-08-13",
+            "route_number": "988200",
+            "schedule_key": "tuesday",
+            "delivery_date": "2026-08-13",
+            "job_type": queue.JOB_TYPE_FORECAST_ONLY,
+        }
+        with patch(
+            "forecast_contract.load_authority_generation_state",
+            return_value=(set(), "derived-revision"),
+        ), patch.object(
+            queue, "_evaluate_job_freshness", return_value=(True, "fresh")
+        ) as evaluate, patch.object(queue, "_finish_job"):
+            result = queue._process_claimed_job(object(), "/tmp/service-account.json", job)
+
+        self.assertEqual(result, "skipped_fresh")
+        self.assertEqual(evaluate.call_args.args[-1], "derived-revision")
+
 
 if __name__ == "__main__":
     unittest.main()

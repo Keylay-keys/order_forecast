@@ -101,6 +101,8 @@ def load_store_configs(
     stores: List[StoreConfig] = []
     for doc in docs:
         data = doc.to_dict() or {}
+        if data.get("isActive") is False or data.get("is_active") is False or data.get("active") is False:
+            continue
         delivery_days = data.get("deliveryDays") or data.get("delivery_days") or []
         active_items = data.get("items") or data.get("activeItems") or []
         active_saps: List[str] = []

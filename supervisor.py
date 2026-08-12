@@ -190,6 +190,15 @@ def create_services(route: str, sa_path: str, db_path: str) -> List[Service]:
             ],
             log_file=LOG_DIR / 'order_sync.log',
         ),
+        Service(
+            name="Config Sync Listener",
+            cmd=[
+                python,
+                str(SCRIPTS_DIR / 'config_sync_listener.py'),
+                '--serviceAccount', sa_path,
+            ],
+            log_file=LOG_DIR / 'config_sync.log',
+        ),
         # Handles archive requests from app via DB Manager
         Service(
             name="Archive Listener",
@@ -408,7 +417,7 @@ def cmd_stop(args):
     time.sleep(0.5)
     
     # Now stop individual services
-    patterns = ['db_manager.py', 'order_sync_listener.py', 'order_archive_listener.py', 'archive_export_worker.py', 'archive_purge_worker.py', 'retrain_daemon.py', 'forecast_generation_worker.py', 'delivery_manifest_listener.py', 'promo_email_listener.py', 'catalog_upload_listener.py', 'low_qty_notification_daemon.py', 'api.main:app', 'pcf_core.runner']
+    patterns = ['db_manager.py', 'order_sync_listener.py', 'config_sync_listener.py', 'order_archive_listener.py', 'archive_export_worker.py', 'archive_purge_worker.py', 'retrain_daemon.py', 'forecast_generation_worker.py', 'delivery_manifest_listener.py', 'promo_email_listener.py', 'catalog_upload_listener.py', 'low_qty_notification_daemon.py', 'api.main:app', 'pcf_core.runner']
     
     for pattern in patterns:
         try:
@@ -446,6 +455,7 @@ def cmd_status(args):
     patterns = [
         ('DB Manager', 'db_manager.py'),
         ('Order Sync Listener', 'order_sync_listener.py'),
+        ('Config Sync Listener', 'config_sync_listener.py'),
         ('Archive Listener', 'order_archive_listener.py'),
         ('Archive Export Worker', 'archive_export_worker.py'),
         ('Archive Purge Worker', 'archive_purge_worker.py'),

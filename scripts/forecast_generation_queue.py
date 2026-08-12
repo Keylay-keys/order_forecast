@@ -539,6 +539,34 @@ def _derive_finalize_targets(route_number: str, finalized_schedule_key: Optional
     return out
 
 
+def derive_upcoming_generation_targets(route_number: str, lookahead_days: int = 21) -> List[Dict[str, str]]:
+    """Return the next unordered exact target for every active schedule."""
+    conn = _pg_connect(autocommit=True)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT DISTINCT schedule_key
+                FROM user_schedules
+                WHERE route_number = %s AND is_active = TRUE
+                ORDER BY schedule_key
+                """,
+                [str(route_number)],
+            )
+            schedule_keys = [str(row[0]) for row in (cur.fetchall() or []) if row[0]]
+    finally:
+        conn.close()
+
+    targets = [
+        target
+        for schedule_key in schedule_keys
+        if (target := _get_next_unordered_delivery_for_schedule(
+            route_number, schedule_key, lookahead_days
+        ))
+    ]
+    return sorted(targets, key=lambda target: (target["delivery_date"], target["schedule_key"]))
+
+
 def enqueue_finalize_jobs(
     route_number: str,
     order_id: str,
@@ -799,7 +827,9 @@ def _evaluate_job_freshness(
         return False, "generation_input_changed"
     now = datetime.now(timezone.utc)
     expires_at = _to_utc_datetime(meta.get("expiresAt"))
-    if expires_at and expires_at <= now:
+    if not expires_at:
+        return False, "missing_expiry"
+    if expires_at <= now:
         return False, "expired"
 
     generated_at = _to_utc_datetime(meta.get("generatedAt")) or _to_utc_datetime(meta.get("publishedAt"))
@@ -893,13 +923,24 @@ def _process_claimed_job(
         _finish_job(job_key, "error", error_text="invalid_job_payload")
         return "error"
 
+    desired_revision = job.get("desired_revision")
+    if not desired_revision:
+        try:
+            from forecast_contract import load_authority_generation_state
+            _active_keys, desired_revision = load_authority_generation_state(
+                fb_client, route_number, delivery_date, schedule_key
+            )
+        except Exception as exc:
+            _retry_or_fail_job(job, f"authority_revision_unavailable:{exc}")
+            return "retry_or_error"
+
     is_fresh, reason = _evaluate_job_freshness(
         fb_client,
         route_number,
         delivery_date,
         schedule_key,
         job_type,
-        job.get("desired_revision"),
+        desired_revision,
     )
     if is_fresh:
         _finish_job(job_key, "skipped_fresh", skipped_reason=reason)
