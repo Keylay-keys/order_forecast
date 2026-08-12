@@ -33,10 +33,10 @@ from ..models import (
 from forecast_contract import (
     ForecastContractError,
     build_order_snapshot,
-    generation_input_fingerprint,
-    stable_fingerprint,
+    load_authority_generation_state,
     validate_ready_artifact,
 )
+from forecast_reference_rollout import forecast_reference_enabled_for_route
 
 
 router = APIRouter()
@@ -235,7 +235,7 @@ def _get_latest_forecast(
     delivery_date: str,
     schedule_key: str,
 ) -> Optional[Dict[str, Any]]:
-    """Return latest cached forecast doc (exact match, then scheduleKey fallback)."""
+    """Return the latest supported forecast for one exact target."""
     forecasts_ref = db.collection("forecasts").document(route_number).collection("cached")
 
     exact_query = (
@@ -243,10 +243,6 @@ def _get_latest_forecast(
         .where("scheduleKey", "==", schedule_key)
     )
     docs = list(exact_query.stream())
-
-    if not docs:
-        fallback_query = forecasts_ref.where("scheduleKey", "==", schedule_key)
-        docs = list(fallback_query.stream())
 
     if not docs:
         return None
@@ -257,6 +253,8 @@ def _get_latest_forecast(
         reverse=True,
     )
     data = docs[0].to_dict() or {}
+    if data.get("schemaVersion") != 2 or data.get("state") != "ready":
+        return None
 
     # Skip expired
     expires_at = _to_naive_utc(data.get("expiresAt"))
@@ -289,19 +287,44 @@ def _get_cached_forecast_readiness(
     db: firestore.Client,
     route_number: str,
     schedule_key: Optional[str] = None,
+    delivery_date: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Return availability and mode for the newest non-expired cached forecast."""
+    """Return attachable availability for one exact target, never schedule-only."""
+    if not schedule_key or not delivery_date:
+        return {"forecastAvailable": False, "forecastMode": None}
     cached_ref = db.collection("forecasts").document(route_number).collection("cached")
-    docs = cached_ref.where("scheduleKey", "==", schedule_key).stream() if schedule_key else cached_ref.stream()
+    docs = (
+        cached_ref.where("deliveryDate", "==", delivery_date)
+        .where("scheduleKey", "==", schedule_key)
+        .stream()
+    )
     now = _to_naive_utc(datetime.now(timezone.utc))
     available: List[Dict[str, Any]] = []
+    try:
+        active_keys, revision = load_authority_generation_state(
+            db, route_number, delivery_date, schedule_key
+        )
+    except Exception:
+        return {"forecastAvailable": False, "forecastMode": None}
 
     for snapshot in docs:
         data = snapshot.to_dict() or {}
         if data.get("schemaVersion") != 2 or data.get("state") != "ready":
             continue
         expires_at = _to_naive_utc(data.get("expiresAt"))
-        if expires_at and now and expires_at <= now:
+        if not expires_at or (now and expires_at <= now):
+            continue
+        try:
+            validate_ready_artifact(
+                data,
+                route_number=route_number,
+                delivery_date=delivery_date,
+                schedule_key=schedule_key,
+                active_carry_keys=active_keys,
+            )
+        except ForecastContractError:
+            continue
+        if data.get("generationInputFingerprint") != revision:
             continue
         available.append(data)
 
@@ -480,6 +503,8 @@ async def get_forecast_status(
     request: Request,
     route: str = Query(..., pattern=r"^\d{1,10}$", description="Route number"),
     scheduleKey: Optional[str] = Query(default=None),
+    deliveryDate: Optional[str] = Query(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$"),
+    orderId: Optional[str] = Query(default=None, min_length=1, max_length=200),
     decoded_token: dict = Depends(verify_firebase_token),
     db: firestore.Client = Depends(get_firestore),
 ) -> ForecastStatusResponse:
@@ -492,8 +517,24 @@ async def get_forecast_status(
     status_doc = db.collection("forecasts").document(route).get()
     status_data = status_doc.to_dict() or {}
 
+    if orderId:
+        order_snapshot = (
+            db.collection("routes").document(route).collection("orders").document(orderId).get()
+        )
+        if not order_snapshot.exists:
+            raise HTTPException(404, "Order not found")
+        order_data = order_snapshot.to_dict() or {}
+        deliveryDate = str(order_data.get("expectedDeliveryDate") or "") or None
+        scheduleKey = str(order_data.get("scheduleKey") or "").lower() or None
+    elif bool(deliveryDate) != bool(scheduleKey):
+        raise HTTPException(400, "deliveryDate and scheduleKey must be supplied together")
+
     last_finalized = _get_last_finalized_at(route, scheduleKey)
-    cached_status = _get_cached_forecast_readiness(db, route, scheduleKey)
+    cached_status = (
+        _get_cached_forecast_readiness(db, route, scheduleKey, deliveryDate)
+        if forecast_reference_enabled_for_route(route)
+        else {"forecastAvailable": False, "forecastMode": None}
+    )
 
     return ForecastStatusResponse(
         orderCount=status_data.get("orderCount"),
@@ -510,6 +551,7 @@ async def get_forecast_status(
     "/forecast/attach/{order_id}",
     response_model=AttachForecastResponse,
     responses={
+        202: {"model": ForecastPreparingResponse},
         400: {"model": ErrorResponse},
         401: {"model": ErrorResponse},
         403: {"model": ErrorResponse},
@@ -526,6 +568,8 @@ async def attach_forecast(
 ) -> Any:
     """Attach an exact, validated schema-v2 snapshot without editing stores."""
     await require_route_feature_access(route, "forecasting", decoded_token, db)
+    if not forecast_reference_enabled_for_route(route):
+        raise HTTPException(409, "forecast_reference_rollout_disabled")
 
     order_ref = db.collection("routes").document(route).collection("orders").document(order_id)
     order_doc = order_ref.get()
@@ -543,6 +587,19 @@ async def attach_forecast(
     if not delivery_date or not schedule_key:
         raise HTTPException(400, "Order target is incomplete")
 
+    authority_error = None
+    try:
+        active_keys, current_input_fingerprint = load_authority_generation_state(
+            db, route, delivery_date, schedule_key
+        )
+    except ForecastContractError as exc:
+        authority_error = str(exc)
+        active_keys, current_input_fingerprint = None, None
+    except Exception:
+        active_keys, current_input_fingerprint = None, None
+    if authority_error and authority_error.startswith("schedule_not_active:"):
+        raise HTTPException(409, "order_schedule_no_longer_active; recreate the draft")
+
     cached_ref = db.collection("forecasts").document(route).collection("cached")
     candidates = list(
         cached_ref.where("deliveryDate", "==", delivery_date)
@@ -554,24 +611,21 @@ async def attach_forecast(
         .stream()
     )
     now = datetime.now(timezone.utc)
-    artifact = next((doc.to_dict() or {} for doc in candidates if (
-        not _to_naive_utc((doc.to_dict() or {}).get("expiresAt"))
-        or _to_naive_utc((doc.to_dict() or {}).get("expiresAt")) > _to_naive_utc(now)
-    )), None)
+    artifact = next((
+        data
+        for doc in candidates
+        if (data := (doc.to_dict() or {}))
+        and (expires_at := _to_naive_utc(data.get("expiresAt"))) is not None
+        and expires_at > _to_naive_utc(now)
+    ), None)
     if artifact is None:
         from forecast_generation_queue import enqueue_generation_job
-        desired_revision = stable_fingerprint({
-            "schemaVersion": 2,
-            "routeNumber": route,
-            "deliveryDate": delivery_date,
-            "scheduleKey": schedule_key,
-        })
         job = enqueue_generation_job(
             route,
             schedule_key,
             delivery_date,
             source="forecast_attach",
-            desired_revision=desired_revision,
+            desired_revision=current_input_fingerprint,
             refresh_reason="attach_stale",
         )
         preparing = ForecastPreparingResponse(
@@ -582,43 +636,10 @@ async def attach_forecast(
         )
         return JSONResponse(status_code=202, content=preparing.model_dump())
 
-    desired_revision = stable_fingerprint({
-        "schemaVersion": 2,
-        "routeNumber": route,
-        "deliveryDate": delivery_date,
-        "scheduleKey": schedule_key,
-    })
+    desired_revision = current_input_fingerprint
     try:
-        from firebase_loader import load_master_catalog, load_store_configs
-        from forecast_engine import _get_stores_for_order_cycle
-        from schedule_utils import get_order_cycles
-
-        products = load_master_catalog(db, route)
-        stores_config = load_store_configs(db, route)
-        valid_store_ids = _get_stores_for_order_cycle(
-            stores_config,
-            get_order_cycles(db, route),
-            schedule_key,
-        )
-        case_pack_by_sap = {
-            str(product.sap): int(product.case_pack or product.tray or 0)
-            for product in products
-        }
-        active_carry_rows = {
-            (str(store.store_id), str(sap), case_pack_by_sap[str(sap)])
-            for store in stores_config
-            if str(store.store_id) in valid_store_ids
-            for sap in (store.active_saps or [])
-            if str(sap) in case_pack_by_sap
-        }
-        active_keys = {(store_id, sap) for store_id, sap, _case_pack in active_carry_rows}
-        current_input_fingerprint = generation_input_fingerprint(
-            route,
-            delivery_date,
-            schedule_key,
-            active_carry_rows,
-        )
-        desired_revision = current_input_fingerprint
+        if active_keys is None or current_input_fingerprint is None:
+            raise ForecastContractError("authority_state_unavailable")
         if artifact.get("generationInputFingerprint") != current_input_fingerprint:
             raise ForecastContractError("generation_input_stale")
         artifact_items = validate_ready_artifact(
@@ -637,6 +658,9 @@ async def attach_forecast(
         snapshot_items, eligibility_fingerprint = build_order_snapshot(
             artifact_items, active_keys, order_keys
         )
+        artifact_generated_at = _to_naive_utc(artifact.get("generatedAt"))
+        if artifact_generated_at is None:
+            raise ForecastContractError("generated_at_missing_or_invalid")
     except ForecastContractError as exc:
         from forecast_generation_queue import enqueue_generation_job
         job = enqueue_generation_job(
@@ -663,7 +687,7 @@ async def attach_forecast(
         "forecastDeliveryDate": artifact["deliveryDate"],
         "orderDeliveryDate": delivery_date,
         "scheduleKey": schedule_key,
-        "generatedAt": _to_naive_utc(artifact.get("generatedAt")).replace(tzinfo=timezone.utc).isoformat(),
+        "generatedAt": artifact_generated_at.replace(tzinfo=timezone.utc).isoformat(),
         "attachedAt": attached_at,
         "activeCarryItemCount": len(active_keys),
         "eligibleItemCount": len(snapshot_items),

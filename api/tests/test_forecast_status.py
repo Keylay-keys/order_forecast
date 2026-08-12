@@ -4,6 +4,11 @@ from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from order_forecast.api.routers import forecast
+from order_forecast.scripts.forecast_contract import (
+    artifact_semantic_payload,
+    key_fingerprint,
+    stable_fingerprint,
+)
 
 
 class _Snapshot:
@@ -23,13 +28,48 @@ def _forecast_db(status, cached):
     forecast_collection.document.return_value = forecast_document
     forecast_document.get.return_value = _Snapshot(status)
     forecast_document.collection.return_value = cached_collection
+    cached_collection.where.return_value = cached_collection
     cached_collection.stream.return_value = [_Snapshot(item) for item in cached]
     return db
 
 
 class ForecastStatusTests(unittest.IsolatedAsyncioTestCase):
+    def artifact(self, *, delivery_date="2026-08-13", expires_at=None):
+        now = datetime.now(timezone.utc)
+        keys = {("store-1", "sap-1")}
+        artifact = {
+            "schemaVersion": 2,
+            "state": "ready",
+            "forecastId": "forecast-1",
+            "generationMode": "last_order",
+            "routeNumber": "989567",
+            "deliveryDate": delivery_date,
+            "scheduleKey": "tuesday",
+            "generatedAt": now,
+            "publishedAt": now,
+            "expiresAt": expires_at or now + timedelta(days=2),
+            "generationInputFingerprint": "revision-1",
+            "eligibility": {
+                "activeCarryItemCount": 1,
+                "emittedItemCount": 1,
+                "zeroItemCount": 1,
+                "activeCarryFingerprint": key_fingerprint(keys),
+            },
+            "items": [{
+                "storeId": "store-1",
+                "sap": "sap-1",
+                "recommendedUnits": 0,
+                "source": "dense_zero",
+            }],
+        }
+        artifact["artifactFingerprint"] = stable_fingerprint(
+            artifact_semantic_payload(artifact)
+        )
+        return artifact, keys
+
     async def test_last_order_fallback_is_available_before_training(self):
         now = datetime.now(timezone.utc)
+        artifact, keys = self.artifact()
         db = _forecast_db(
             status={
                 "orderCount": 2,
@@ -37,27 +77,25 @@ class ForecastStatusTests(unittest.IsolatedAsyncioTestCase):
                 "hasTrainedModel": False,
                 "lastUpdated": now,
             },
-            cached=[{
-                "schemaVersion": 2,
-                "state": "ready",
-                "generationMode": "last_order",
-                "generatedAt": now,
-                "expiresAt": now + timedelta(days=2),
-                "items": [
-                    {"source": "last_order"},
-                    {"source": "suppressed_zero"},
-                ],
-            }],
+            cached=[artifact],
         )
 
         endpoint = inspect.unwrap(forecast.get_forecast_status)
         with patch.object(
             forecast, "require_route_feature_access", new=AsyncMock()
-        ), patch.object(forecast, "_get_last_finalized_at", return_value=None):
+        ), patch.object(
+            forecast, "forecast_reference_enabled_for_route", return_value=True
+        ), patch.object(
+            forecast, "_get_last_finalized_at", return_value=None
+        ), patch.object(
+            forecast, "load_authority_generation_state", return_value=(keys, "revision-1")
+        ):
             result = await endpoint(
                 request=None,
                 route="989567",
-                scheduleKey=None,
+                scheduleKey="tuesday",
+                deliveryDate="2026-08-13",
+                orderId=None,
                 decoded_token={"uid": "owner"},
                 db=db,
             )
@@ -69,17 +107,36 @@ class ForecastStatusTests(unittest.IsolatedAsyncioTestCase):
 
     def test_expired_cache_is_not_available(self):
         now = datetime.now(timezone.utc)
+        artifact, keys = self.artifact(expires_at=now - timedelta(days=1))
         db = _forecast_db(
             status={},
-            cached=[{
-                "generatedAt": now - timedelta(days=8),
-                "expiresAt": now - timedelta(days=1),
-                "items": [{"source": "last_order"}],
-            }],
+            cached=[artifact],
         )
 
-        result = forecast._get_cached_forecast_readiness(db, "989567")
+        with patch.object(
+            forecast, "load_authority_generation_state", return_value=(keys, "revision-1")
+        ):
+            result = forecast._get_cached_forecast_readiness(
+                db, "989567", "tuesday", "2026-08-13"
+            )
 
+        self.assertEqual(result, {"forecastAvailable": False, "forecastMode": None})
+
+    def test_schedule_only_status_is_never_attachable(self):
+        artifact, _keys = self.artifact()
+        db = _forecast_db(status={}, cached=[artifact])
+        result = forecast._get_cached_forecast_readiness(db, "989567", "tuesday")
+        self.assertEqual(result, {"forecastAvailable": False, "forecastMode": None})
+
+    def test_same_schedule_other_date_is_not_attachable(self):
+        artifact, keys = self.artifact(delivery_date="2026-08-20")
+        db = _forecast_db(status={}, cached=[artifact])
+        with patch.object(
+            forecast, "load_authority_generation_state", return_value=(keys, "revision-1")
+        ):
+            result = forecast._get_cached_forecast_readiness(
+                db, "989567", "tuesday", "2026-08-13"
+            )
         self.assertEqual(result, {"forecastAvailable": False, "forecastMode": None})
 
 
