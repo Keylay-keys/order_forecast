@@ -285,12 +285,36 @@ def handle_sync_order(conn: psycopg2.extensions.connection, db: firestore.Client
         schedule_key = data.get('scheduleKey', 'unknown')
         stores = data.get('stores', [])
 
+        attached_context = data.get('forecastContext') if isinstance(data.get('forecastContext'), dict) else {}
+        has_attached_context = (
+            attached_context.get('schemaVersion') == 2
+            and bool(attached_context.get('forecastId'))
+            and isinstance(attached_context.get('items'), list)
+        )
+        legacy_forecast_context = bool(data.get('forecastId')) or any(
+            item.get('forecastId')
+            or item.get('forecastRecommendedUnits') is not None
+            or item.get('forecastSuggestedUnits') is not None
+            or item.get('forecastedQuantity') is not None
+            for store in stores
+            for item in (store.get('items') or [])
+        )
+
         # Best-effort: load the cached forecast used for this delivery/schedule so we can
         # extract corrections even if the app didn't store forecastRecommendedUnits on items.
         # This is critical for capturing removals (forecasted > 0 but not ordered).
         cached_forecast_id: Optional[str] = None
         forecast_lookup: Dict[str, Dict[str, Any]] = {}  # "{storeId}::{sap}" -> cached forecast item
-        if route_number and delivery_date and schedule_key:
+        if has_attached_context:
+            cached_forecast_id = str(attached_context.get('forecastId'))
+            for item in attached_context.get('items') or []:
+                raw_store_id = item.get('storeId') or ''
+                sap = str(item.get('sap') or '').strip()
+                if not raw_store_id or not sap:
+                    continue
+                resolved_store_id = resolve_store_id_from_db(conn, route_number, raw_store_id) or raw_store_id
+                forecast_lookup[f"{resolved_store_id}::{sap}"] = item
+        elif legacy_forecast_context and route_number and delivery_date and schedule_key:
             try:
                 cached_ref = (
                     db.collection('forecasts')
@@ -402,27 +426,15 @@ def handle_sync_order(conn: psycopg2.extensions.connection, db: firestore.Client
         
         # Get forecast ID
         forecast_id = (
-            data.get('forecastId')
+            attached_context.get('forecastId')
+            or data.get('forecastId')
             or cached_forecast_id
             or f'order-derived-{order_id}'
         )
 
         # Did this order actually carry forecast context?
         # We only infer "added-not-forecasted" corrections when forecast context exists.
-        has_forecast_context = bool(data.get('forecastId'))
-        if not has_forecast_context:
-            for store in stores:
-                for item in store.get('items', []):
-                    if (
-                        item.get('forecastId')
-                        or item.get('forecastRecommendedUnits') is not None
-                        or item.get('forecastSuggestedUnits') is not None
-                        or item.get('forecastedQuantity') is not None
-                    ):
-                        has_forecast_context = True
-                        break
-                if has_forecast_context:
-                    break
+        has_forecast_context = has_attached_context or legacy_forecast_context
         
         # Collect line items and corrections for batch insert
         line_item_rows = []

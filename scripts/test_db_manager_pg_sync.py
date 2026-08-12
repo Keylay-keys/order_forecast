@@ -179,6 +179,56 @@ def _fake_execute_values(cur, sql, rows, page_size=100):
 
 
 class TestHandleSyncOrderProjectionReplacement(unittest.TestCase):
+    def test_schema_v2_snapshot_records_omitted_zero_add_and_changed_amounts(self):
+        route_number = "988200"
+        order_id = "order-988200-v2"
+        order = {
+            "id": order_id,
+            "routeNumber": route_number,
+            "userId": "user-1",
+            "expectedDeliveryDate": "2026-08-13",
+            "orderDate": "2026-08-11",
+            "scheduleKey": "tuesday",
+            "forecastContext": {
+                "schemaVersion": 2,
+                "forecastId": "forecast-v2",
+                "items": [
+                    {"storeId": "store-1", "sap": "omitted", "recommendedUnits": 5},
+                    {"storeId": "store-1", "sap": "zero-add", "recommendedUnits": 0},
+                    {"storeId": "store-1", "sap": "changed", "recommendedUnits": 6},
+                    {"storeId": "store-1", "sap": "exact", "recommendedUnits": 2},
+                ],
+            },
+            "stores": [{
+                "storeId": "store-1",
+                "storeName": "Store One",
+                "items": [
+                    {"sap": "zero-add", "quantity": 3, "cases": 0},
+                    {"sap": "changed", "quantity": 4, "cases": 0},
+                    {"sap": "exact", "quantity": 2, "cases": 0},
+                ],
+            }],
+        }
+        db = _FakeFirestoreDB({(route_number, order_id): order}, {})
+        conn = _FakeConnection()
+
+        with (
+            mock.patch.object(worker, "execute_values", side_effect=_fake_execute_values),
+            mock.patch.object(worker, "resolve_store_id_from_db", side_effect=lambda conn, route, store: store),
+            mock.patch.object(worker, "is_holiday_week", return_value=(False, "")),
+        ):
+            result = worker.handle_sync_order(conn, db, {"orderId": order_id, "routeNumber": route_number})
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["correctionsExtracted"], 3)
+        self.assertEqual(set(conn.forecast_corrections), {
+            f"{order_id}-store-1-omitted-rm",
+            f"{order_id}-store-1-zero-add-corr",
+            f"{order_id}-store-1-changed-corr",
+        })
+        zero_add = conn.forecast_corrections[f"{order_id}-store-1-zero-add-corr"]
+        self.assertEqual((zero_add[9], zero_add[11], zero_add[13]), (0, 3, 3))
+
     def test_sync_order_replaces_removed_line_items_and_stale_corrections(self):
         route_number = "989262"
         order_id = "order-989262-1776772064245"
