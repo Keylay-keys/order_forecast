@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from google.cloud import firestore
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, Field, field_validator
 
 from ..dependencies import (
     get_firestore,
@@ -46,18 +46,21 @@ class CatalogProductPayload(BaseModel):
     sku: Optional[str] = Field(None, max_length=120)
     notes: Optional[str] = Field(None, max_length=1000)
 
-    @validator("sap")
+    @field_validator("sap")
+    @classmethod
     def validate_sap(cls, value: str) -> str:
         sap = value.strip()
         if not SAP_PATTERN.match(sap):
             raise ValueError("Invalid SAP code")
         return sap
 
-    @validator("brand", "category", "fullName", pre=True)
+    @field_validator("brand", "category", "fullName", mode="before")
+    @classmethod
     def normalize_required_text(cls, value: Any) -> str:
         return str(value or "").strip()
 
-    @validator("pcfAbbreviation", "upc", "sku", "notes", pre=True)
+    @field_validator("pcfAbbreviation", "upc", "sku", "notes", mode="before")
+    @classmethod
     def normalize_optional_text(cls, value: Any) -> Optional[str]:
         if value is None:
             return None
@@ -66,10 +69,11 @@ class CatalogProductPayload(BaseModel):
 
 
 class SapListActivationRequest(BaseModel):
-    saps: List[str] = Field(default_factory=list, max_items=MAX_SAP_LIST_INPUT)
+    saps: List[str] = Field(default_factory=list, max_length=MAX_SAP_LIST_INPUT)
     hideMissingReferenceItems: bool = False
 
-    @validator("saps")
+    @field_validator("saps")
+    @classmethod
     def normalize_saps(cls, value: List[str]) -> List[str]:
         seen: set[str] = set()
         normalized: List[str] = []

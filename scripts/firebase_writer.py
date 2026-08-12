@@ -9,7 +9,7 @@ import json
 import os
 import tempfile
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
 
 from google.cloud import firestore  # type: ignore
@@ -90,7 +90,7 @@ def _archive_forecast_to_disk(route_number: str, forecast: ForecastPayload, payl
         "generatedAt": _iso(payload.get("generatedAt")),
         "publishedAt": _iso(payload.get("publishedAt")),
         "expiresAt": _iso(payload.get("expiresAt")),
-        "archivedAt": datetime.utcnow().isoformat() + "Z",
+        "archivedAt": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
     }
 
     final_path = os.path.join(target_dir, f"{forecast.forecast_id}.json")
@@ -796,7 +796,7 @@ def write_cached_forecast(
     expires_at = forecast.generated_at + timedelta(days=ttl_days)
     
     cached_ref = db.collection("forecasts").document(route_number).collection("cached")
-    published_at = datetime.utcnow()
+    published_at = datetime.now(timezone.utc)
     validation_started = time.perf_counter()
     payload = _build_ready_forecast_payload(route_number, forecast, expires_at, published_at)
     dense_validation_ms = round((time.perf_counter() - validation_started) * 1000, 3)

@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from google.cloud import firestore
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, Field, field_validator
 
 from ..dependencies import (
     get_firestore,
@@ -38,21 +38,24 @@ class StorePayload(BaseModel):
     address: Optional[str] = Field(None, max_length=240)
     deliveryDays: List[str] = Field(default_factory=list)
 
-    @validator("name")
+    @field_validator("name")
+    @classmethod
     def validate_name(cls, value: str) -> str:
         trimmed = value.strip()
         if not trimmed:
             raise ValueError("Store name is required")
         return trimmed
 
-    @validator("number", "address", pre=True)
+    @field_validator("number", "address", mode="before")
+    @classmethod
     def normalize_optional_text(cls, value: Optional[str]) -> Optional[str]:
         if value is None:
             return None
         trimmed = str(value).strip()
         return trimmed or None
 
-    @validator("deliveryDays")
+    @field_validator("deliveryDays")
+    @classmethod
     def validate_delivery_days(cls, value: List[str]) -> List[str]:
         days: List[str] = []
         seen = set()
@@ -69,7 +72,8 @@ class StorePayload(BaseModel):
 class StoreItemsPayload(BaseModel):
     items: List[str] = Field(default_factory=list)
 
-    @validator("items")
+    @field_validator("items")
+    @classmethod
     def validate_items(cls, value: List[str]) -> List[str]:
         items: List[str] = []
         seen = set()

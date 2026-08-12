@@ -6,9 +6,9 @@ to ensure compatibility between mobile app and web portal.
 
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from typing import List, Optional, Dict, Any, Literal
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 import re
 
 
@@ -37,7 +37,10 @@ def _parse_firestore_timestamp(value: Any) -> Optional[datetime]:
         nanos = value.get("nanoseconds") or value.get("_nanoseconds") or value.get("nanos")
         if seconds is not None:
             try:
-                return datetime.utcfromtimestamp(seconds + (nanos or 0) / 1_000_000_000)
+                return datetime.fromtimestamp(
+                    seconds + (nanos or 0) / 1_000_000_000,
+                    tz=timezone.utc,
+                )
             except Exception:
                 return None
     return None
@@ -52,7 +55,8 @@ class HistoryRequest(BaseModel):
     route: str = Field(..., description="Route number (digits only)")
     weeks: int = Field(default=12, ge=1, le=52, description="Number of weeks of history")
     
-    @validator('route')
+    @field_validator('route')
+    @classmethod
     def validate_route(cls, v):
         if not ROUTE_NUMBER_PATTERN.match(v):
             raise ValueError('Route must be 1-10 digits')
@@ -68,19 +72,22 @@ class OrderCreateRequest(BaseModel):
     notes: Optional[str] = None
     coreItemPolicyVersion: Optional[int] = Field(default=None, ge=1, le=1)
     
-    @validator('routeNumber')
+    @field_validator('routeNumber')
+    @classmethod
     def validate_route(cls, v):
         if not ROUTE_NUMBER_PATTERN.match(v):
             raise ValueError('Route must be 1-10 digits')
         return v
     
-    @validator('scheduleKey')
+    @field_validator('scheduleKey')
+    @classmethod
     def validate_schedule_key(cls, v):
         if not SCHEDULE_KEY_PATTERN.match(v.lower()):
             raise ValueError('scheduleKey must be a day of week')
         return v.lower()
     
-    @validator('deliveryDate')
+    @field_validator('deliveryDate')
+    @classmethod
     def validate_delivery_date(cls, v):
         from datetime import timedelta
         today = date.today()
@@ -100,13 +107,15 @@ class ForecastRequest(BaseModel):
     deliveryDate: date = Field(..., description="Delivery date for forecast")
     scheduleKey: str = Field(..., description="Order day (monday, tuesday, etc.)")
     
-    @validator('route')
+    @field_validator('route')
+    @classmethod
     def validate_route(cls, v):
         if not ROUTE_NUMBER_PATTERN.match(v):
             raise ValueError('Route must be 1-10 digits')
         return v
     
-    @validator('scheduleKey')
+    @field_validator('scheduleKey')
+    @classmethod
     def validate_schedule_key(cls, v):
         if not SCHEDULE_KEY_PATTERN.match(v.lower()):
             raise ValueError('scheduleKey must be a day of week')
@@ -210,7 +219,8 @@ class OrderItem(BaseModel):
     # Prior order context
     priorOrderContext: Optional[PriorOrderContext] = None
 
-    @validator('enteredAt', pre=True)
+    @field_validator('enteredAt', mode='before')
+    @classmethod
     def validate_entered_at(cls, v):
         parsed = _parse_firestore_timestamp(v)
         return parsed if parsed is not None else v
@@ -221,14 +231,16 @@ class OrderItem(BaseModel):
     # Whole-case adjustment
     wholeCaseAdjustment: Optional[WholeCaseAdjustment] = None
     
-    @validator('sap')
+    @field_validator('sap')
+    @classmethod
     def validate_sap(cls, v):
         if not SAP_PATTERN.match(v):
             raise ValueError('Invalid SAP format')
         return v
 
-    class Config:
-        allow_population_by_field_name = True
+    # Keep support for the full declared Pydantic >=2.0 range. This preserves
+    # the API's ability to accept either the field name or its legacy alias.
+    model_config = ConfigDict(populate_by_name=True)
 
 
 class StoreOrder(BaseModel):
@@ -239,13 +251,15 @@ class StoreOrder(BaseModel):
     enteredAt: Optional[datetime] = None
     completed: Optional[bool] = None
     
-    @validator('storeId')
+    @field_validator('storeId')
+    @classmethod
     def validate_store_id(cls, v):
         if not STORE_ID_PATTERN.match(v):
             raise ValueError('Invalid store ID format')
         return v
 
-    @validator('enteredAt', pre=True)
+    @field_validator('enteredAt', mode='before')
+    @classmethod
     def validate_store_entered_at(cls, v):
         parsed = _parse_firestore_timestamp(v)
         return parsed if parsed is not None else v
@@ -285,7 +299,8 @@ class Order(BaseModel):
     #   {"seconds": ..., "nanoseconds": ...}
     # instead of native Timestamp types. Accept and coerce these into datetimes
     # so API reads don't 500 on old/bad data.
-    @validator('createdAt', 'updatedAt', 'submittedAt', pre=True)
+    @field_validator('createdAt', 'updatedAt', 'submittedAt', mode='before')
+    @classmethod
     def validate_order_timestamps(cls, v):
         parsed = _parse_firestore_timestamp(v)
         return parsed if parsed is not None else v
@@ -303,7 +318,8 @@ class OrderUpdateRequest(BaseModel):
     routeSplittingEnabled: Optional[bool] = None
     sapOrder: Optional[List[str]] = Field(default=None, max_length=2000)
 
-    @validator('sapOrder')
+    @field_validator('sapOrder')
+    @classmethod
     def validate_sap_order(cls, v):
         if v is None:
             return v
@@ -313,7 +329,8 @@ class OrderUpdateRequest(BaseModel):
             raise ValueError('sapOrder contains an invalid SAP')
         return v
 
-    @validator('updatedAt', pre=True)
+    @field_validator('updatedAt', mode='before')
+    @classmethod
     def validate_updated_at(cls, v):
         parsed = _parse_firestore_timestamp(v)
         return parsed if parsed is not None else v
@@ -497,14 +514,12 @@ class ApplyForecastItem(BaseModel):
     priorOrderContext: Optional[Dict[str, Any]] = None
     expiryReplacement: Optional[Dict[str, Any]] = None
 
-    class Config:
-        extra = "forbid"  # Reject unknown fields
+    model_config = ConfigDict(extra="forbid")
 
 
 class ApplyForecastRequest(BaseModel):
     """Request to apply forecast items to an order."""
     forecastId: str = ""
-    items: List[ApplyForecastItem] = []
+    items: List[ApplyForecastItem] = Field(default_factory=list)
 
-    class Config:
-        extra = "forbid"  # Reject unknown fields
+    model_config = ConfigDict(extra="forbid")
