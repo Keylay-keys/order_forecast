@@ -3,6 +3,7 @@ from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
 import forecast_generation_queue as queue
+from forecast_contract import ForecastContractError
 
 
 class _Doc:
@@ -93,6 +94,30 @@ class ForecastGenerationFreshnessV2Test(unittest.TestCase):
 
         self.assertEqual(result, "skipped_fresh")
         self.assertEqual(evaluate.call_args.args[-1], "derived-revision")
+
+    def test_worker_terminally_rejects_obsolete_schedule_without_retry(self):
+        job = {
+            "job_key": "988200::monday::2026-08-13",
+            "route_number": "988200",
+            "schedule_key": "monday",
+            "delivery_date": "2026-08-13",
+            "job_type": queue.JOB_TYPE_FORECAST_ONLY,
+        }
+        with patch(
+            "forecast_contract.load_authority_generation_state",
+            side_effect=ForecastContractError("schedule_not_active:monday"),
+        ), patch.object(queue, "_finish_job") as finish, patch.object(
+            queue, "_retry_or_fail_job"
+        ) as retry:
+            result = queue._process_claimed_job(
+                object(), "/tmp/service-account.json", job
+            )
+
+        self.assertEqual(result, "terminal_error")
+        finish.assert_called_once_with(
+            job["job_key"], "error", error_text="schedule_not_active:monday"
+        )
+        retry.assert_not_called()
 
 
 if __name__ == "__main__":

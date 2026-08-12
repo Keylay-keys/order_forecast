@@ -926,10 +926,17 @@ def _process_claimed_job(
     desired_revision = job.get("desired_revision")
     if not desired_revision:
         try:
-            from forecast_contract import load_authority_generation_state
+            from forecast_contract import ForecastContractError, load_authority_generation_state
             _active_keys, desired_revision = load_authority_generation_state(
                 fb_client, route_number, delivery_date, schedule_key
             )
+        except ForecastContractError as exc:
+            error_text = str(exc)
+            if error_text.startswith("schedule_not_active:"):
+                _finish_job(job_key, "error", error_text=error_text)
+                return "terminal_error"
+            _retry_or_fail_job(job, f"authority_revision_unavailable:{error_text}")
+            return "retry_or_error"
         except Exception as exc:
             _retry_or_fail_job(job, f"authority_revision_unavailable:{exc}")
             return "retry_or_error"
@@ -984,7 +991,13 @@ def process_generation_jobs_for_route(
 ) -> Dict[str, int]:
     ensure_forecast_queue_tables()
     lock_conn = _pg_connect(autocommit=True)
-    stats = {"claimed": 0, "done": 0, "skipped_fresh": 0, "retry_or_error": 0}
+    stats = {
+        "claimed": 0,
+        "done": 0,
+        "skipped_fresh": 0,
+        "retry_or_error": 0,
+        "terminal_error": 0,
+    }
     lock_key = f"forecast-route::{str(route_number)}"
 
     try:
