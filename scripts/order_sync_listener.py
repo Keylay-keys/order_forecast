@@ -964,12 +964,8 @@ def regenerate_forecasts_after_finalization(
         
         print(f"     📋 Next forecast target: {delivery_date} ({schedule_key})")
         
-        # Delete any existing forecast for this date (will be replaced)
-        deleted = delete_forecasts_for_dates(fb_client, route_number, [target])
-        if deleted > 0:
-            print(f"     🗑️  Deleted {deleted} stale forecast(s) for {delivery_date}")
-        
-        # Generate fresh forecast
+        # The publisher writes and verifies the replacement before removing any
+        # superseded exact artifact; callers must never create an availability gap.
         try:
             from forecast_engine import ForecastConfig, generate_forecast
             

@@ -189,6 +189,7 @@ try:
         load_promotions,
     )
     from .firebase_writer import write_cached_forecast, write_forecast_transfer_suggestions
+    from .forecast_contract import stable_fingerprint
     from .schedule_utils import (
         normalize_delivery_date,
         weekday_key,
@@ -214,6 +215,7 @@ except ImportError:
         load_promotions,
     )
     from firebase_writer import write_cached_forecast, write_forecast_transfer_suggestions
+    from forecast_contract import stable_fingerprint
     from schedule_utils import (
         normalize_delivery_date,
         weekday_key,
@@ -1388,6 +1390,64 @@ def _store_active_with_reason(
         return False, "inactive_store_item"
 
     return True, None
+
+
+def _complete_dense_active_carry(
+    items: List[ForecastItem],
+    stores_cfg: List[StoreConfig],
+    products: List[Product],
+    valid_store_ids: set,
+) -> List[ForecastItem]:
+    """Add an explicit zero row for every visible active store/SAP key."""
+    product_by_sap = {str(product.sap): product for product in products if getattr(product, "sap", None)}
+    by_key = {(str(item.store_id), str(item.sap)): item for item in items}
+    for store in stores_cfg:
+        store_id = str(store.store_id)
+        if store_id not in valid_store_ids:
+            continue
+        for raw_sap in sorted(set(store.active_saps or []), key=str):
+            sap = str(raw_sap)
+            product = product_by_sap.get(sap)
+            if product is None or (store_id, sap) in by_key:
+                continue
+            case_pack = product.case_pack or product.tray
+            by_key[(store_id, sap)] = ForecastItem(
+                store_id=store_id,
+                store_name=store.store_name,
+                sap=sap,
+                recommended_units=0.0,
+                recommended_cases=0.0 if case_pack else None,
+                p10_units=0.0,
+                p50_units=0.0,
+                p90_units=0.0,
+                source="dense_zero",
+                confidence=0.0,
+            )
+    return [by_key[key] for key in sorted(by_key)]
+
+
+def _generation_input_fingerprint(
+    route_number: str,
+    delivery_date: str,
+    schedule_key: str,
+    dense_items: List[ForecastItem],
+    products: List[Product],
+) -> str:
+    case_pack_by_sap = {
+        str(product.sap): int(product.case_pack or product.tray or 0)
+        for product in products
+        if getattr(product, "sap", None)
+    }
+    return stable_fingerprint({
+        "contractVersion": 2,
+        "routeNumber": str(route_number),
+        "deliveryDate": delivery_date,
+        "scheduleKey": schedule_key,
+        "activeCarry": [
+            [str(item.store_id), str(item.sap), case_pack_by_sap.get(str(item.sap), 0)]
+            for item in sorted(dense_items, key=lambda row: (str(row.store_id), str(row.sap)))
+        ],
+    })
 
 
 def _filter_orders_by_schedule(orders, schedule_key: str):
@@ -2805,6 +2865,9 @@ def generate_forecast(config: ForecastConfig) -> ForecastPayload:
                 active_promos=active_promos,
             )
             if fallback_items:
+                fallback_items = _complete_dense_active_carry(
+                    fallback_items, stores_cfg, products, valid_store_ids
+                )
                 print(
                     f"[forecast] Fallback to last order (schedule={schedule_key}) "
                     f"mode={mode_decision.mode} reason={mode_decision.reason} "
@@ -2819,6 +2882,14 @@ def generate_forecast(config: ForecastConfig) -> ForecastPayload:
                     schedule_key=schedule_key,
                     generated_at=datetime.utcnow(),
                     items=fallback_items,
+                    generation_mode="last_order",
+                    generation_input_fingerprint=_generation_input_fingerprint(
+                        config.route_number,
+                        delivery_iso,
+                        schedule_key,
+                        fallback_items,
+                        products,
+                    ),
                 )
                 # Write to Firebase cache (same as ML path)
                 write_cached_forecast(
@@ -3719,6 +3790,7 @@ def generate_forecast(config: ForecastConfig) -> ForecastPayload:
     except Exception:
         pass
 
+    items = _complete_dense_active_carry(items, stores_cfg, products, valid_store_ids)
     forecast = ForecastPayload(
         forecast_id=str(uuid.uuid4()),
         route_number=config.route_number,
@@ -3726,6 +3798,14 @@ def generate_forecast(config: ForecastConfig) -> ForecastPayload:
         schedule_key=schedule_key,
         generated_at=datetime.utcnow(),
         items=items,
+        generation_mode="model",
+        generation_input_fingerprint=_generation_input_fingerprint(
+            config.route_number,
+            delivery_iso,
+            schedule_key,
+            items,
+            products,
+        ),
     )
 
     # Write to Firestore cache

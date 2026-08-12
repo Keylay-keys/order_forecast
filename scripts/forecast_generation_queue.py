@@ -127,6 +127,9 @@ def ensure_forecast_queue_tables() -> None:
                 ADD COLUMN IF NOT EXISTS job_type VARCHAR(32) NOT NULL DEFAULT 'forecast_only'
                 """
             )
+            cur.execute("ALTER TABLE forecast_generation_jobs ADD COLUMN IF NOT EXISTS desired_revision TEXT")
+            cur.execute("ALTER TABLE forecast_generation_jobs ADD COLUMN IF NOT EXISTS refresh_reason TEXT")
+            cur.execute("ALTER TABLE forecast_generation_jobs ADD COLUMN IF NOT EXISTS rerun_requested BOOLEAN NOT NULL DEFAULT FALSE")
     finally:
         conn.close()
 
@@ -607,6 +610,8 @@ def enqueue_generation_job(
     source: str,
     job_type: str = JOB_TYPE_FORECAST_ONLY,
     finalize_key: Optional[str] = None,
+    desired_revision: Optional[str] = None,
+    refresh_reason: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     ensure_forecast_queue_tables()
     sk = normalize_schedule_key(schedule_key)
@@ -624,9 +629,10 @@ def enqueue_generation_job(
                 INSERT INTO forecast_generation_jobs (
                     job_key, route_number, schedule_key, delivery_date,
                     job_type, source, finalize_key, status, attempts, max_attempts,
-                    trigger_count, available_at, updated_at, last_triggered_at
+                    trigger_count, available_at, updated_at, last_triggered_at,
+                    desired_revision, refresh_reason
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, 'queued', 0, %s, 1, NOW(), NOW(), NOW())
+                VALUES (%s, %s, %s, %s, %s, %s, %s, 'queued', 0, %s, 1, NOW(), NOW(), NOW(), %s, %s)
                 ON CONFLICT (job_key) DO UPDATE SET
                     job_type = CASE
                         WHEN forecast_generation_jobs.job_type = %s
@@ -639,23 +645,43 @@ def enqueue_generation_job(
                     trigger_count = forecast_generation_jobs.trigger_count + 1,
                     last_triggered_at = NOW(),
                     updated_at = NOW(),
+                    desired_revision = COALESCE(EXCLUDED.desired_revision, forecast_generation_jobs.desired_revision),
+                    refresh_reason = COALESCE(EXCLUDED.refresh_reason, forecast_generation_jobs.refresh_reason),
+                    rerun_requested = CASE
+                        WHEN forecast_generation_jobs.status = 'running'
+                         AND EXCLUDED.desired_revision IS NOT NULL
+                         AND EXCLUDED.desired_revision IS DISTINCT FROM forecast_generation_jobs.desired_revision
+                            THEN TRUE
+                        ELSE forecast_generation_jobs.rerun_requested
+                    END,
                     status = CASE
                         WHEN forecast_generation_jobs.status = 'error' THEN 'queued'
+                        WHEN forecast_generation_jobs.status <> 'running'
+                         AND EXCLUDED.desired_revision IS NOT NULL
+                         AND EXCLUDED.desired_revision IS DISTINCT FROM forecast_generation_jobs.desired_revision
+                            THEN 'queued'
                         ELSE forecast_generation_jobs.status
                     END,
                     attempts = CASE
-                        WHEN forecast_generation_jobs.status = 'error' THEN 0
+                        WHEN forecast_generation_jobs.status = 'error'
+                          OR (EXCLUDED.desired_revision IS NOT NULL
+                           AND EXCLUDED.desired_revision IS DISTINCT FROM forecast_generation_jobs.desired_revision)
+                            THEN 0
                         ELSE forecast_generation_jobs.attempts
                     END,
                     available_at = CASE
-                        WHEN forecast_generation_jobs.status = 'error' THEN NOW()
+                        WHEN forecast_generation_jobs.status = 'error'
+                          OR (forecast_generation_jobs.status <> 'running'
+                           AND EXCLUDED.desired_revision IS NOT NULL
+                           AND EXCLUDED.desired_revision IS DISTINCT FROM forecast_generation_jobs.desired_revision)
+                            THEN NOW()
                         ELSE forecast_generation_jobs.available_at
                     END,
                     last_error = CASE
                         WHEN forecast_generation_jobs.status = 'error' THEN NULL
                         ELSE forecast_generation_jobs.last_error
                     END
-                RETURNING job_key, route_number, schedule_key, delivery_date, job_type, status, attempts, source
+                RETURNING job_key, route_number, schedule_key, delivery_date, job_type, status, attempts, source, desired_revision, refresh_reason, rerun_requested
                 """,
                 [
                     job_key,
@@ -666,6 +692,8 @@ def enqueue_generation_job(
                     str(source),
                     finalize_key,
                     max_attempts,
+                    desired_revision,
+                    refresh_reason,
                     JOB_TYPE_RETRAIN_THEN_FORECAST,
                     JOB_TYPE_RETRAIN_THEN_FORECAST,
                     JOB_TYPE_RETRAIN_THEN_FORECAST,
@@ -738,7 +766,7 @@ def _select_latest_cached_forecast_meta(
         docs = [doc for doc in cached_ref.stream() if (doc.to_dict() or {}).get("deliveryDate") == delivery_date and (doc.to_dict() or {}).get("scheduleKey") == schedule_key]
     if not docs:
         return None
-    docs.sort(key=lambda d: _to_utc_datetime((d.to_dict() or {}).get("createdAt")) or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
+    docs.sort(key=lambda d: _to_utc_datetime((d.to_dict() or {}).get("publishedAt")) or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
     return docs[0].to_dict() or {}
 
 
@@ -748,6 +776,7 @@ def _evaluate_job_freshness(
     delivery_date: str,
     schedule_key: str,
     job_type: str = JOB_TYPE_FORECAST_ONLY,
+    desired_revision: Optional[str] = None,
 ) -> Tuple[bool, str]:
     normalized_job_type = normalize_job_type(job_type)
     if normalized_job_type == JOB_TYPE_RETRAIN_THEN_FORECAST:
@@ -756,12 +785,16 @@ def _evaluate_job_freshness(
     meta = _select_latest_cached_forecast_meta(fb_client, route_number, delivery_date, schedule_key)
     if not meta:
         return False, "missing"
+    if meta.get("schemaVersion") != 2 or meta.get("state") != "ready":
+        return False, "unsupported_or_unready"
+    if desired_revision and meta.get("generationInputFingerprint") != desired_revision:
+        return False, "generation_input_changed"
     now = datetime.now(timezone.utc)
     expires_at = _to_utc_datetime(meta.get("expiresAt"))
     if expires_at and expires_at <= now:
         return False, "expired"
 
-    generated_at = _to_utc_datetime(meta.get("generatedAt")) or _to_utc_datetime(meta.get("createdAt"))
+    generated_at = _to_utc_datetime(meta.get("generatedAt")) or _to_utc_datetime(meta.get("publishedAt"))
     if not generated_at:
         return True, "non_expired_no_generated_at"
 
@@ -778,10 +811,14 @@ def _finish_job(job_key: str, status: str, skipped_reason: Optional[str] = None,
             cur.execute(
                 """
                 UPDATE forecast_generation_jobs
-                SET status = %s,
+                SET status = CASE WHEN rerun_requested THEN 'queued' ELSE %s END,
                     skipped_reason = %s,
                     last_error = %s,
-                    finished_at = NOW(),
+                    finished_at = CASE WHEN rerun_requested THEN NULL ELSE NOW() END,
+                    available_at = CASE WHEN rerun_requested THEN NOW() ELSE available_at END,
+                    claimed_by = CASE WHEN rerun_requested THEN NULL ELSE claimed_by END,
+                    claimed_at = CASE WHEN rerun_requested THEN NULL ELSE claimed_at END,
+                    rerun_requested = FALSE,
                     updated_at = NOW()
                 WHERE job_key = %s
                 """,
@@ -854,6 +891,7 @@ def _process_claimed_job(
         delivery_date,
         schedule_key,
         job_type,
+        job.get("desired_revision"),
     )
     if is_fresh:
         _finish_job(job_key, "skipped_fresh", skipped_reason=reason)
@@ -924,6 +962,28 @@ def process_generation_jobs_for_route(
         except Exception:
             pass
         lock_conn.close()
+
+
+def list_queued_generation_routes(limit: int = 100) -> List[str]:
+    """Return routes with runnable work for the dedicated queue drainer."""
+    ensure_forecast_queue_tables()
+    conn = _pg_connect(autocommit=True)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT route_number
+                FROM forecast_generation_jobs
+                WHERE status = 'queued' AND available_at <= NOW()
+                GROUP BY route_number
+                ORDER BY MIN(available_at), route_number
+                LIMIT %s
+                """,
+                [max(1, int(limit))],
+            )
+            return [str(row[0]) for row in (cur.fetchall() or [])]
+    finally:
+        conn.close()
 
 
 def reconcile_finalize_event(finalize_key: str) -> Dict[str, Any]:

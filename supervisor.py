@@ -231,6 +231,15 @@ def create_services(route: str, sa_path: str, db_path: str) -> List[Service]:
             ],
             log_file=LOG_DIR / 'retrain_daemon.log',
         ),
+        Service(
+            name="Forecast Generation Worker",
+            cmd=[
+                python,
+                str(SCRIPTS_DIR / 'forecast_generation_worker.py'),
+                '--serviceAccount', sa_path,
+            ],
+            log_file=LOG_DIR / 'forecast_generation_worker.log',
+        ),
         # Delivery manifest requests from app
         Service(
             name="Delivery Manifest Listener",
@@ -399,7 +408,7 @@ def cmd_stop(args):
     time.sleep(0.5)
     
     # Now stop individual services
-    patterns = ['db_manager.py', 'order_sync_listener.py', 'order_archive_listener.py', 'archive_export_worker.py', 'archive_purge_worker.py', 'retrain_daemon.py', 'delivery_manifest_listener.py', 'promo_email_listener.py', 'catalog_upload_listener.py', 'low_qty_notification_daemon.py', 'api.main:app', 'pcf_core.runner']
+    patterns = ['db_manager.py', 'order_sync_listener.py', 'order_archive_listener.py', 'archive_export_worker.py', 'archive_purge_worker.py', 'retrain_daemon.py', 'forecast_generation_worker.py', 'delivery_manifest_listener.py', 'promo_email_listener.py', 'catalog_upload_listener.py', 'low_qty_notification_daemon.py', 'api.main:app', 'pcf_core.runner']
     
     for pattern in patterns:
         try:
@@ -441,6 +450,7 @@ def cmd_status(args):
         ('Archive Export Worker', 'archive_export_worker.py'),
         ('Archive Purge Worker', 'archive_purge_worker.py'),
         ('Retrain Daemon', 'retrain_daemon.py'),
+        ('Forecast Generation Worker', 'forecast_generation_worker.py'),
         ('Delivery Manifest', 'delivery_manifest_listener.py'),
         ('Promo Email', 'promo_email_listener.py'),
         ('Catalog Upload', 'catalog_upload_listener.py'),

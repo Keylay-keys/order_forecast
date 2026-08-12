@@ -126,6 +126,8 @@ class ForecastPayload:
     schedule_key: str
     generated_at: datetime
     items: List[ForecastItem] = field(default_factory=list)
+    generation_mode: str = "model"
+    generation_input_fingerprint: str = ""
 
 
 @dataclass

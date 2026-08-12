@@ -18,8 +18,10 @@ from google.cloud.firestore_v1.base_query import FieldFilter
 try:
     from .models import ForecastPayload
     from .pg_utils import fetch_all as pg_fetch_all
+    from .forecast_contract import artifact_semantic_payload, key_fingerprint, stable_fingerprint, validate_ready_artifact
 except ImportError:
     from models import ForecastPayload
+    from forecast_contract import artifact_semantic_payload, key_fingerprint, stable_fingerprint, validate_ready_artifact
     try:
         from pg_utils import fetch_all as pg_fetch_all
     except Exception:
@@ -63,7 +65,7 @@ def _serialize_whole_case_adjustment(adj: object) -> Optional[dict]:
         return None
 
 
-def _archive_forecast_to_disk(route_number: str, forecast: ForecastPayload, expires_at: datetime) -> None:
+def _archive_forecast_to_disk(route_number: str, forecast: ForecastPayload, payload: dict) -> None:
     """Persist a copy of a forecast to local disk (server HDD).
 
     This is intentionally separate from Firestore. Cached forecasts in Firestore are TTL-based
@@ -82,45 +84,11 @@ def _archive_forecast_to_disk(route_number: str, forecast: ForecastPayload, expi
     )
     os.makedirs(target_dir, exist_ok=True)
 
-    payload = {
-        "forecastId": forecast.forecast_id,
-        "routeNumber": str(route_number),
-        "deliveryDate": str(forecast.delivery_date),
-        "scheduleKey": str(forecast.schedule_key),
-        "generatedAt": _iso(forecast.generated_at),
-        "expiresAt": _iso(expires_at),
-        "items": [
-            {
-                "storeId": item.store_id,
-                "storeName": item.store_name,
-                "sap": item.sap,
-                "recommendedUnits": item.recommended_units,
-                "recommendedCases": item.recommended_cases,
-                "p10Units": item.p10_units,
-                "p50Units": item.p50_units,
-                "p90Units": item.p90_units,
-                "promoActive": item.promo_active,
-                "promoLiftPct": item.promo_lift_pct,
-                "isFirstWeekend": item.is_first_weekend,
-                "confidence": item.confidence,
-                "source": item.source,
-                **({"priorOrderContext": {
-                    "orderId": item.prior_order_context.order_id,
-                    "orderDate": item.prior_order_context.order_date,
-                    "deliveryDate": item.prior_order_context.delivery_date,
-                    "quantity": item.prior_order_context.quantity,
-                    "scheduleKey": item.prior_order_context.schedule_key,
-                }} if item.prior_order_context else {}),
-                **({"expiryReplacement": {
-                    "expiryDate": item.expiry_replacement.expiry_date,
-                    "minUnitsRequired": item.expiry_replacement.min_units_required,
-                    "reason": item.expiry_replacement.reason,
-                }} if item.expiry_replacement else {}),
-                **({"wholeCaseAdjustment": wca}
-                   if (wca := _serialize_whole_case_adjustment(item.whole_case_adjustment)) else {}),
-            }
-            for item in forecast.items
-        ],
+    archive_payload = {
+        **payload,
+        "generatedAt": _iso(payload.get("generatedAt")),
+        "publishedAt": _iso(payload.get("publishedAt")),
+        "expiresAt": _iso(payload.get("expiresAt")),
         "archivedAt": datetime.utcnow().isoformat() + "Z",
     }
 
@@ -128,7 +96,7 @@ def _archive_forecast_to_disk(route_number: str, forecast: ForecastPayload, expi
     fd, tmp_path = tempfile.mkstemp(dir=target_dir, prefix=f"{forecast.forecast_id}.", suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
+            json.dump(archive_payload, f, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
             f.write("\n")
         os.replace(tmp_path, final_path)
     finally:
@@ -733,81 +701,109 @@ def write_forecast_transfer_suggestions(
         )
 
 
+def _serialize_forecast_items(forecast: ForecastPayload) -> List[dict]:
+    rows: List[dict] = []
+    for item in forecast.items:
+        units = int(round(float(item.recommended_units or 0)))
+        rows.append({
+            "storeId": str(item.store_id),
+            "storeName": item.store_name,
+            "sap": str(item.sap),
+            "recommendedUnits": units,
+            "recommendedCases": item.recommended_cases,
+            "p10Units": item.p10_units,
+            "p50Units": item.p50_units,
+            "p90Units": item.p90_units,
+            "promoActive": item.promo_active,
+            "promoLiftPct": item.promo_lift_pct,
+            "isFirstWeekend": item.is_first_weekend,
+            "confidence": item.confidence,
+            "source": item.source or "unknown",
+            **({"priorOrderContext": {
+                "orderId": item.prior_order_context.order_id,
+                "orderDate": item.prior_order_context.order_date,
+                "deliveryDate": item.prior_order_context.delivery_date,
+                "quantity": item.prior_order_context.quantity,
+                "scheduleKey": item.prior_order_context.schedule_key,
+            }} if item.prior_order_context else {}),
+            **({"expiryReplacement": {
+                "expiryDate": item.expiry_replacement.expiry_date,
+                "minUnitsRequired": item.expiry_replacement.min_units_required,
+                "reason": item.expiry_replacement.reason,
+            }} if item.expiry_replacement else {}),
+            **({"wholeCaseAdjustment": adjustment}
+               if (adjustment := _serialize_whole_case_adjustment(item.whole_case_adjustment)) else {}),
+        })
+    return sorted(rows, key=lambda row: (row["storeId"], row["sap"]))
+
+
+def _build_ready_forecast_payload(
+    route_number: str,
+    forecast: ForecastPayload,
+    expires_at: datetime,
+    published_at: datetime,
+) -> dict:
+    items = _serialize_forecast_items(forecast)
+    keys = {(row["storeId"], row["sap"]) for row in items}
+    if len(keys) != len(items):
+        raise ValueError("duplicate forecast store/SAP key")
+    payload = {
+        "schemaVersion": 2,
+        "state": "ready",
+        "forecastId": forecast.forecast_id,
+        "generationMode": forecast.generation_mode,
+        "routeNumber": str(route_number),
+        "deliveryDate": forecast.delivery_date,
+        "scheduleKey": forecast.schedule_key,
+        "generatedAt": _ts(forecast.generated_at),
+        "publishedAt": published_at,
+        "expiresAt": expires_at,
+        "generationInputFingerprint": forecast.generation_input_fingerprint,
+        "eligibility": {
+            "activeCarryItemCount": len(keys),
+            "emittedItemCount": len(items),
+            "zeroItemCount": sum(row["recommendedUnits"] == 0 for row in items),
+            "activeCarryFingerprint": key_fingerprint(keys),
+        },
+        "items": items,
+    }
+    payload["artifactFingerprint"] = stable_fingerprint(artifact_semantic_payload(payload))
+    validate_ready_artifact(
+        payload,
+        route_number=str(route_number),
+        delivery_date=forecast.delivery_date,
+        schedule_key=forecast.schedule_key,
+        active_carry_keys=keys,
+    )
+    return payload
+
+
 def write_cached_forecast(
     db: firestore.Client,
     route_number: str,
     forecast: ForecastPayload,
     ttl_days: int = 7,
 ) -> None:
-    """Write a forecast to forecasts/{route}/cached/{forecastId} with TTL.
-    
-    Deletes any existing forecasts for the same delivery_date/schedule_key
-    to prevent duplicates from piling up.
-    """
+    """Validate, archive, then safely publish one ready schema-v2 forecast."""
     # Just use datetime - Firestore auto-converts to Timestamp
     expires_at = forecast.generated_at + timedelta(days=ttl_days)
     
-    # Delete existing forecasts for the same delivery/schedule to prevent duplicates
     cached_ref = db.collection("forecasts").document(route_number).collection("cached")
+    published_at = datetime.utcnow()
+    payload = _build_ready_forecast_payload(route_number, forecast, expires_at, published_at)
+    _archive_forecast_to_disk(route_number=route_number, forecast=forecast, payload=payload)
+
+    # Publish first. A failed set leaves the previous exact artifact available.
+    cached_ref.document(forecast.forecast_id).set(payload)
+
     existing = cached_ref.where(filter=FieldFilter("deliveryDate", "==", forecast.delivery_date))\
-                        .where(filter=FieldFilter("scheduleKey", "==", forecast.schedule_key))\
-                        .stream()
-    
+        .where(filter=FieldFilter("scheduleKey", "==", forecast.schedule_key))\
+        .stream()
     deleted_count = 0
     for old_doc in existing:
+        if getattr(old_doc, "id", None) == forecast.forecast_id:
+            continue
         old_doc.reference.delete()
         deleted_count += 1
-    
-    if deleted_count > 0:
-        print(f"[firebase_writer] Deleted {deleted_count} existing forecast(s) for {forecast.delivery_date}/{forecast.schedule_key}")
-
-    doc_ref = db.collection("forecasts").document(route_number).collection("cached").document(
-        forecast.forecast_id
-    )
-
-    doc_ref.set(
-        {
-            "forecastId": forecast.forecast_id,
-            "routeNumber": route_number,
-            "deliveryDate": forecast.delivery_date,
-            "scheduleKey": forecast.schedule_key,
-            "generatedAt": _ts(forecast.generated_at),
-            "expiresAt": expires_at,
-            "items": [
-                {
-                    "storeId": item.store_id,
-                    "storeName": item.store_name,
-                    "sap": item.sap,
-                    "recommendedUnits": item.recommended_units,
-                    "recommendedCases": item.recommended_cases,
-                    "p10Units": item.p10_units,
-                    "p50Units": item.p50_units,
-                    "p90Units": item.p90_units,
-                    "promoActive": item.promo_active,
-                    "promoLiftPct": item.promo_lift_pct,
-                    "isFirstWeekend": item.is_first_weekend,
-                    "confidence": item.confidence,
-                    "source": item.source,
-                    # Prior order context for overlapping deliveries
-                    **({"priorOrderContext": {
-                        "orderId": item.prior_order_context.order_id,
-                        "orderDate": item.prior_order_context.order_date,
-                        "deliveryDate": item.prior_order_context.delivery_date,
-                        "quantity": item.prior_order_context.quantity,
-                        "scheduleKey": item.prior_order_context.schedule_key,
-                    }} if item.prior_order_context else {}),
-                    # Expiry replacement metadata for low-qty floor injection
-                    **({"expiryReplacement": {
-                        "expiryDate": item.expiry_replacement.expiry_date,
-                        "minUnitsRequired": item.expiry_replacement.min_units_required,
-                        "reason": item.expiry_replacement.reason,
-                    }} if item.expiry_replacement else {}),
-                    **({"wholeCaseAdjustment": wca}
-                       if (wca := _serialize_whole_case_adjustment(item.whole_case_adjustment)) else {}),
-                }
-                for item in forecast.items
-            ],
-            "createdAt": firestore.SERVER_TIMESTAMP,
-        }
-    )
-    _archive_forecast_to_disk(route_number=route_number, forecast=forecast, expires_at=expires_at)
+    if deleted_count:
+        print(f"[firebase_writer] Removed {deleted_count} superseded forecast(s) after safe publication")
