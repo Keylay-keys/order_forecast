@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time as datetime_time, timedelta, timezone
 import hashlib
 import hmac
 import logging
@@ -14,6 +14,7 @@ from threading import Lock, Thread
 import time
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 from uuid import UUID
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from psycopg2.extras import RealDictCursor
 
@@ -30,6 +31,7 @@ _REQUEST_QUEUE: Queue["ApiUsageRequest"] = Queue(maxsize=2000)
 _WORKER_LOCK = Lock()
 _WORKER_STARTED = False
 _IDENTITY_CACHE: Dict[Tuple[str, str], Tuple[float, "ActorContext"]] = {}
+_DEFAULT_REPORTING_TIME_ZONE = "America/Denver"
 
 
 _FEATURE_PREFIXES: Tuple[Tuple[str, str], ...] = (
@@ -79,6 +81,35 @@ class ActorContext:
     actor_hash: str
     route_number: str
     actor_role: str
+
+
+def _reporting_timezone() -> Tuple[str, ZoneInfo]:
+    configured = os.environ.get(
+        "USAGE_ANALYTICS_TIME_ZONE",
+        _DEFAULT_REPORTING_TIME_ZONE,
+    ).strip() or _DEFAULT_REPORTING_TIME_ZONE
+    try:
+        return configured, ZoneInfo(configured)
+    except ZoneInfoNotFoundError:
+        logger.error(
+            "Invalid USAGE_ANALYTICS_TIME_ZONE=%s; falling back to %s",
+            configured,
+            _DEFAULT_REPORTING_TIME_ZONE,
+        )
+        return _DEFAULT_REPORTING_TIME_ZONE, ZoneInfo(_DEFAULT_REPORTING_TIME_ZONE)
+
+
+def _reporting_date(value: datetime) -> date:
+    _name, reporting_tz = _reporting_timezone()
+    observed = value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+    return observed.astimezone(reporting_tz).date()
+
+
+def _reporting_range_instants(start_date: date, end_date: date) -> Tuple[datetime, datetime]:
+    _name, reporting_tz = _reporting_timezone()
+    start = datetime.combine(start_date, datetime_time.min, tzinfo=reporting_tz)
+    end_exclusive = datetime.combine(end_date + timedelta(days=1), datetime_time.min, tzinfo=reporting_tz)
+    return start.astimezone(timezone.utc), end_exclusive.astimezone(timezone.utc)
 
 
 def build_actor_hash(uid: str, secret: Optional[str] = None) -> str:
@@ -185,7 +216,7 @@ def record_api_request(
                     last_seen_at = GREATEST(api_usage_daily.last_seen_at, EXCLUDED.last_seen_at)
                 """,
                 (
-                    observed_at.date(),
+                    _reporting_date(observed_at),
                     actor_hash,
                     route_number,
                     actor_role,
@@ -358,8 +389,11 @@ def get_usage_summary(
 ) -> Dict[str, Any]:
     """Return route/role aggregates without exposing actor identifiers."""
 
-    end_date = (now or datetime.now(timezone.utc)).date()
+    reporting_time_zone, _reporting_tz = _reporting_timezone()
+    observed_now = now or datetime.now(timezone.utc)
+    end_date = _reporting_date(observed_now)
     start_date = end_date - timedelta(days=days - 1)
+    start_instant, end_exclusive = _reporting_range_instants(start_date, end_date)
     route_clause = " AND route_number = %s" if route_number else ""
     params: List[Any] = [start_date, end_date]
     if route_number:
@@ -478,7 +512,7 @@ def get_usage_summary(
         )
         route_features = _rows(cur)
 
-        error_params: List[Any] = [start_date, end_date]
+        error_params: List[Any] = [start_instant, end_exclusive]
         error_route_clause = ""
         if route_number:
             error_route_clause = " AND route_number = %s"
@@ -496,8 +530,8 @@ def get_usage_summary(
                 error_code AS "errorCode",
                 request_id::TEXT AS "requestId"
             FROM api_usage_errors
-            WHERE occurred_at >= %s::DATE
-              AND occurred_at < (%s::DATE + INTERVAL '1 day'){error_route_clause}
+            WHERE occurred_at >= %s
+              AND occurred_at < %s{error_route_clause}
             ORDER BY occurred_at DESC
             LIMIT 201
             """,
@@ -506,7 +540,12 @@ def get_usage_summary(
         recent_errors = _rows(cur)
 
     return {
-        "range": {"days": days, "startDate": start_date.isoformat(), "endDate": end_date.isoformat()},
+        "range": {
+            "days": days,
+            "startDate": start_date.isoformat(),
+            "endDate": end_date.isoformat(),
+            "timeZone": reporting_time_zone,
+        },
         "totals": {key: int(value or 0) for key, value in totals.items()},
         "features": _serialize_rows(features),
         "transferRollup": {

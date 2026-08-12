@@ -213,6 +213,21 @@ class UsageAnalyticsTests(unittest.TestCase):
         self.assertEqual(params[5], 1)
         self.assertEqual(params[6], 404)
 
+    def test_activity_date_uses_mountain_time_instead_of_utc(self):
+        connection = _FakeConnection()
+        usage_analytics.record_api_request(
+            connection,
+            actor_hash="a" * 64,
+            route_number="989262",
+            actor_role="owner",
+            feature_key="reference_catalog",
+            status_code=200,
+            now=datetime(2026, 8, 11, 3, 10, tzinfo=timezone.utc),
+        )
+
+        _sql, params = connection.statements[0]
+        self.assertEqual(params[0].isoformat(), "2026-08-10")
+
     def test_records_safe_error_event_and_prunes_old_events(self):
         connection = _FakeConnection()
         request_id = "77ee4c94-0265-43bc-9d66-288573534bb9"
@@ -334,7 +349,7 @@ class UsageAnalyticsTests(unittest.TestCase):
             connection,
             days=7,
             route_number="989262",
-            now=datetime(2026, 8, 6, tzinfo=timezone.utc),
+            now=datetime(2026, 8, 6, 12, tzinfo=timezone.utc),
         )
 
         self.assertEqual(result["totals"]["uniqueUsers"], 2)
@@ -350,8 +365,42 @@ class UsageAnalyticsTests(unittest.TestCase):
         self.assertEqual(result["recentErrors"][0]["endpoint"], "/api/catalog/starter/items/{sap}")
         self.assertEqual(result["recentErrors"][0]["statusCode"], 404)
         self.assertFalse(result["errorsTruncated"])
+        self.assertEqual(result["range"]["timeZone"], "America/Denver")
+        self.assertEqual(result["range"]["endDate"], "2026-08-06")
         self.assertNotIn("actor_hash", str(result))
         self.assertNotIn("firebase", str(result))
+
+    def test_summary_range_does_not_advance_at_utc_midnight(self):
+        connection = _SummaryConnection([
+            {}, [], {}, [], [], [], [],
+        ])
+
+        result = usage_analytics.get_usage_summary(
+            connection,
+            days=7,
+            now=datetime(2026, 8, 11, 3, 10, tzinfo=timezone.utc),
+        )
+
+        self.assertEqual(result["range"]["endDate"], "2026-08-10")
+        self.assertEqual(result["range"]["startDate"], "2026-08-04")
+        recent_error_params = connection.statements[-1][1]
+        self.assertEqual(recent_error_params[0].isoformat(), "2026-08-04T06:00:00+00:00")
+        self.assertEqual(recent_error_params[1].isoformat(), "2026-08-11T06:00:00+00:00")
+
+    def test_summary_error_range_honors_mountain_daylight_saving_transition(self):
+        connection = _SummaryConnection([
+            {}, [], {}, [], [], [], [],
+        ])
+
+        usage_analytics.get_usage_summary(
+            connection,
+            days=7,
+            now=datetime(2026, 11, 4, 3, 10, tzinfo=timezone.utc),
+        )
+
+        recent_error_params = connection.statements[-1][1]
+        self.assertEqual(recent_error_params[0].isoformat(), "2026-10-28T06:00:00+00:00")
+        self.assertEqual(recent_error_params[1].isoformat(), "2026-11-04T07:00:00+00:00")
 
     def test_admin_access_requires_claim_or_allowlisted_uid(self):
         with patch.dict(os.environ, {"USAGE_ANALYTICS_ADMIN_UIDS": "allowed-uid"}, clear=False):
