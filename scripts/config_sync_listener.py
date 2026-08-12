@@ -431,6 +431,7 @@ def sync_user_schedules_to_pg(route_number: str, user_id: str, order_cycles: Lis
                         )
                         VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                         ON CONFLICT (id) DO UPDATE SET
+                            user_id = EXCLUDED.user_id,
                             order_day = EXCLUDED.order_day,
                             load_day = EXCLUDED.load_day,
                             delivery_day = EXCLUDED.delivery_day,
@@ -465,6 +466,34 @@ def sync_user_schedules_to_pg(route_number: str, user_id: str, order_cycles: Lis
         return False
     finally:
         close_pg_connection(conn)
+
+
+def resolve_route_owner_user_id(
+    fb_client: firestore.Client,
+    route_number: str,
+    fallback_user_id: str,
+) -> str:
+    """Resolve the same Firebase schedule authority used by forecast attachment.
+
+    `routes_synced.user_id` is a discovery hint, not route ownership authority.
+    Test/migrated routes can have multiple user profiles claiming the same route,
+    so following that stale projection can sync one user's cycles while the
+    generator reads `routes/{route}.ownerUid`. Prefer the route document pointer
+    and retain the PostgreSQL user only as a compatibility fallback.
+    """
+    try:
+        snapshot = fb_client.collection('routes').document(str(route_number)).get()
+        if snapshot.exists:
+            data = snapshot.to_dict() or {}
+            owner_user_id = str(data.get('ownerUid') or data.get('userId') or '').strip()
+            if owner_user_id:
+                return owner_user_id
+    except Exception as exc:
+        print(
+            f"  [Schedule] ⚠️ Could not resolve route owner for {route_number};"
+            f" using discovery fallback: {exc}"
+        )
+    return str(fallback_user_id or '').strip()
 
 
 # =============================================================================
@@ -667,10 +696,24 @@ class ConfigSyncManager:
         if route_number in self.known_routes:
             return  # Already listening
 
+        authority_user_id = resolve_route_owner_user_id(
+            self.fb_client,
+            route_number,
+            user_id,
+        )
+        if not authority_user_id:
+            print(f"  [Schedule] ⚠️ No owner authority found for route {route_number}")
+            return
+        if authority_user_id != user_id:
+            print(
+                f"  [Schedule] Route {route_number} owner authority overrides"
+                f" routes_synced user {user_id} -> {authority_user_id}"
+            )
+
         print(f"\n[+] Starting listeners for route {route_number}")
         self.start_stores_listener(route_number)
         self.start_products_listener(route_number)
-        self.start_schedules_listener(user_id, route_number)
+        self.start_schedules_listener(authority_user_id, route_number)
         self.known_routes.add(route_number)
 
     def discover_and_start_listeners(self) -> None:

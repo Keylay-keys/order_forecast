@@ -36,6 +36,23 @@ class _WatchReference:
         return MagicMock()
 
 
+class _RouteAuthorityReference(_WatchReference):
+    def __init__(self, route_owner):
+        super().__init__()
+        self.route_owner = route_owner
+        self.document_ids = []
+
+    def document(self, document_id):
+        self.document_ids.append(document_id)
+        return self
+
+    def get(self):
+        return _Document(
+            self.document_ids[-1] if self.document_ids else 'route',
+            {'ownerUid': self.route_owner},
+        )
+
+
 class ConfigSyncForecastEnqueueTests(unittest.TestCase):
     @staticmethod
     def _schedule_data(cycles):
@@ -70,6 +87,32 @@ class ConfigSyncForecastEnqueueTests(unittest.TestCase):
         manager._schedule_forecast_refresh.assert_called_once_with(
             "988200", "store_or_carry_change"
         )
+
+    def test_route_document_owner_overrides_stale_routes_synced_user(self):
+        reference = _RouteAuthorityReference('firebase-owner')
+        manager = listener.ConfigSyncManager(reference)
+        manager.start_stores_listener = MagicMock()
+        manager.start_products_listener = MagicMock()
+        manager.start_schedules_listener = MagicMock()
+
+        manager.start_route_listeners('988200', 'stale-pg-user')
+
+        manager.start_schedules_listener.assert_called_once_with(
+            'firebase-owner', '988200'
+        )
+        self.assertIn('988200', manager.known_routes)
+
+    def test_route_owner_resolution_falls_back_when_route_document_is_unavailable(self):
+        reference = MagicMock()
+        reference.collection.side_effect = RuntimeError('firestore unavailable')
+
+        resolved = listener.resolve_route_owner_user_id(
+            reference,
+            '988200',
+            'fallback-user',
+        )
+
+        self.assertEqual(resolved, 'fallback-user')
 
     def test_product_name_change_coalesces_but_case_pack_change_refreshes(self):
         reference = _WatchReference()
@@ -182,6 +225,8 @@ class ConfigSyncForecastEnqueueTests(unittest.TestCase):
             )
 
         self.assertTrue(synced)
+        schedule_upsert_sql = cursor.execute.call_args_list[-1].args[0]
+        self.assertIn("user_id = EXCLUDED.user_id", schedule_upsert_sql)
         close.assert_called_once_with(conn)
 
 
