@@ -201,6 +201,14 @@ def _create_order_tables(cur) -> None:
         ALTER TABLE forecast_corrections
         ADD COLUMN IF NOT EXISTS prediction_source VARCHAR(50)
     """)
+    # Historical rows predate source-aware snapshots. Preserve their current
+    # training eligibility while making the unknown provenance explicit rather
+    # than leaving reporting to interpret NULL.
+    cur.execute("""
+        UPDATE forecast_corrections
+        SET prediction_source = 'legacy_unknown'
+        WHERE prediction_source IS NULL OR BTRIM(prediction_source) = ''
+    """)
     
     print("  ✓ Order tables created")
 

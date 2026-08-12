@@ -488,8 +488,8 @@ def handle_sync_order(conn: psycopg2.extensions.connection, db: firestore.Client
                 prediction_source = str(
                     (forecast_item or {}).get('source')
                     or item.get('forecastSource')
-                    or ('legacy_item_metadata' if forecasted_qty is not None else '')
-                ).strip()[:50] or None
+                    or ('legacy_item_metadata' if forecasted_qty is not None else 'legacy_unknown')
+                ).strip()[:50]
 
                 # If forecast context exists and this ordered line was not in forecast_lookup,
                 # record it explicitly as an added line (predicted=0, final>0).
@@ -575,7 +575,7 @@ def handle_sync_order(conn: psycopg2.extensions.connection, db: firestore.Client
                     rec_cases = int(rec_cases) if rec_cases is not None else 0
                     promo_active = bool(fit.get("promoActive", False))
                     promo_id = fit.get("promoId")
-                    prediction_source = str(fit.get("source") or "unknown").strip()[:50]
+                    prediction_source = str(fit.get("source") or "legacy_unknown").strip()[:50]
 
                     correction_id = f"{order_id}-{store_id}-{sap}-rm"
                     predicted = float(rec_units)

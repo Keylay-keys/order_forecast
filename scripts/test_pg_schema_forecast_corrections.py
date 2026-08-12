@@ -22,6 +22,12 @@ class ForecastCorrectionSchemaMigrationTests(unittest.TestCase):
             and "add column if not exists prediction_source varchar(50)" in statement
             for statement in cursor.statements
         ))
+        self.assertTrue(any(
+            statement.startswith("update forecast_corrections")
+            and "set prediction_source = 'legacy_unknown'" in statement
+            and "prediction_source is null" in statement
+            for statement in cursor.statements
+        ))
 
 
 if __name__ == "__main__":
