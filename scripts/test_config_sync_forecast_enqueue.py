@@ -152,6 +152,38 @@ class ConfigSyncForecastEnqueueTests(unittest.TestCase):
         self.assertEqual(manager._schedule_forecast_refresh.call_count, 2)
         self.assertEqual(sync.call_args_list[-1].args, ("988200", "owner-1", []))
 
+    def test_product_sync_uses_generator_case_pack_default_and_closes_connection(self):
+        conn = MagicMock()
+        cursor = MagicMock()
+        conn.cursor.return_value.__enter__.return_value = cursor
+        with patch.object(listener, "get_pg_connection", return_value=conn), patch.object(
+            listener, "close_pg_connection"
+        ) as close:
+            synced = listener.sync_product_to_pg(
+                "988200", "54304", {"sap": "54304", "fullName": "No pack"}
+            )
+
+        self.assertTrue(synced)
+        values = cursor.execute.call_args.args[1]
+        self.assertEqual(values[8], 0)
+        close.assert_called_once_with(conn)
+
+    def test_schedule_sync_releases_its_connection_after_each_snapshot(self):
+        conn = MagicMock()
+        cursor = MagicMock()
+        conn.cursor.return_value.__enter__.return_value = cursor
+        with patch.object(listener, "get_pg_connection", return_value=conn), patch.object(
+            listener, "close_pg_connection"
+        ) as close:
+            synced = listener.sync_user_schedules_to_pg(
+                "988200",
+                "owner-1",
+                [{"orderDay": 1, "loadDay": 3, "deliveryDay": 4}],
+            )
+
+        self.assertTrue(synced)
+        close.assert_called_once_with(conn)
+
 
 if __name__ == "__main__":
     unittest.main()

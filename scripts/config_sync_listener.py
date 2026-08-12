@@ -34,46 +34,47 @@ except ImportError:
 
 # Worker ID for this instance
 WORKER_ID = f"config-sync-{socket.gethostname()}-{os.getpid()}"
+_pg_connection_slots = threading.BoundedSemaphore(
+    max(1, int(os.environ.get("CONFIG_SYNC_MAX_DB_CONNECTIONS", "8")))
+)
 
 # =============================================================================
 # PostgreSQL Connection
 # =============================================================================
 
-_pg_state = threading.local()
-
-
 def _new_pg_connection() -> psycopg2.extensions.connection:
-    conn = psycopg2.connect(
-        host=os.environ.get('POSTGRES_HOST', 'localhost'),
-        port=int(os.environ.get('POSTGRES_PORT', 5432)),
-        database=os.environ.get('POSTGRES_DB', 'routespark'),
-        user=os.environ.get('POSTGRES_USER', 'routespark'),
-        password=os.environ.get('POSTGRES_PASSWORD', ''),
-    )
+    if not _pg_connection_slots.acquire(timeout=30):
+        raise TimeoutError("config_sync_db_connection_slot_timeout")
+    try:
+        conn = psycopg2.connect(
+            host=os.environ.get('POSTGRES_HOST', 'localhost'),
+            port=int(os.environ.get('POSTGRES_PORT', 5432)),
+            database=os.environ.get('POSTGRES_DB', 'routespark'),
+            user=os.environ.get('POSTGRES_USER', 'routespark'),
+            password=os.environ.get('POSTGRES_PASSWORD', ''),
+        )
+    except Exception:
+        _pg_connection_slots.release()
+        raise
     # Keep autocommit disabled so each sync unit can commit/rollback atomically.
     conn.autocommit = False
     return conn
 
 
 def get_pg_connection() -> psycopg2.extensions.connection:
-    """Get or create a thread-local PostgreSQL connection for direct DB access."""
-    conn = getattr(_pg_state, 'conn', None)
-    if conn is None or conn.closed:
-        conn = _new_pg_connection()
-        _pg_state.conn = conn
-    return conn
+    """Open a short-lived PostgreSQL connection for one sync unit."""
+    return _new_pg_connection()
 
 
-def close_pg_connection() -> None:
-    """Close the current thread-local PostgreSQL connection, if any."""
-    conn = getattr(_pg_state, 'conn', None)
+def close_pg_connection(conn: Optional[psycopg2.extensions.connection]) -> None:
+    """Close a sync unit's PostgreSQL connection."""
     if conn is None:
         return
     try:
         if not conn.closed:
             conn.close()
     finally:
-        _pg_state.conn = None
+        _pg_connection_slots.release()
 
 
 def get_firestore_client(sa_path: str) -> firestore.Client:
@@ -120,6 +121,7 @@ def _schedule_forecast_signature(order_cycles: List[dict]) -> str:
 
 def get_known_routes() -> Set[str]:
     """Get all known route numbers from routes_synced table."""
+    conn = None
     try:
         conn = get_pg_connection()
         with conn:
@@ -129,6 +131,8 @@ def get_known_routes() -> Set[str]:
     except Exception as e:
         print(f"  [!] Error fetching known routes: {e}")
         return set()
+    finally:
+        close_pg_connection(conn)
 
 
 # =============================================================================
@@ -205,6 +209,8 @@ def sync_store_to_pg(route_number: str, store_id: str, data: dict, deleted: bool
     except Exception as e:
         print(f"  [!] Error syncing store {store_id}: {e}")
         return False
+    finally:
+        close_pg_connection(conn)
 
 
 def _sync_store_items_inner(
@@ -297,6 +303,9 @@ def sync_store_items(
 
     except Exception as e:
         print(f"  [!] Error syncing store items for {store_id}: {e}")
+    finally:
+        if conn is None:
+            close_pg_connection(active_conn)
 
 
 # =============================================================================
@@ -355,7 +364,7 @@ def sync_product_to_pg(route_number: str, sap: str, data: dict, deleted: bool = 
                     data.get('brand', ''),
                     data.get('category', ''),
                     data.get('subCategory', ''),
-                    data.get('casePack') or data.get('tray'),
+                    data.get('casePack') or data.get('tray') or 0,
                     data.get('tray'),  # Can be None
                     data.get('active', data.get('isActive', data.get('is_active', True))),
                     now,
@@ -367,6 +376,8 @@ def sync_product_to_pg(route_number: str, sap: str, data: dict, deleted: bool = 
     except Exception as e:
         print(f"  [!] Error syncing product {sap}: {e}")
         return False
+    finally:
+        close_pg_connection(conn)
 
 
 # =============================================================================
@@ -452,6 +463,8 @@ def sync_user_schedules_to_pg(route_number: str, user_id: str, order_cycles: Lis
     except Exception as e:
         print(f"  [!] Error syncing schedules for route {route_number}: {e}")
         return False
+    finally:
+        close_pg_connection(conn)
 
 
 # =============================================================================
@@ -664,6 +677,7 @@ class ConfigSyncManager:
         """Discover existing routes from PG and start listeners for each."""
         print("\n[*] Discovering existing routes from PostgreSQL...")
 
+        conn = None
         try:
             conn = get_pg_connection()
             with conn:
@@ -689,6 +703,8 @@ class ConfigSyncManager:
 
         except Exception as e:
             print(f"  [!] Error discovering routes: {e}")
+        finally:
+            close_pg_connection(conn)
 
     def watch_for_new_routes(self) -> None:
         """Watch routes_synced in PostgreSQL for new routes (via polling).
@@ -733,6 +749,7 @@ def main(sa_path: str):
     fb_client = get_firestore_client(sa_path)
 
     # Test PostgreSQL connection
+    conn = None
     try:
         conn = get_pg_connection()
         with conn:
@@ -742,6 +759,8 @@ def main(sa_path: str):
     except Exception as e:
         print(f"  [!] PostgreSQL connection failed: {e}")
         return 1
+    finally:
+        close_pg_connection(conn)
 
     # Create sync manager and start listeners
     manager = ConfigSyncManager(fb_client)
@@ -765,6 +784,7 @@ def main(sa_path: str):
                 last_check = current_time
 
                 # Check for newly synced routes
+                conn = None
                 try:
                     conn = get_pg_connection()
                     with conn:
@@ -785,12 +805,13 @@ def main(sa_path: str):
 
                 except Exception as e:
                     print(f"  [!] Error checking for new routes: {e}")
+                finally:
+                    close_pg_connection(conn)
 
     except KeyboardInterrupt:
         print("\n\n[*] Shutdown requested...")
     finally:
         manager.stop_all()
-        close_pg_connection()
 
     return 0
 
