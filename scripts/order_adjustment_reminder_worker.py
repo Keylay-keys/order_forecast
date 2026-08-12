@@ -398,19 +398,23 @@ def claim_adjustment_reminder(db: firestore.Client, doc: Any, *, now_ms: int) ->
         claimed = dict(data)
         claimed["id"] = snap.id
         claimed["reminderAttemptCount"] = attempts
+        claimed["reminderClaimedAtMs"] = now_ms
+        claimed["reminderWorkerId"] = WORKER_ID
         return {"ref": adjustment_ref, "adjustment": claimed}
 
     return _claim(db.transaction())
 
 
 def finish_adjustment_reminder(
+    db: firestore.Client,
     adjustment_ref: Any,
     *,
+    claim: Dict[str, Any],
     now_ms: int,
     sent: bool,
     push_stats: Dict[str, int],
     error: Optional[str] = None,
-) -> None:
+) -> bool:
     update = {
         "reminderStatus": "sent" if sent else "failed",
         "reminderSentAt": firestore.SERVER_TIMESTAMP if sent else None,
@@ -421,7 +425,30 @@ def finish_adjustment_reminder(
     }
     if error:
         update["reminderError"] = error[:500]
-    adjustment_ref.update(update)
+    expected_claimed_at = _to_millis(claim.get("reminderClaimedAtMs"))
+    expected_worker = str(claim.get("reminderWorkerId") or "")
+    expected_attempt = int(claim.get("reminderAttemptCount") or 0)
+
+    @firestore.transactional
+    def _finish(transaction):
+        snap = adjustment_ref.get(transaction=transaction)
+        if not snap.exists:
+            return False
+        current = snap.to_dict() or {}
+        if str(current.get("status") or "draft") != "draft":
+            return False
+        if str(current.get("reminderStatus") or "none") != "sending":
+            return False
+        if _to_millis(current.get("reminderClaimedAtMs")) != expected_claimed_at:
+            return False
+        if str(current.get("reminderWorkerId") or "") != expected_worker:
+            return False
+        if int(current.get("reminderAttemptCount") or 0) != expected_attempt:
+            return False
+        transaction.update(adjustment_ref, update)
+        return True
+
+    return bool(_finish(db.transaction()))
 
 
 def send_claimed_reminder(db: firestore.Client, claimed: Dict[str, Any], *, now_ms: int) -> bool:
@@ -439,7 +466,7 @@ def send_claimed_reminder(db: firestore.Client, claimed: Dict[str, Any], *, now_
 
     if ORDER_ADJUSTMENT_REMINDER_DRY_RUN:
         logger.info("[dry-run] Would send order adjustment reminder route=%s adjustment=%s uid=%s", payload["routeNumber"], payload["adjustmentId"], uid)
-        finish_adjustment_reminder(adjustment_ref, now_ms=now_ms, sent=True, push_stats={"sent": 0, "failed": 0, "dryRun": 1})
+        finish_adjustment_reminder(db, adjustment_ref, claim=adjustment, now_ms=now_ms, sent=True, push_stats={"sent": 0, "failed": 0, "dryRun": 1})
         return True
 
     try:
@@ -458,11 +485,11 @@ def send_claimed_reminder(db: firestore.Client, claimed: Dict[str, Any], *, now_
             data={"type": "order_adjustment_reminder", **payload},
         )
         sent = push_stats.get("sent", 0) > 0
-        finish_adjustment_reminder(adjustment_ref, now_ms=now_ms, sent=sent, push_stats=push_stats)
+        finish_adjustment_reminder(db, adjustment_ref, claim=adjustment, now_ms=now_ms, sent=sent, push_stats=push_stats)
         return sent
     except Exception as exc:
         logger.exception("Failed sending order adjustment reminder")
-        finish_adjustment_reminder(adjustment_ref, now_ms=now_ms, sent=False, push_stats={"sent": 0, "failed": 1}, error=str(exc))
+        finish_adjustment_reminder(db, adjustment_ref, claim=adjustment, now_ms=now_ms, sent=False, push_stats={"sent": 0, "failed": 1}, error=str(exc))
         return False
 
 

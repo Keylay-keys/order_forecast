@@ -240,6 +240,51 @@ class OrderAdjustmentReminderWorkerTests(unittest.TestCase):
         adjustment = db.root["routes"]["989567"]["_subcollections"]["orderAdjustments"]["adjustment-a"]
         self.assertEqual(adjustment["reminderStatus"], "sent")
 
+    def test_finish_does_not_overwrite_terminalized_adjustment(self):
+        db = _build_db()
+        _add_adjustment(db)
+        doc = next(iter(worker._pending_query(db, 900_000, 10)))
+        with patch.object(worker.firestore, "transactional", side_effect=lambda fn: fn):
+            claimed = worker.claim_adjustment_reminder(db, doc, now_ms=900_000)
+            self.assertIsNotNone(claimed)
+            adjustment = db.root["routes"]["989567"]["_subcollections"]["orderAdjustments"]["adjustment-a"]
+            adjustment.update({"status": "sent", "reminderStatus": "skipped"})
+            finished = worker.finish_adjustment_reminder(
+                db,
+                claimed["ref"],
+                claim=claimed["adjustment"],
+                now_ms=901_000,
+                sent=True,
+                push_stats={"sent": 1, "failed": 0},
+            )
+
+        self.assertFalse(finished)
+        self.assertEqual(adjustment["reminderStatus"], "skipped")
+
+    def test_finish_does_not_overwrite_newer_claim(self):
+        db = _build_db()
+        _add_adjustment(db)
+        doc = next(iter(worker._pending_query(db, 900_000, 10)))
+        with patch.object(worker.firestore, "transactional", side_effect=lambda fn: fn):
+            claimed = worker.claim_adjustment_reminder(db, doc, now_ms=900_000)
+            self.assertIsNotNone(claimed)
+            adjustment = db.root["routes"]["989567"]["_subcollections"]["orderAdjustments"]["adjustment-a"]
+            adjustment.update({
+                "reminderClaimedAtMs": 901_000,
+                "reminderAttemptCount": 2,
+            })
+            finished = worker.finish_adjustment_reminder(
+                db,
+                claimed["ref"],
+                claim=claimed["adjustment"],
+                now_ms=902_000,
+                sent=False,
+                push_stats={"sent": 0, "failed": 1},
+            )
+
+        self.assertFalse(finished)
+        self.assertEqual(adjustment["reminderStatus"], "sending")
+
     def test_claim_transaction_skips_sent_adjustment_after_query_snapshot(self):
         db = _build_db()
         _add_adjustment(db)
