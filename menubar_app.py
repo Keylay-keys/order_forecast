@@ -32,7 +32,6 @@ VENV_PYTHON = APP_DIR / 'venv' / 'bin' / 'python'
 
 # Services to monitor
 SERVICES = [
-    ('DB Manager', 'db_manager.py'),
     ('Order Sync', 'order_sync_listener.py'),
     ('Archive', 'order_archive_listener.py'),
     ('Retrain', 'retrain_daemon.py'),
@@ -161,9 +160,7 @@ class RouteSparkStatusApp(rumps.App):
         
         for name, pattern in SERVICES:
             log_name = pattern.replace('.py', '.log').replace('.runner', '_listener.log')
-            if 'db_manager' in pattern:
-                log_name = 'db_manager.log'
-            elif 'order_sync' in pattern:
+            if 'order_sync' in pattern:
                 log_name = 'order_sync.log'
             elif 'order_archive' in pattern:
                 log_name = 'archive_listener.log'
@@ -265,4 +262,3 @@ class RouteSparkStatusApp(rumps.App):
 
 if __name__ == "__main__":
     RouteSparkStatusApp().run()
-

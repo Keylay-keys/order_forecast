@@ -1,7 +1,6 @@
 """Compute historical shares for case allocation (PostgreSQL).
 
-This mirrors scripts/compute_shares.py but targets the production PostgreSQL
-schema used by the server containers.
+This targets the production PostgreSQL schema used by the server containers.
 
 Usage:
     python scripts/compute_shares_pg.py --route 989262

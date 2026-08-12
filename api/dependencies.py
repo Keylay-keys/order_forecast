@@ -308,13 +308,6 @@ def get_db_client() -> DirectPGConnection:
     return DirectPGConnection()
 
 
-# Legacy alias for compatibility
-def get_duckdb() -> DirectPGConnection:
-    """DEPRECATED: Use get_db_client() instead. This now uses PostgreSQL."""
-    logger.warning("get_duckdb() is deprecated, use get_db_client()")
-    return get_db_client()
-
-
 # =============================================================================
 # AUTHENTICATION
 # =============================================================================

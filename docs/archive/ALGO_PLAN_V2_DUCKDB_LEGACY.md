@@ -1,5 +1,9 @@
 # Order Forecast Algorithm - Implementation Plan V2
 
+> Archived: this plan describes the retired DuckDB order/forecast stack. The
+> production runtime uses PostgreSQL and none of the referenced DuckDB services
+> or sync entrypoints remain executable.
+
 > **Status**: Active Development  
 > **Last Updated**: December 14, 2025  
 > **Pilot Route**: 989262  

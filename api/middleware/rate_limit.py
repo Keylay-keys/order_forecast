@@ -4,7 +4,7 @@ Provides per-endpoint rate limits to prevent abuse.
 
 Default limits:
 - Global: 100 req/min per IP
-- History endpoints: 30 req/min (expensive DuckDB queries)
+- History endpoints: 30 req/min (database-backed queries)
 - Write endpoints: 10 req/min (order creation/updates)
 - Auth endpoints: 60 req/min
 """

@@ -8,7 +8,8 @@ Security: All endpoints require Firebase Auth except /api/health.
 Usage:
     uvicorn api.main:app --host 127.0.0.1 --port 8000
     
-Or via supervisor.py.
+Production runs through the Kubernetes runtime entrypoint. Local development
+may invoke uvicorn directly.
 """
 
 from __future__ import annotations

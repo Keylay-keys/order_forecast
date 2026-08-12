@@ -34,6 +34,16 @@ Rules:
 
 A lightweight toolkit for generating twice-weekly order forecasts, comparing them with actual shipments, and keeping historical inputs organized. The repo is structured so you can drop in your own order exports and promo sheets without committing personal data.
 
+## Runtime data boundary
+
+PostgreSQL is the only operational database for order history, forecast generation,
+correction evidence, and runtime services. The former Firebase-to-DuckDB sync and
+database-manager stack has been retired and removed.
+
+DuckDB remains an optional dependency solely for isolated promo/mailbox audit
+warehouse scripts. Those offline artifacts are not consumed by the production
+order or forecast runtime.
+
 ## Prerequisites
 
 - Python 3.10+

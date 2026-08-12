@@ -81,7 +81,7 @@ def main():
                 print(f"   ⚠️  Case rounding NOT working! Got {total_units}, expected {expected_total}")
         
         # Compare to historical
-        print("\n   Historical shares (from DuckDB):")
+        print("\n   Historical shares:")
         print("     Walmart: 30.3%")
         print("     Kaysville Smith's: 29.3%")
         print("     Farmington Smith's: 21.2%")
@@ -104,4 +104,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

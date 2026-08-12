@@ -1,7 +1,7 @@
 """RouteSpark Web Portal API.
 
 FastAPI-based backend for the web portal, providing:
-- Order history queries (DuckDB)
+- Order history queries (PostgreSQL)
 - Order creation and management (Firestore)
 - Forecast retrieval and application
 - Health and sync status

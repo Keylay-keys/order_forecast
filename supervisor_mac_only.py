@@ -296,7 +296,7 @@ def cmd_status(args):
 def main():
     parser = argparse.ArgumentParser(
         description='Mac-Only RouteSpark Services',
-        epilog='Run this AFTER the server is live with db_manager running.',
+        epilog='Run this after the PostgreSQL-backed server runtime is healthy.',
     )
     
     subparsers = parser.add_subparsers(dest='command', help='Command')

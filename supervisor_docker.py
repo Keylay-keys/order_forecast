@@ -15,7 +15,7 @@ Services managed:
 - Config Sync Listener
 - Promo Sync Listener
 
-Note: DB Manager service deprecated - all clients use direct PostgreSQL.
+All clients use direct PostgreSQL.
 
 Usage:
     python supervisor_docker.py start
@@ -166,9 +166,8 @@ def create_services() -> List[Service]:
     # Environment variables: POSTGRES_HOST, POSTGRES_PORT, POSTGRES_DB, POSTGRES_USER, POSTGRES_PASSWORD
 
     services = [
-        # NOTE: DB Manager service DEPRECATED - all clients now use direct PostgreSQL.
-        # The db_manager_pg.py module is kept for utility functions (handle_sync_order, etc.)
-        # but no longer runs as a service watching dbRequests.
+        # Order projection helpers live in db_manager_pg.py for compatibility,
+        # but there is no database-manager service or local analytics database.
 
         # Watches all orders, syncs to PostgreSQL directly
         Service(
@@ -369,7 +368,7 @@ def cmd_stop(args):
     log("=" * 50)
     
     patterns = [
-        # NOTE: db_manager_pg.py removed - service deprecated
+        # No database-manager process exists; services use PostgreSQL directly.
         'order_sync_listener.py',
         'order_archive_listener.py',
         'retrain_daemon.py',
@@ -414,7 +413,7 @@ def cmd_status(args):
     log("=" * 50)
     
     patterns = [
-        # NOTE: DB Manager removed - service deprecated
+        # Runtime services connect directly to PostgreSQL.
         ('Order Sync Listener', 'order_sync_listener.py'),
         ('Archive Listener', 'order_archive_listener.py'),
         ('Retrain Daemon', 'retrain_daemon.py'),

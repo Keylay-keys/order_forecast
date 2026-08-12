@@ -54,7 +54,6 @@ PCF_START_SCRIPT = PCF_DIR / 'scripts' / 'start_listener.sh'
 # Default config
 DEFAULT_ROUTE = '989262'
 DEFAULT_SA_PATH = '/Users/kylemacmini/Desktop/dev/firebase-tools/routespark-1f47d-firebase-adminsdk-tnv5k-b259331cbc.json'
-DEFAULT_DB_PATH = BASE_DIR / 'data' / 'analytics.duckdb'
 
 
 class Service:
@@ -163,24 +162,14 @@ def log(msg: str):
     print(f"[{ts}] {msg}", flush=True)
 
 
-def create_services(route: str, sa_path: str, db_path: str) -> List[Service]:
+def create_services(route: str, sa_path: str) -> List[Service]:
     """Create service definitions."""
     python = str(VENV_PYTHON)
     
     services = [
-        # CORE: DB Manager owns the single DuckDB connection
-        # Must start FIRST - other services communicate via Firebase
-        Service(
-            name="DB Manager",
-            cmd=[
-                python,
-                str(SCRIPTS_DIR / 'db_manager.py'),
-                '--serviceAccount', sa_path,
-                '--duckdb', str(db_path),
-            ],
-            log_file=LOG_DIR / 'db_manager.log',
-        ),
-        # Watches all orders, syncs new routes via DB Manager
+        # All order/forecast state is PostgreSQL-backed. No local database
+        # manager is started or consulted by this supervisor.
+        # Watches all orders and syncs directly to PostgreSQL.
         Service(
             name="Order Sync Listener",
             cmd=[
@@ -199,7 +188,7 @@ def create_services(route: str, sa_path: str, db_path: str) -> List[Service]:
             ],
             log_file=LOG_DIR / 'config_sync.log',
         ),
-        # Handles archive requests from app via DB Manager
+        # Handles archive requests through direct PostgreSQL access.
         Service(
             name="Archive Listener",
             cmd=[
@@ -229,7 +218,7 @@ def create_services(route: str, sa_path: str, db_path: str) -> List[Service]:
             ],
             log_file=LOG_DIR / 'archive_purge_worker.log',
         ),
-        # Periodic retraining check (uses DBClient)
+        # Periodic retraining check using PostgreSQL.
         Service(
             name="Retrain Daemon",
             cmd=[
@@ -343,13 +332,13 @@ def cmd_start(args):
     log("🚀 Starting RouteSpark Backend Services")
     log("=" * 50)
     
-    services = create_services(args.route, args.service_account, args.db)
+    services = create_services(args.route, args.service_account)
     
     all_started = True
     for i, service in enumerate(services):
         if not service.start():
             all_started = False
-        # Add delay between services to prevent DuckDB lock conflicts
+        # Stagger starts to avoid simultaneous connection bursts.
         if i < len(services) - 1:
             time.sleep(2)
     
@@ -417,7 +406,7 @@ def cmd_stop(args):
     time.sleep(0.5)
     
     # Now stop individual services
-    patterns = ['db_manager.py', 'order_sync_listener.py', 'config_sync_listener.py', 'order_archive_listener.py', 'archive_export_worker.py', 'archive_purge_worker.py', 'retrain_daemon.py', 'forecast_generation_worker.py', 'delivery_manifest_listener.py', 'promo_email_listener.py', 'catalog_upload_listener.py', 'low_qty_notification_daemon.py', 'api.main:app', 'pcf_core.runner']
+    patterns = ['order_sync_listener.py', 'config_sync_listener.py', 'order_archive_listener.py', 'archive_export_worker.py', 'archive_purge_worker.py', 'retrain_daemon.py', 'forecast_generation_worker.py', 'delivery_manifest_listener.py', 'promo_email_listener.py', 'catalog_upload_listener.py', 'low_qty_notification_daemon.py', 'api.main:app', 'pcf_core.runner']
     
     for pattern in patterns:
         try:
@@ -453,7 +442,6 @@ def cmd_status(args):
     log("=" * 50)
     
     patterns = [
-        ('DB Manager', 'db_manager.py'),
         ('Order Sync Listener', 'order_sync_listener.py'),
         ('Config Sync Listener', 'config_sync_listener.py'),
         ('Archive Listener', 'order_archive_listener.py'),
@@ -494,7 +482,6 @@ def cmd_restart(args):
     # Set default args for start command
     args.route = getattr(args, 'route', DEFAULT_ROUTE)
     args.service_account = getattr(args, 'service_account', DEFAULT_SA_PATH)
-    args.db = getattr(args, 'db', str(DEFAULT_DB_PATH))
     args.detach = True  # Always detach on restart
     return cmd_start(args)
 
@@ -537,7 +524,6 @@ Commands:
     start_parser = subparsers.add_parser('start', help='Start all services')
     start_parser.add_argument('--route', default=DEFAULT_ROUTE, help='Route number')
     start_parser.add_argument('--service-account', default=DEFAULT_SA_PATH, help='Firebase SA')
-    start_parser.add_argument('--db', default=str(DEFAULT_DB_PATH), help='DuckDB path')
     start_parser.add_argument('--detach', '-d', action='store_true', help='Detach after starting')
     
     # Other commands

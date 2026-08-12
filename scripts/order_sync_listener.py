@@ -1,7 +1,7 @@
 """Unified order sync listener - watches ALL orders across all routes.
 
 Multi-user support: Automatically syncs new routes when their first order appears.
-Uses direct PostgreSQL connections (no DB Manager / DuckDB dependency).
+Uses direct PostgreSQL connections.
 
 Flow:
 1. Watches `/orders` collection for all users
@@ -1653,8 +1653,6 @@ if __name__ == "__main__":
         description="Order sync listener - watches all orders, syncs new routes via PostgreSQL",
     )
     parser.add_argument('--serviceAccount', required=True, help='Path to Firebase service account JSON')
-    # --duckdb is no longer needed since we use PostgreSQL directly
-    parser.add_argument('--duckdb', help='(deprecated) Not used - direct PostgreSQL writes')
     
     args = parser.parse_args()
     

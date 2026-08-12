@@ -216,11 +216,9 @@ def watch_requests(sa_path: str):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Archive listener - handles order history requests via DB Manager",
+        description="Archive listener - handles order history requests via PostgreSQL",
     )
     parser.add_argument('--serviceAccount', required=True, help='Path to Firebase service account JSON')
-    # --duckdb is no longer needed since we use direct PostgreSQL
-    parser.add_argument('--duckdb', help='(deprecated) Not used - DB Manager handles database')
     
     args = parser.parse_args()
     

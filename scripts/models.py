@@ -1,7 +1,7 @@
 """Core dataclasses for the forecasting pipeline.
 
 These classes are shared across loaders, trainers, and writers so we have a
-typed contract for the data that moves between Firebase, DuckDB, and the ML
+typed contract for the data that moves between Firebase, PostgreSQL, and the ML
 components.
 """
 

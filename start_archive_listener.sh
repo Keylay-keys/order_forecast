@@ -10,11 +10,10 @@
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VENV_PATH="$SCRIPT_DIR/venv"
-DUCKDB_PATH="$SCRIPT_DIR/data/analytics.duckdb"
 SA_PATH="/Users/kylemacmini/Desktop/dev/firebase-tools/routespark-1f47d-firebase-adminsdk-tnv5k-b259331cbc.json"
 
 echo "🎧 Starting Order Archive Listener (Real-time)..."
-echo "   Database: $DUCKDB_PATH"
+echo "   Database: PostgreSQL (environment configuration)"
 echo ""
 
 # Activate virtual environment
@@ -25,6 +24,4 @@ source "$VENV_PATH/bin/activate"
 # -i: prevent idle sleep  
 # -m: prevent disk sleep
 caffeinate -dim python "$SCRIPT_DIR/scripts/order_archive_listener.py" \
-    --serviceAccount "$SA_PATH" \
-    --duckdb "$DUCKDB_PATH"
-
+    --serviceAccount "$SA_PATH"

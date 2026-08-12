@@ -1,5 +1,8 @@
 # Low-Quantity Notification Daemon Plan
 
+> Archived implementation history. Any references to DBClient, DuckDB, or the
+> old supervisor are non-operational; the active runtime uses PostgreSQL.
+
 ## Goal
 
 Send push notifications for low-quantity items that need to be ordered today.

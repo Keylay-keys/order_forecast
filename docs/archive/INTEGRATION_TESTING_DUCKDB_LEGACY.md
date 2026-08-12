@@ -1,5 +1,8 @@
 # Order Forecast - Integration Testing & Deployment
 
+> Archived: these procedures target the retired DuckDB order/forecast pipeline.
+> Current release gates use PostgreSQL-focused tests and runtime checks.
+
 > **Status**: Testing Phase - IN PROGRESS
 > **Last Updated**: December 11, 2025 (Claude 2 tests passing)
 > **Created**: December 11, 2025

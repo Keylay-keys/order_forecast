@@ -2,7 +2,7 @@
 """Retrain daemon: runs continuously, checking for cycle completion.
 
 Multi-user: Discovers routes via PostgreSQL.
-Uses direct PostgreSQL connections (no DB Manager / DuckDB).
+Uses direct PostgreSQL connections.
 
 This daemon:
 1. Gets all synced routes via PostgreSQL

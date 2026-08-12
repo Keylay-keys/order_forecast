@@ -2,7 +2,7 @@
 
 Inputs:
   - Fresh orders CSV (2-row header format) and stock CSV (same shape) for the route
-  - Optional corrections CSV from feedback_collector aggregates
+  - Optional corrections CSV exported from PostgreSQL correction history
   - Optional promo PDFs
 
 Outputs:
