@@ -9,6 +9,7 @@ from typing import Dict, Any, List, Optional
 
 import pandas as pd
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi.responses import JSONResponse
 from google.cloud import firestore
 
 from ..dependencies import (
@@ -27,10 +28,13 @@ from ..models import (
     ForecastItem,
     ErrorResponse,
     AttachForecastResponse,
+    ForecastPreparingResponse,
 )
 from forecast_contract import (
     ForecastContractError,
     build_order_snapshot,
+    generation_input_fingerprint,
+    stable_fingerprint,
     validate_ready_artifact,
 )
 
@@ -519,7 +523,7 @@ async def attach_forecast(
     route: str = Query(..., pattern=r"^\d{1,10}$", description="Route number"),
     decoded_token: dict = Depends(verify_firebase_token),
     db: firestore.Client = Depends(get_firestore),
-) -> AttachForecastResponse:
+) -> Any:
     """Attach an exact, validated schema-v2 snapshot without editing stores."""
     await require_route_feature_access(route, "forecasting", decoded_token, db)
 
@@ -555,16 +559,75 @@ async def attach_forecast(
         or _to_naive_utc((doc.to_dict() or {}).get("expiresAt")) > _to_naive_utc(now)
     )), None)
     if artifact is None:
-        raise HTTPException(409, "Exact forecast unavailable; try again shortly")
+        from forecast_generation_queue import enqueue_generation_job
+        desired_revision = stable_fingerprint({
+            "schemaVersion": 2,
+            "routeNumber": route,
+            "deliveryDate": delivery_date,
+            "scheduleKey": schedule_key,
+        })
+        job = enqueue_generation_job(
+            route,
+            schedule_key,
+            delivery_date,
+            source="forecast_attach",
+            desired_revision=desired_revision,
+            refresh_reason="attach_stale",
+        )
+        preparing = ForecastPreparingResponse(
+            reason="missing",
+            jobId=(job or {}).get("job_key"),
+            deliveryDate=delivery_date,
+            scheduleKey=schedule_key,
+        )
+        return JSONResponse(status_code=202, content=preparing.model_dump())
 
+    desired_revision = stable_fingerprint({
+        "schemaVersion": 2,
+        "routeNumber": route,
+        "deliveryDate": delivery_date,
+        "scheduleKey": schedule_key,
+    })
     try:
+        from firebase_loader import load_master_catalog, load_store_configs
+        from forecast_engine import _get_stores_for_order_cycle
+        from schedule_utils import get_order_cycles
+
+        products = load_master_catalog(db, route)
+        stores_config = load_store_configs(db, route)
+        valid_store_ids = _get_stores_for_order_cycle(
+            stores_config,
+            get_order_cycles(db, route),
+            schedule_key,
+        )
+        case_pack_by_sap = {
+            str(product.sap): int(product.case_pack or product.tray or 0)
+            for product in products
+        }
+        active_carry_rows = {
+            (str(store.store_id), str(sap), case_pack_by_sap[str(sap)])
+            for store in stores_config
+            if str(store.store_id) in valid_store_ids
+            for sap in (store.active_saps or [])
+            if str(sap) in case_pack_by_sap
+        }
+        active_keys = {(store_id, sap) for store_id, sap, _case_pack in active_carry_rows}
+        current_input_fingerprint = generation_input_fingerprint(
+            route,
+            delivery_date,
+            schedule_key,
+            active_carry_rows,
+        )
+        desired_revision = current_input_fingerprint
+        if artifact.get("generationInputFingerprint") != current_input_fingerprint:
+            raise ForecastContractError("generation_input_stale")
         artifact_items = validate_ready_artifact(
             artifact,
             route_number=route,
             delivery_date=delivery_date,
             schedule_key=schedule_key,
+            active_carry_keys=active_keys,
         )
-        active_keys = {(row["storeId"], row["sap"]) for row in artifact_items}
         order_keys = {
             (str(store.get("storeId") or ""), str(item.get("sap") or ""))
             for store in (order_data.get("stores") or [])
@@ -575,11 +638,22 @@ async def attach_forecast(
             artifact_items, active_keys, order_keys
         )
     except ForecastContractError as exc:
-        raise HTTPException(409, f"Forecast incomplete; try again ({exc})") from exc
-
-    existing = order_data.get("forecastContext") or {}
-    if existing and existing.get("forecastId") != artifact.get("forecastId"):
-        raise HTTPException(409, "A different forecast is already attached")
+        from forecast_generation_queue import enqueue_generation_job
+        job = enqueue_generation_job(
+            route,
+            schedule_key,
+            delivery_date,
+            source="forecast_attach",
+            desired_revision=desired_revision,
+            refresh_reason="attach_stale",
+        )
+        preparing = ForecastPreparingResponse(
+            reason="incomplete",
+            jobId=(job or {}).get("job_key"),
+            deliveryDate=delivery_date,
+            scheduleKey=schedule_key,
+        )
+        return JSONResponse(status_code=202, content=preparing.model_dump())
 
     attached_at = now
     context = {
@@ -599,10 +673,34 @@ async def attach_forecast(
         "eligibilityFingerprint": eligibility_fingerprint,
         "items": snapshot_items,
     }
-    idempotent = bool(existing)
-    if not idempotent:
+    transaction = db.transaction()
+
+    @firestore.transactional
+    def attach_context_transactionally(active_transaction):
+        current_snapshot = order_ref.get(transaction=active_transaction)
+        if not current_snapshot.exists:
+            raise HTTPException(404, "Order not found")
+        current_order = current_snapshot.to_dict() or {}
+        if current_order.get("status") != "draft":
+            raise HTTPException(400, "Order is not editable")
+        if (
+            str(current_order.get("expectedDeliveryDate") or "") != delivery_date
+            or str(current_order.get("scheduleKey") or "").lower() != schedule_key
+        ):
+            raise HTTPException(409, "Order target changed while attaching forecast")
+        current_context = current_order.get("forecastContext") or {}
+        if current_context:
+            if current_context.get("forecastId") != artifact.get("forecastId"):
+                raise HTTPException(409, "A different forecast is already attached")
+            return current_context, True
         # Field-scoped Admin write: never read/merge/write stores here.
-        order_ref.update({"forecastContext": context, "updatedAt": attached_at})
+        active_transaction.update(order_ref, {
+            "forecastContext": context,
+            "updatedAt": attached_at,
+        })
+        return context, False
+
+    persisted_context, idempotent = attach_context_transactionally(transaction)
 
     _log_order_audit(
         db,
@@ -624,9 +722,9 @@ async def attach_forecast(
         "orderId": order_id,
         "forecastId": artifact["forecastId"],
         "forecastItemCount": len(snapshot_items),
-        "forecastContext": existing or context,
-        "updatedAt": (existing or context).get("attachedAt", attached_at),
-        "attachedAt": (existing or context).get("attachedAt", attached_at),
+        "forecastContext": persisted_context,
+        "updatedAt": persisted_context.get("attachedAt", attached_at),
+        "attachedAt": persisted_context.get("attachedAt", attached_at),
         "idempotent": idempotent,
     })
 

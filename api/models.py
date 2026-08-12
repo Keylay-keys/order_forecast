@@ -446,6 +446,15 @@ class AttachForecastResponse(BaseModel):
     idempotent: bool
 
 
+class ForecastPreparingResponse(BaseModel):
+    status: Literal['preparing'] = 'preparing'
+    reason: Literal['missing', 'expired', 'unsupported_or_unready', 'incomplete']
+    jobId: Optional[str] = None
+    retryAfterSeconds: int = 5
+    deliveryDate: str
+    scheduleKey: str
+
+
 class ForecastResponse(BaseModel):
     """Forecast availability response."""
     forecastAvailable: bool

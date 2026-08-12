@@ -34,6 +34,21 @@ def key_fingerprint(keys: Iterable[Key]) -> str:
     return stable_fingerprint([list(key) for key in sorted(set(keys))])
 
 
+def generation_input_fingerprint(
+    route_number: str,
+    delivery_date: str,
+    schedule_key: str,
+    active_carry_case_packs: Iterable[Tuple[str, str, int]],
+) -> str:
+    return stable_fingerprint({
+        "contractVersion": 2,
+        "routeNumber": str(route_number),
+        "deliveryDate": delivery_date,
+        "scheduleKey": schedule_key,
+        "activeCarry": [list(row) for row in sorted(set(active_carry_case_packs))],
+    })
+
+
 def normalize_units(value: Any) -> int:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ForecastContractError("recommended_units_not_numeric")

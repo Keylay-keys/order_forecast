@@ -189,7 +189,7 @@ try:
         load_promotions,
     )
     from .firebase_writer import write_cached_forecast, write_forecast_transfer_suggestions
-    from .forecast_contract import stable_fingerprint
+    from .forecast_contract import generation_input_fingerprint
     from .schedule_utils import (
         normalize_delivery_date,
         weekday_key,
@@ -215,7 +215,7 @@ except ImportError:
         load_promotions,
     )
     from firebase_writer import write_cached_forecast, write_forecast_transfer_suggestions
-    from forecast_contract import stable_fingerprint
+    from forecast_contract import generation_input_fingerprint
     from schedule_utils import (
         normalize_delivery_date,
         weekday_key,
@@ -1438,16 +1438,15 @@ def _generation_input_fingerprint(
         for product in products
         if getattr(product, "sap", None)
     }
-    return stable_fingerprint({
-        "contractVersion": 2,
-        "routeNumber": str(route_number),
-        "deliveryDate": delivery_date,
-        "scheduleKey": schedule_key,
-        "activeCarry": [
-            [str(item.store_id), str(item.sap), case_pack_by_sap.get(str(item.sap), 0)]
-            for item in sorted(dense_items, key=lambda row: (str(row.store_id), str(row.sap)))
-        ],
-    })
+    return generation_input_fingerprint(
+        route_number,
+        delivery_date,
+        schedule_key,
+        (
+            (str(item.store_id), str(item.sap), case_pack_by_sap.get(str(item.sap), 0))
+            for item in dense_items
+        ),
+    )
 
 
 def _filter_orders_by_schedule(orders, schedule_key: str):

@@ -649,13 +649,18 @@ def enqueue_generation_job(
                     refresh_reason = COALESCE(EXCLUDED.refresh_reason, forecast_generation_jobs.refresh_reason),
                     rerun_requested = CASE
                         WHEN forecast_generation_jobs.status = 'running'
-                         AND EXCLUDED.desired_revision IS NOT NULL
-                         AND EXCLUDED.desired_revision IS DISTINCT FROM forecast_generation_jobs.desired_revision
+                         AND (
+                           (EXCLUDED.desired_revision IS NOT NULL
+                            AND EXCLUDED.desired_revision IS DISTINCT FROM forecast_generation_jobs.desired_revision)
+                           OR (EXCLUDED.refresh_reason IS NOT NULL AND EXCLUDED.desired_revision IS NULL)
+                         )
                             THEN TRUE
                         ELSE forecast_generation_jobs.rerun_requested
                     END,
                     status = CASE
                         WHEN forecast_generation_jobs.status = 'error' THEN 'queued'
+                        WHEN forecast_generation_jobs.status <> 'running'
+                         AND EXCLUDED.refresh_reason IS NOT NULL THEN 'queued'
                         WHEN forecast_generation_jobs.status <> 'running'
                          AND EXCLUDED.desired_revision IS NOT NULL
                          AND EXCLUDED.desired_revision IS DISTINCT FROM forecast_generation_jobs.desired_revision
@@ -664,6 +669,7 @@ def enqueue_generation_job(
                     END,
                     attempts = CASE
                         WHEN forecast_generation_jobs.status = 'error'
+                          OR EXCLUDED.refresh_reason IS NOT NULL
                           OR (EXCLUDED.desired_revision IS NOT NULL
                            AND EXCLUDED.desired_revision IS DISTINCT FROM forecast_generation_jobs.desired_revision)
                             THEN 0
@@ -671,6 +677,8 @@ def enqueue_generation_job(
                     END,
                     available_at = CASE
                         WHEN forecast_generation_jobs.status = 'error'
+                          OR (forecast_generation_jobs.status <> 'running'
+                           AND EXCLUDED.refresh_reason IS NOT NULL)
                           OR (forecast_generation_jobs.status <> 'running'
                            AND EXCLUDED.desired_revision IS NOT NULL
                            AND EXCLUDED.desired_revision IS DISTINCT FROM forecast_generation_jobs.desired_revision)
