@@ -193,10 +193,10 @@ class TestHandleSyncOrderProjectionReplacement(unittest.TestCase):
                 "schemaVersion": 2,
                 "forecastId": "forecast-v2",
                 "items": [
-                    {"storeId": "store-1", "sap": "omitted", "recommendedUnits": 5},
-                    {"storeId": "store-1", "sap": "zero-add", "recommendedUnits": 0},
-                    {"storeId": "store-1", "sap": "changed", "recommendedUnits": 6},
-                    {"storeId": "store-1", "sap": "exact", "recommendedUnits": 2},
+                    {"storeId": "store-1", "sap": "omitted", "recommendedUnits": 5, "source": "last_order"},
+                    {"storeId": "store-1", "sap": "zero-add", "recommendedUnits": 0, "source": "order_only_zero"},
+                    {"storeId": "store-1", "sap": "changed", "recommendedUnits": 6, "source": "baseline"},
+                    {"storeId": "store-1", "sap": "exact", "recommendedUnits": 2, "source": "dense_zero"},
                 ],
             },
             "stores": [{
@@ -227,7 +227,11 @@ class TestHandleSyncOrderProjectionReplacement(unittest.TestCase):
             f"{order_id}-store-1-changed-corr",
         })
         zero_add = conn.forecast_corrections[f"{order_id}-store-1-zero-add-corr"]
-        self.assertEqual((zero_add[9], zero_add[11], zero_add[13]), (0, 3, 3))
+        changed = conn.forecast_corrections[f"{order_id}-store-1-changed-corr"]
+        omitted = conn.forecast_corrections[f"{order_id}-store-1-omitted-rm"]
+        self.assertEqual((zero_add[9], zero_add[11], zero_add[12], zero_add[14]), (0, "order_only_zero", 3, 3))
+        self.assertEqual(changed[11], "baseline")
+        self.assertEqual(omitted[11], "last_order")
 
     def test_sync_order_replaces_removed_line_items_and_stale_corrections(self):
         route_number = "989262"

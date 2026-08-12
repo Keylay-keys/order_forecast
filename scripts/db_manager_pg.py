@@ -480,10 +480,16 @@ def handle_sync_order(conn: psycopg2.extensions.connection, db: firestore.Client
                     forecasted_qty = item.get('forecastedQuantity')
                 # If the order item doesn't carry forecast metadata (e.g. older web portal writes),
                 # fall back to the archived/cached forecast for this delivery+schedule.
+                forecast_item = forecast_lookup.get(ordered_key)
                 if forecasted_qty is None:
-                    fit = forecast_lookup.get(ordered_key)
-                    if fit is not None:
-                        forecasted_qty = fit.get('recommendedUnits')
+                    if forecast_item is not None:
+                        forecasted_qty = forecast_item.get('recommendedUnits')
+
+                prediction_source = str(
+                    (forecast_item or {}).get('source')
+                    or item.get('forecastSource')
+                    or ('legacy_item_metadata' if forecasted_qty is not None else '')
+                ).strip()[:50] or None
 
                 # If forecast context exists and this ordered line was not in forecast_lookup,
                 # record it explicitly as an added line (predicted=0, final>0).
@@ -508,6 +514,7 @@ def handle_sync_order(conn: psycopg2.extensions.connection, db: firestore.Client
                         delivery_date if delivery_date else None, store_id, store_name, sap,
                         0,  # predicted_units
                         0,  # predicted_cases
+                        'order_only_zero' if has_attached_context else 'legacy_added_zero',
                         int(final),
                         int(final_cases) if final_cases is not None else 0,
                         int(final),  # delta = final - 0
@@ -528,9 +535,8 @@ def handle_sync_order(conn: psycopg2.extensions.connection, db: firestore.Client
                     if predicted_cases is None:
                         predicted_cases = item.get('forecastedCases')
                     if predicted_cases is None:
-                        fit = forecast_lookup.get(ordered_key)
-                        if fit is not None:
-                            predicted_cases = fit.get('recommendedCases')
+                        if forecast_item is not None:
+                            predicted_cases = forecast_item.get('recommendedCases')
                     final_cases = item_cases if item_cases is not None else 0
 
                     correction_id = f"{order_id}-{store_id}-{sap}-corr"
@@ -540,6 +546,7 @@ def handle_sync_order(conn: psycopg2.extensions.connection, db: firestore.Client
                         delivery_date if delivery_date else None, store_id, store_name, sap,
                         int(predicted),
                         int(predicted_cases) if predicted_cases is not None else 0,
+                        prediction_source,
                         int(final),
                         int(final_cases) if final_cases is not None else 0,
                         delta, ratio,
@@ -568,6 +575,7 @@ def handle_sync_order(conn: psycopg2.extensions.connection, db: firestore.Client
                     rec_cases = int(rec_cases) if rec_cases is not None else 0
                     promo_active = bool(fit.get("promoActive", False))
                     promo_id = fit.get("promoId")
+                    prediction_source = str(fit.get("source") or "unknown").strip()[:50]
 
                     correction_id = f"{order_id}-{store_id}-{sap}-rm"
                     predicted = float(rec_units)
@@ -582,6 +590,7 @@ def handle_sync_order(conn: psycopg2.extensions.connection, db: firestore.Client
                         delivery_date if delivery_date else None, store_id, store_name, sap,
                         int(predicted),
                         int(rec_cases),
+                        prediction_source,
                         0,
                         0,
                         delta, ratio,
@@ -614,7 +623,8 @@ def handle_sync_order(conn: psycopg2.extensions.connection, db: firestore.Client
                 INSERT INTO forecast_corrections (
                     correction_id, forecast_id, order_id, route_number, schedule_key,
                     delivery_date, store_id, store_name, sap,
-                    predicted_units, predicted_cases, final_units, final_cases,
+                    predicted_units, predicted_cases, prediction_source,
+                    final_units, final_cases,
                     correction_delta, correction_ratio, was_removed,
                     promo_id, promo_active,
                     submitted_at
@@ -624,6 +634,7 @@ def handle_sync_order(conn: psycopg2.extensions.connection, db: firestore.Client
                     final_cases = EXCLUDED.final_cases,
                     predicted_units = EXCLUDED.predicted_units,
                     predicted_cases = EXCLUDED.predicted_cases,
+                    prediction_source = EXCLUDED.prediction_source,
                     correction_delta = EXCLUDED.correction_delta,
                     correction_ratio = EXCLUDED.correction_ratio,
                     was_removed = EXCLUDED.was_removed,
@@ -698,7 +709,7 @@ def handle_get_archived_dates(conn: psycopg2.extensions.connection, payload: Dic
     
     try:
         cur = conn.cursor(cursor_factory=RealDictCursor)
-        # Match original DuckDB query structure - group by order_id to get one row per order
+        # Group by order_id to get one row per order.
         cur.execute("""
             SELECT 
                 o.delivery_date,
@@ -732,7 +743,7 @@ def handle_get_archived_dates(conn: psycopg2.extensions.connection, payload: Dic
 def handle_get_order(conn: psycopg2.extensions.connection, payload: Dict) -> Dict:
     """Get a specific archived order.
     
-    Returns order in the exact format the app expects (matching original DuckDB version).
+    Returns the order in the exact format the app expects.
     """
     route_number = payload.get('routeNumber')
     delivery_date = payload.get('deliveryDate')

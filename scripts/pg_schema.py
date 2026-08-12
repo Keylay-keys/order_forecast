@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """PostgreSQL schema definitions for the Order Forecast analytical database.
 
-Migration from DuckDB to PostgreSQL for multi-writer support.
-No more single-writer lock - all services can write concurrently.
+All runtime services connect directly and may write concurrently.
 
 This module creates and manages the PostgreSQL database schema used for:
 - Historical order storage (permanent, never deleted)
@@ -194,6 +193,13 @@ def _create_order_tables(cur) -> None:
             
             submitted_at TIMESTAMP WITH TIME ZONE NOT NULL
         )
+    """)
+    # Existing installations predate source-aware correction evidence. CREATE
+    # TABLE IF NOT EXISTS does not add columns, so keep this migration explicit
+    # and idempotent before the sync worker begins writing prediction_source.
+    cur.execute("""
+        ALTER TABLE forecast_corrections
+        ADD COLUMN IF NOT EXISTS prediction_source VARCHAR(50)
     """)
     
     print("  ✓ Order tables created")
