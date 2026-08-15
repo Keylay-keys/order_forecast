@@ -19,10 +19,12 @@ import threading
 from fastapi import Request
 from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.concurrency import run_in_threadpool
 
-from ..utils.security_logger import security_logger
+from ..utils.security_logger import SOURCE_INSTANCE, security_logger
 from ..utils.blocklist import blocklist, WHITELISTED_IPS
 from ..utils.client_ip import get_client_ip
+from ..utils.security_store import security_store
 
 
 class BruteForceProtection:
@@ -41,13 +43,13 @@ class BruteForceProtection:
         self.locked_out: Dict[str, datetime] = {}  # IP -> unlock_time
         self._lock = threading.Lock()
     
-    def record_failure(self, ip: str, reason: str = "auth_failure"):
+    def record_failure(self, ip: str, reason: str = "auth_failure") -> Optional[timedelta]:
         """Record a failed attempt for an IP.
         
         Checks if lockout threshold is reached and applies it.
         """
         if ip in WHITELISTED_IPS:
-            return
+            return None
         
         with self._lock:
             now = datetime.utcnow()
@@ -72,19 +74,11 @@ class BruteForceProtection:
                     unlock_time = now + lockout_duration
                     self.locked_out[ip] = unlock_time
                     
-                    # Log the lockout
-                    security_logger.brute_force_lockout(
-                        ip=ip,
-                        failures=recent_fails,
-                        lockout_minutes=int(lockout_duration.total_seconds() / 60),
-                        reason=reason
-                    )
-                    
-                    # For severe cases (24h lockout), also add to persistent blocklist
-                    if lockout_duration >= timedelta(hours=24):
-                        blocklist.add(ip, reason=f"brute_force_{reason}", duration=lockout_duration)
-                    
-                    break
+                    # The middleware performs shared PostgreSQL work outside
+                    # this in-memory lock and outside the async event loop.
+                    return lockout_duration
+
+        return None
     
     def is_locked_out(self, ip: str) -> bool:
         """Check if IP is currently locked out."""
@@ -174,10 +168,7 @@ class BruteForceMiddleware(BaseHTTPMiddleware):
             retry_after = brute_force.get_retry_after_seconds(ip)
             return JSONResponse(
                 status_code=429,
-                content={
-                    "error": "Too many failed attempts. Try again later.",
-                    "code": "LOCKED_OUT"
-                },
+                content={"error": "Too many requests", "code": "RATE_LIMITED"},
                 headers={"Retry-After": str(retry_after)}
             )
         
@@ -193,7 +184,44 @@ class BruteForceMiddleware(BaseHTTPMiddleware):
             # entire IP and take down unrelated API access.
             if path.startswith("/api/health"):
                 return response
-            brute_force.record_failure(ip, "auth_failure")
+            decision = None
+            try:
+                decision = await run_in_threadpool(
+                    security_store.record_auth_failure,
+                    ip,
+                    reason="auth_failure",
+                    path=path,
+                    source_instance=SOURCE_INSTANCE,
+                )
+            except Exception:
+                # Keep the original local limiter only as an outage fallback.
+                security_logger.log_event(
+                    event_type="auth_counter_store_unavailable",
+                    severity="critical",
+                    details={},
+                    ip=ip,
+                    path=path,
+                )
+                local_duration = brute_force.record_failure(ip, "auth_failure")
+                if local_duration:
+                    decision = {
+                        "failures": len(brute_force.failed_attempts.get(ip, [])),
+                        "lockout_duration": local_duration,
+                    }
+            if decision:
+                lockout_duration = decision["lockout_duration"]
+                security_logger.brute_force_lockout(
+                    ip=ip,
+                    failures=int(decision["failures"]),
+                    lockout_minutes=max(1, int(lockout_duration.total_seconds() / 60)),
+                    reason="auth_failure",
+                )
+                await run_in_threadpool(
+                    blocklist.add,
+                    ip,
+                    "brute_force_auth_failure",
+                    lockout_duration,
+                )
         return response
 
 

@@ -30,6 +30,7 @@ from .middleware.brute_force import setup_brute_force_protection
 from .middleware.code_protection import setup_code_protection
 from .middleware.request_context import setup_request_context
 from .middleware.usage_analytics import setup_usage_analytics
+from .utils.security_store import flush_security_events, security_store, start_security_maintenance
 
 # =============================================================================
 # CONFIGURATION
@@ -83,6 +84,14 @@ async def lifespan(app: FastAPI):
         get_pg_pool()
         logger.info("PostgreSQL connection pool initialized")
 
+        # Security state must never silently fall back to per-process storage.
+        # Apply the schema migration before rolling out a web-api image that
+        # contains this contract.
+        security_store.verify_schema()
+        logger.info("Cluster-wide security schema verified")
+        start_security_maintenance()
+        logger.info("Cluster-wide security maintenance worker started")
+
     except Exception as e:
         logger.error(f"Startup failed: {e}")
         raise
@@ -90,6 +99,8 @@ async def lifespan(app: FastAPI):
     yield
     
     # Shutdown
+    if not flush_security_events(timeout_seconds=5):
+        logger.error("Timed out flushing queued security evidence during shutdown")
     logger.info("Shutting down RouteSpark API")
 
 

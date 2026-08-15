@@ -1,94 +1,74 @@
-"""IP Blocklist with persistence.
-
-Manages blocked IPs with:
-- Persistent storage (survives restarts)
-- Auto-expiry for temporary bans
-- Explicit permanent bans for known bad IPs
-- Escalating bans for repeat offenders (capped at 48h max for temporary bans)
-- Whitelist for known good IPs
-"""
+"""Cluster-wide IP blocklist with a bounded local outage fallback."""
 
 from __future__ import annotations
 
-import json
+from datetime import datetime, timedelta, timezone
+import ipaddress
+import logging
 import os
-from datetime import datetime, timedelta
-from pathlib import Path
+from threading import Lock
 from typing import Any, Dict, Optional, Set
-import threading
 
 from .security_logger import security_logger
+from .security_store import PostgresSecurityStore, security_store
 
-# Paths
-DATA_DIR = Path(__file__).parent.parent.parent / "data"
-BLOCKLIST_FILE = DATA_DIR / "ip_blocklist.json"
 
-# Whitelisted IPs (from environment or hardcoded)
-WHITELISTED_IPS: Set[str] = set(
-    ip.strip() 
+logger = logging.getLogger("api.blocklist")
+
+WHITELISTED_IPS: Set[str] = {
+    ip.strip()
     for ip in os.environ.get("WHITELISTED_IPS", "127.0.0.1").split(",")
     if ip.strip()
-)
+}
 
 
 class IPBlocklist:
-    """Persistent IP blocklist with auto-expiry and escalation."""
-    
-    # Maximum ban duration (protects shared NAT IPs)
+    """Use PostgreSQL as authority; retain known blocks during brief outages."""
+
     MAX_BAN_DURATION = timedelta(hours=48)
-    
-    def __init__(self):
-        self.blocklist: Dict[str, Dict[str, Any]] = {}
-        self._lock = threading.Lock()
-        self._dirty = False
-        self._load()
-    
-    def _load(self):
-        """Load blocklist from disk."""
-        if BLOCKLIST_FILE.exists():
-            try:
-                data = json.loads(BLOCKLIST_FILE.read_text())
-                for ip, entry in data.items():
-                    permanent = bool(entry.get("permanent", False))
-                    until_raw = entry.get("until")
-                    self.blocklist[ip] = {
-                        "until": datetime.fromisoformat(until_raw) if until_raw else None,
-                        "reason": entry["reason"],
-                        "hits": entry.get("hits", 1),
-                        "permanent": permanent,
-                        "first_seen_at": entry.get("first_seen_at"),
-                        "last_seen_at": entry.get("last_seen_at"),
-                        "last_metadata": entry.get("last_metadata") or {},
-                    }
-            except Exception as e:
-                print(f"[blocklist] Error loading blocklist: {e}")
-    
-    def _save(self):
-        """Persist blocklist to disk."""
-        DATA_DIR.mkdir(parents=True, exist_ok=True)
-        
-        # Only save active blocks
-        now = datetime.utcnow()
-        data = {
-            ip: {
-                "until": entry["until"].isoformat() if entry.get("until") else None,
-                "reason": entry["reason"],
-                "hits": entry["hits"],
-                "permanent": entry.get("permanent", False),
-                "first_seen_at": entry.get("first_seen_at"),
-                "last_seen_at": entry.get("last_seen_at"),
-                "last_metadata": entry.get("last_metadata") or {},
-            }
-            for ip, entry in self.blocklist.items()
-            if entry.get("permanent") or (entry.get("until") and entry["until"] > now)
-        }
-        
+
+    def __init__(self, store: Optional[PostgresSecurityStore] = None) -> None:
+        self._store = store or security_store
+        self._fallback_blocks: Dict[str, Dict[str, Any]] = {}
+        self._lock = Lock()
+
+    @staticmethod
+    def _canonical_ip(ip: str) -> Optional[str]:
         try:
-            BLOCKLIST_FILE.write_text(json.dumps(data, indent=2))
-            self._dirty = False
-        except Exception as e:
-            print(f"[blocklist] Error saving blocklist: {e}")
-    
+            return str(ipaddress.ip_address(str(ip or "").strip()))
+        except ValueError:
+            logger.warning("Ignoring invalid client IP supplied to blocklist")
+            return None
+
+    @staticmethod
+    def _active(entry: Optional[Dict[str, Any]]) -> bool:
+        if not entry:
+            return False
+        if entry.get("permanent"):
+            return True
+        until_raw = entry.get("until")
+        if not until_raw:
+            return False
+        until = datetime.fromisoformat(str(until_raw).replace("Z", "+00:00"))
+        if until.tzinfo is None:
+            until = until.replace(tzinfo=timezone.utc)
+        return until > datetime.now(timezone.utc)
+
+    def _remember(self, ip: str, entry: Optional[Dict[str, Any]]) -> None:
+        with self._lock:
+            if self._active(entry):
+                self._fallback_blocks[ip] = dict(entry or {})
+            else:
+                self._fallback_blocks.pop(ip, None)
+
+    def _fallback(self, ip: str) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            entry = self._fallback_blocks.get(ip)
+            if self._active(entry):
+                return dict(entry or {})
+            self._fallback_blocks.pop(ip, None)
+            return None
+
     def add(
         self,
         ip: str,
@@ -98,185 +78,109 @@ class IPBlocklist:
         permanent: bool = False,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> bool:
-        """Add IP to blocklist.
-        
-        Duration escalates for repeat offenders:
-        - 1st offense: specified duration (default 24h)
-        - 2nd offense: 2x duration
-        - 3rd+ offense: 4x duration
-        
-        Returns:
-            True if newly blocked, False if already blocked
-        """
-        if ip in WHITELISTED_IPS:
+        canonical_ip = self._canonical_ip(ip)
+        if canonical_ip is None or canonical_ip in WHITELISTED_IPS:
             return False
-
-        with self._lock:
-            now = datetime.utcnow()
-            now_iso = now.isoformat() + "Z"
-            existing = self.blocklist.get(ip)
-
-            if existing:
-                hits = existing["hits"] + 1
-                if existing.get("permanent"):
-                    permanent = True
-            else:
-                hits = 1
-
-            if not permanent:
-                # Escalate duration for repeat offenders
-                if hits >= 3:
-                    duration = duration * 4
-                elif hits >= 2:
-                    duration = duration * 2
-
-                # Cap at max duration to protect shared NAT IPs
-                if duration > self.MAX_BAN_DURATION:
-                    duration = self.MAX_BAN_DURATION
-
-            expires_at = None if permanent else now + duration
-            self.blocklist[ip] = {
-                "until": expires_at,
+        try:
+            entry = self._store.add_block(
+                canonical_ip,
+                reason,
+                duration,
+                permanent=permanent,
+                metadata=metadata,
+            )
+            enforcement_scope = "cluster"
+        except Exception:
+            now = datetime.now(timezone.utc)
+            existing = self._fallback(canonical_ip)
+            hits = int(existing.get("hits") or 0) + 1 if existing else 1
+            base_duration = min(
+                max(duration, timedelta(seconds=1)),
+                self.MAX_BAN_DURATION,
+            )
+            effective_duration = min(
+                base_duration * (4 if hits >= 3 else 2 if hits == 2 else 1),
+                self.MAX_BAN_DURATION,
+            )
+            entry = {
+                "ip": canonical_ip,
+                "until": None if permanent else (now + effective_duration).isoformat(),
                 "reason": reason,
                 "hits": hits,
                 "permanent": permanent,
-                "first_seen_at": existing.get("first_seen_at", now_iso) if existing else now_iso,
-                "last_seen_at": now_iso,
+                "first_seen_at": existing.get("first_seen_at") if existing else now.isoformat(),
+                "last_seen_at": now.isoformat(),
                 "last_metadata": metadata or {},
             }
-            self._dirty = True
-            self._save()
-
-        # Log the block
-        security_logger.ip_blocked(
-            ip=ip,
-            reason=reason,
-            duration_hours=None if permanent else duration.total_seconds() / 3600,
-            permanent=permanent,
-            hits=hits,
-            expires_at=expires_at.isoformat() + "Z" if expires_at else None,
-            details=metadata,
+            enforcement_scope = "local_outage_fallback"
+            logger.exception(
+                "Shared blocklist write failed; enforcing a local outage fallback for ip=%s",
+                canonical_ip,
+            )
+        self._remember(canonical_ip, entry)
+        until = datetime.fromisoformat(entry["until"]) if entry.get("until") else None
+        effective_hours = (
+            max(0.0, (until - datetime.now(timezone.utc)).total_seconds() / 3600)
+            if until
+            else None
         )
-
+        security_logger.ip_blocked(
+            ip=canonical_ip,
+            reason=reason,
+            duration_hours=effective_hours,
+            permanent=entry["permanent"],
+            hits=entry["hits"],
+            expires_at=entry["until"],
+            details={**(metadata or {}), "enforcement_scope": enforcement_scope},
+        )
         return True
-    
+
+    def get_block_info(self, ip: str) -> Optional[Dict[str, Any]]:
+        canonical_ip = self._canonical_ip(ip)
+        if canonical_ip is None or canonical_ip in WHITELISTED_IPS:
+            return None
+        try:
+            entry = self._store.get_block(canonical_ip)
+            self._remember(canonical_ip, entry)
+            return entry
+        except Exception:
+            # Availability-safe degradation: never block a previously clean IP
+            # merely because PostgreSQL is unavailable, but continue enforcing a
+            # still-active block this worker has already observed.
+            fallback = self._fallback(canonical_ip)
+            logger.exception(
+                "Shared blocklist unavailable; using local known-block fallback for ip=%s active=%s",
+                canonical_ip,
+                bool(fallback),
+            )
+            return fallback
+
     def is_blocked(self, ip: str) -> bool:
-        """Check if IP is currently blocked.
-        
-        Cleans up expired entries.
-        """
-        if ip in WHITELISTED_IPS:
-            return False
-        
-        with self._lock:
-            if ip not in self.blocklist:
-                return False
+        return self.get_block_info(ip) is not None
 
-            entry = self.blocklist[ip]
-            if entry.get("permanent"):
-                return True
-            if datetime.utcnow() > entry["until"]:
-                # Expired, clean up
-                del self.blocklist[ip]
-                self._dirty = True
-                return False
-            
-            return True
-    
-    def get_block_info(self, ip: str) -> Optional[Dict]:
-        """Get block details for an IP."""
-        if ip not in self.blocklist:
-            return None
-        
-        entry = self.blocklist[ip]
-        if not entry.get("permanent") and datetime.utcnow() > entry["until"]:
-            return None
-
-        return {
-            "until": entry["until"].isoformat() if entry.get("until") else None,
-            "reason": entry["reason"],
-            "hits": entry["hits"],
-            "permanent": entry.get("permanent", False),
-            "first_seen_at": entry.get("first_seen_at"),
-            "last_seen_at": entry.get("last_seen_at"),
-            "last_metadata": entry.get("last_metadata") or {},
-        }
-    
     def remove(self, ip: str) -> bool:
-        """Manually unblock an IP.
-        
-        Returns:
-            True if IP was blocked and removed, False otherwise
-        """
-        with self._lock:
-            if ip in self.blocklist:
-                del self.blocklist[ip]
-                self._dirty = True
-                self._save()
-                return True
+        canonical_ip = self._canonical_ip(ip)
+        if canonical_ip is None:
             return False
-    
-    def get_stats(self) -> Dict:
-        """Get blocklist statistics for admin dashboard."""
-        now = datetime.utcnow()
-        
-        with self._lock:
-            active = {
-                ip: entry 
-                for ip, entry in self.blocklist.items()
-                if entry.get("permanent") or (entry.get("until") and entry["until"] > now)
-            }
-        
-        # Sort by hits (most offensive first)
-        top_offenders = sorted(
-            active.items(),
-            key=lambda x: x[1]["hits"],
-            reverse=True
-        )[:10]
-        
-        return {
-            "active_blocks": len(active),
-            "top_offenders": [
-                {
-                    "ip": ip,
-                    "hits": entry["hits"],
-                    "reason": entry["reason"],
-                    "expires": entry["until"].isoformat() if entry.get("until") else None,
-                    "permanent": entry.get("permanent", False),
-                    "last_seen_at": entry.get("last_seen_at"),
-                }
-                for ip, entry in top_offenders
-            ]
-        }
-    
-    def cleanup(self):
-        """Remove all expired entries."""
-        now = datetime.utcnow()
-        
-        with self._lock:
-            expired = [
-                ip for ip, entry in self.blocklist.items()
-                if not entry.get("permanent") and entry.get("until") and entry["until"] <= now
-            ]
-            
-            for ip in expired:
-                del self.blocklist[ip]
-            
-            if expired:
-                self._dirty = True
-                self._save()
-        
-        return len(expired)
+        removed = self._store.remove_block(canonical_ip)
+        self._remember(canonical_ip, None)
+        return removed
+
+    def get_stats(self) -> Dict[str, Any]:
+        return self._store.get_stats()
+
+    def cleanup(self) -> int:
+        return self._store.cleanup_expired()
 
     def permaban(self, ip: str, reason: str, metadata: Optional[Dict[str, Any]] = None) -> bool:
-        """Apply a non-expiring block to an IP."""
         return self.add(ip, reason=reason, permanent=True, metadata=metadata)
 
 
-# Singleton instance
 blocklist = IPBlocklist()
 
 
 async def add_to_blocklist(ip: str, reason: str, duration: timedelta = timedelta(hours=24)):
-    """Async wrapper for adding to blocklist."""
-    blocklist.add(ip, reason, duration)
+    """Compatibility wrapper for callers that already await block additions."""
+    from starlette.concurrency import run_in_threadpool
+
+    return await run_in_threadpool(blocklist.add, ip, reason, duration)

@@ -99,6 +99,7 @@ def create_schema(conn: psycopg2.extensions.connection) -> None:
     _create_forecast_learning_tables(cur)
     _create_notification_tables(cur)
     _create_usage_analytics_tables(cur)
+    _create_security_tables(cur)
     _create_indexes(cur)
     
     conn.commit()
@@ -1157,6 +1158,48 @@ def _create_usage_analytics_tables(cur) -> None:
 
 
 # =============================================================================
+# API SECURITY EVIDENCE AND ENFORCEMENT
+# =============================================================================
+
+def _create_security_tables(cur) -> None:
+    """Create shared abuse-control state and bounded security evidence."""
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS security_ip_blocks (
+            ip_address INET PRIMARY KEY,
+            reason VARCHAR(128) NOT NULL,
+            hit_count INTEGER NOT NULL DEFAULT 1 CHECK (hit_count > 0),
+            permanent BOOLEAN NOT NULL DEFAULT FALSE,
+            blocked_until TIMESTAMP WITH TIME ZONE,
+            first_seen_at TIMESTAMP WITH TIME ZONE NOT NULL,
+            last_seen_at TIMESTAMP WITH TIME ZONE NOT NULL,
+            last_metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+            CHECK (
+                (permanent AND blocked_until IS NULL)
+                OR (NOT permanent AND blocked_until IS NOT NULL)
+            )
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS security_events (
+            id BIGSERIAL PRIMARY KEY,
+            occurred_at TIMESTAMP WITH TIME ZONE NOT NULL,
+            event_type VARCHAR(64) NOT NULL,
+            severity VARCHAR(16) NOT NULL
+                CHECK (severity IN ('low', 'medium', 'high', 'critical')),
+            ip_address INET,
+            request_path VARCHAR(512),
+            source_instance VARCHAR(255) NOT NULL,
+            details JSONB NOT NULL DEFAULT '{}'::jsonb,
+            recorded_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    print("  ✓ API security tables created")
+
+
+# =============================================================================
 # INDEXES
 # =============================================================================
 
@@ -1235,6 +1278,14 @@ def _create_indexes(cur) -> None:
         ("idx_api_usage_route_date", "api_usage_daily", "route_number, activity_date"),
         ("idx_api_usage_errors_occurred", "api_usage_errors", "occurred_at DESC"),
         ("idx_api_usage_errors_route_occurred", "api_usage_errors", "route_number, occurred_at DESC"),
+
+        # Cluster-wide API abuse controls and evidence
+        ("idx_security_blocks_active", "security_ip_blocks", "permanent, blocked_until"),
+        ("idx_security_blocks_last_seen", "security_ip_blocks", "last_seen_at DESC"),
+        ("idx_security_events_occurred", "security_events", "occurred_at DESC"),
+        ("idx_security_events_type_occurred", "security_events", "event_type, occurred_at DESC"),
+        ("idx_security_events_ip_occurred", "security_events", "ip_address, occurred_at DESC"),
+        ("idx_security_events_ip_type_occurred", "security_events", "ip_address, event_type, occurred_at DESC"),
     ]
     
     for name, table, columns in indexes:

@@ -18,6 +18,7 @@ from datetime import timedelta
 from fastapi import Request
 from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.concurrency import run_in_threadpool
 
 from ..utils.security_logger import security_logger
 from ..utils.blocklist import blocklist
@@ -186,9 +187,15 @@ class HoneypotMiddleware(BaseHTTPMiddleware):
             
             # Add to blocklist. Known-bad IPs can be pinned permanently.
             if permanent:
-                blocklist.permaban(ip, reason="honeypot", metadata=details)
+                await run_in_threadpool(blocklist.permaban, ip, "honeypot", details)
             else:
-                blocklist.add(ip, reason="honeypot", duration=timedelta(hours=24), metadata=details)
+                await run_in_threadpool(
+                    blocklist.add,
+                    ip,
+                    "honeypot",
+                    timedelta(hours=24),
+                    metadata=details,
+                )
             
             # Return believable error (don't reveal it's a trap)
             return JSONResponse(

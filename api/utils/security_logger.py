@@ -15,14 +15,20 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
+import os
 from pathlib import Path
+import socket
 from typing import Dict, Any, Optional
 
-# Log directory
-LOG_DIR = Path(__file__).parent.parent.parent / "logs"
-SECURITY_LOG_FILE = LOG_DIR / "security.log"
+# The container manifest sets SECURITY_LOG_DIR to its host-backed /app/logs
+# mount. Local development keeps its existing repository-local default.
+DEFAULT_LOG_DIR = Path(__file__).parent.parent.parent / "logs"
+LOG_DIR = Path(os.environ.get("SECURITY_LOG_DIR", str(DEFAULT_LOG_DIR)))
+SOURCE_INSTANCE = f"{socket.gethostname()}:{os.getpid()}"
+# One file per process avoids unsafe multi-process rotation of one shared file.
+SECURITY_LOG_FILE = LOG_DIR / f"security-{socket.gethostname()}-{os.getpid()}.jsonl"
 
 # Log rotation settings
 MAX_LOG_SIZE = 10 * 1024 * 1024  # 10MB per file
@@ -38,6 +44,12 @@ class SecurityLogger:
     
     def _setup_handler(self):
         """Set up rotating file handler for security logs."""
+        if any(
+            getattr(existing, "_routespark_security_handler", False)
+            for existing in self.logger.handlers
+        ):
+            return
+
         LOG_DIR.mkdir(parents=True, exist_ok=True)
         
         # Rotating file handler - prevents unbounded growth
@@ -51,11 +63,10 @@ class SecurityLogger:
         # JSON formatter
         formatter = logging.Formatter('%(message)s')
         handler.setFormatter(formatter)
+        handler._routespark_security_handler = True  # type: ignore[attr-defined]
         
-        # Avoid duplicate handlers
-        if not self.logger.handlers:
-            self.logger.addHandler(handler)
-            self.logger.setLevel(logging.WARNING)
+        self.logger.addHandler(handler)
+        self.logger.setLevel(logging.WARNING)
     
     def log_event(
         self,
@@ -76,10 +87,17 @@ class SecurityLogger:
             uid: User ID if known
             path: Request path
         """
+        occurred_at = datetime.now(timezone.utc)
+        normalized_severity = (
+            severity
+            if severity in {"low", "medium", "high", "critical"}
+            else "medium"
+        )
         event = {
-            "timestamp": datetime.utcnow().isoformat() + "Z",
+            "timestamp": occurred_at.isoformat().replace("+00:00", "Z"),
             "event": event_type,
-            "severity": severity,
+            "severity": normalized_severity,
+            "source_instance": SOURCE_INSTANCE,
             "ip": ip,
             "uid": uid,
             "path": path,
@@ -89,7 +107,33 @@ class SecurityLogger:
         # Remove None values
         event = {k: v for k, v in event.items() if v is not None}
         
-        self.logger.warning(json.dumps(event))
+        self.logger.warning(json.dumps(event, ensure_ascii=True, default=str))
+
+        # stdout and the per-process file remain immediate evidence. PostgreSQL
+        # adds the durable, cluster-wide copy without delaying the request.
+        try:
+            from .security_store import SecurityEvent, enqueue_security_event
+
+            persisted_details = {
+                key: value
+                for key, value in event.items()
+                if key not in {"timestamp", "event", "severity", "ip", "path", "uid", "source_instance"}
+            }
+            if uid:
+                persisted_details["authenticated_actor_present"] = True
+            enqueue_security_event(
+                SecurityEvent(
+                    occurred_at=occurred_at,
+                    event_type=event_type,
+                    severity=normalized_severity,
+                    details=persisted_details,
+                    ip=ip,
+                    path=path,
+                    source_instance=SOURCE_INSTANCE,
+                )
+            )
+        except Exception:
+            self.logger.exception("Could not queue PostgreSQL security evidence")
     
     # Convenience methods for common events
     

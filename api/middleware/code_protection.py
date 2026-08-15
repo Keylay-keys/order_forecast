@@ -13,10 +13,11 @@ enumeration detection and blocklist enforcement.
 from __future__ import annotations
 
 import re
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from fastapi import Request
 from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.concurrency import run_in_threadpool
 
 from ..utils.security_logger import security_logger
 from ..utils.blocklist import blocklist, WHITELISTED_IPS
@@ -95,17 +96,38 @@ class BlocklistMiddleware(BaseHTTPMiddleware):
         if ip in WHITELISTED_IPS:
             return await call_next(request)
         
-        # Check blocklist
-        if blocklist.is_blocked(ip):
+        # The authoritative lookup is synchronous PostgreSQL work, so keep it
+        # off the event loop. Fetch once to avoid a second, inconsistent read.
+        block_info = await run_in_threadpool(blocklist.get_block_info, ip)
+        if block_info:
+            current_request = {
+                "current_method": request.method,
+                "current_cf_ray": request.headers.get("cf-ray", ""),
+                "current_user_agent": request.headers.get("user-agent", ""),
+            }
             security_logger.blocked_ip_attempt(
                 ip,
                 request.url.path,
-                details=blocklist.get_block_info(ip) or {},
+                details={**block_info, **current_request},
             )
-            return JSONResponse(
-                status_code=403,
-                content={"error": "Access denied"}
-            )
+            if str(block_info.get("reason") or "").startswith("brute_force_"):
+                retry_after = 1
+                if block_info.get("until"):
+                    until = datetime.fromisoformat(
+                        str(block_info["until"]).replace("Z", "+00:00")
+                    )
+                    if until.tzinfo is None:
+                        until = until.replace(tzinfo=timezone.utc)
+                    retry_after = max(
+                        1,
+                        int((until - datetime.now(timezone.utc)).total_seconds()),
+                    )
+                return JSONResponse(
+                    status_code=429,
+                    content={"error": "Too many requests", "code": "RATE_LIMITED"},
+                    headers={"Retry-After": str(retry_after)},
+                )
+            return JSONResponse(status_code=403, content={"error": "Access denied"})
         
         return await call_next(request)
 
@@ -128,7 +150,12 @@ class EnumerationProtectionMiddleware(BaseHTTPMiddleware):
             )
             
             # Add to blocklist
-            blocklist.add(ip, reason="enumeration", duration=timedelta(hours=12))
+            await run_in_threadpool(
+                blocklist.add,
+                ip,
+                "enumeration",
+                timedelta(hours=12),
+            )
             
             # Return generic 400 (don't reveal what we detected)
             return JSONResponse(
