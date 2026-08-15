@@ -59,21 +59,53 @@ def get_pg_connection() -> psycopg2.extensions.connection:
     return _pg_conn
 
 
+def _discard_pg_connection(connection: psycopg2.extensions.connection) -> None:
+    """Close a failed cached connection so the next read creates a fresh one."""
+    global _pg_conn
+    try:
+        connection.close()
+    except Exception:
+        pass
+    if _pg_conn is connection:
+        _pg_conn = None
+
+
+def _run_read(operation):
+    """Run an idempotent read, reconnecting exactly once on connection loss."""
+    for attempt in range(2):
+        connection = get_pg_connection()
+        try:
+            return operation(connection)
+        except (psycopg2.InterfaceError, psycopg2.OperationalError):
+            _discard_pg_connection(connection)
+            if attempt == 1:
+                raise
+    raise AssertionError("unreachable")
+
+
 def fetch_all(sql: str, params: Optional[Iterable[Any]] = None) -> list[dict]:
     """Run a SELECT and return rows as list of dicts."""
-    conn = get_pg_connection()
-    with conn.cursor(cursor_factory=RealDictCursor) as cur:
-        cur.execute(sql, list(params) if params else None)
-        return [dict(row) for row in cur.fetchall()]
+    bound_params = list(params) if params else None
+
+    def read(connection):
+        with connection.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(sql, bound_params)
+            return [dict(row) for row in cur.fetchall()]
+
+    return _run_read(read)
 
 
 def fetch_one(sql: str, params: Optional[Iterable[Any]] = None) -> Optional[dict]:
     """Run a SELECT and return a single row as dict."""
-    conn = get_pg_connection()
-    with conn.cursor(cursor_factory=RealDictCursor) as cur:
-        cur.execute(sql, list(params) if params else None)
-        row = cur.fetchone()
-        return dict(row) if row else None
+    bound_params = list(params) if params else None
+
+    def read(connection):
+        with connection.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(sql, bound_params)
+            row = cur.fetchone()
+            return dict(row) if row else None
+
+    return _run_read(read)
 
 
 def execute(sql: str, params: Optional[Iterable[Any]] = None) -> int:
@@ -98,6 +130,7 @@ def get_archived_dates(route_number: str) -> list[dict]:
     """
     rows = fetch_all("""
         SELECT 
+            o.order_id,
             o.delivery_date,
             o.schedule_key,
             COUNT(DISTINCT li.line_item_id) as item_count
@@ -113,6 +146,7 @@ def get_archived_dates(route_number: str) -> list[dict]:
         delivery_date = row.get('delivery_date')
         date_str = delivery_date.strftime('%Y-%m-%d') if hasattr(delivery_date, 'strftime') else str(delivery_date)
         dates.append({
+            'orderId': row.get('order_id'),
             'date': date_str,
             'scheduleKey': row.get('schedule_key') or 'unknown',
             'itemCount': row.get('item_count') or 0,
@@ -120,22 +154,7 @@ def get_archived_dates(route_number: str) -> list[dict]:
     return dates
 
 
-def get_order_by_date(route_number: str, delivery_date: str) -> Optional[dict]:
-    """Get order data for a specific delivery date.
-
-    Replacement for DBClient.get_order().
-    Returns order header with nested stores/items.
-    """
-    order_row = fetch_one("""
-        SELECT order_id, schedule_key, order_date, total_units, store_count
-        FROM orders_historical
-        WHERE route_number = %s AND delivery_date = %s
-        LIMIT 1
-    """, [route_number, delivery_date])
-
-    if not order_row:
-        return None
-
+def _build_archived_order(route_number: str, order_row: dict) -> dict:
     order_id = order_row.get('order_id')
     items = fetch_all("""
         SELECT store_id, store_name, sap, quantity
@@ -161,17 +180,56 @@ def get_order_by_date(route_number: str, delivery_date: str) -> Optional[dict]:
     order_date = order_row.get('order_date')
     if hasattr(order_date, 'isoformat'):
         order_date = order_date.isoformat()
+    delivery_date = order_row.get('delivery_date')
+    if hasattr(delivery_date, 'isoformat'):
+        delivery_date = delivery_date.isoformat()
+    finalized_at = order_row.get('finalized_at')
+    if hasattr(finalized_at, 'isoformat'):
+        finalized_at = finalized_at.isoformat()
+    synced_at = order_row.get('synced_at')
+    if hasattr(synced_at, 'isoformat'):
+        synced_at = synced_at.isoformat()
 
     return {
         'id': order_id,
         'routeNumber': route_number,
+        'userId': order_row.get('user_id') or '',
         'scheduleKey': order_row.get('schedule_key'),
         'deliveryDate': delivery_date,
+        'expectedDeliveryDate': delivery_date,
         'orderDate': order_date,
+        'status': 'finalized',
+        'createdAt': finalized_at or synced_at,
+        'updatedAt': synced_at or finalized_at,
         'totalUnits': order_row.get('total_units'),
         'storeCount': order_row.get('store_count'),
         'stores': list(stores.values()),
     }
+
+
+def get_order_by_id(route_number: str, order_id: str) -> Optional[dict]:
+    """Get an archived order by its canonical ID, scoped to its route."""
+    order_row = fetch_one("""
+        SELECT order_id, user_id, schedule_key, order_date, delivery_date,
+               finalized_at, synced_at, total_units, store_count
+        FROM orders_historical
+        WHERE route_number = %s AND order_id = %s
+        LIMIT 1
+    """, [route_number, order_id])
+    return _build_archived_order(route_number, order_row) if order_row else None
+
+
+def get_order_by_date(route_number: str, delivery_date: str) -> Optional[dict]:
+    """Compatibility lookup for older clients; deterministic across duplicates."""
+    order_row = fetch_one("""
+        SELECT order_id, user_id, schedule_key, order_date, delivery_date,
+               finalized_at, synced_at, total_units, store_count
+        FROM orders_historical
+        WHERE route_number = %s AND delivery_date = %s
+        ORDER BY order_date DESC, order_id DESC
+        LIMIT 1
+    """, [route_number, delivery_date])
+    return _build_archived_order(route_number, order_row) if order_row else None
 
 
 def check_route_synced(route_number: str) -> dict:

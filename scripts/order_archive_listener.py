@@ -18,9 +18,9 @@ from google.cloud import firestore  # type: ignore
 
 # Import pg_utils for direct PostgreSQL access
 try:
-    from .pg_utils import get_archived_dates, get_order_by_date
+    from .pg_utils import get_archived_dates, get_order_by_date, get_order_by_id
 except ImportError:
-    from pg_utils import get_archived_dates, get_order_by_date
+    from pg_utils import get_archived_dates, get_order_by_date, get_order_by_id
 
 # Worker ID for this instance
 WORKER_ID = f"archive-{socket.gethostname()}-{__import__('os').getpid()}"
@@ -39,6 +39,47 @@ def _route_allowed(route_number: str | None) -> bool:
         return False
     allowed = _allowed_routes()
     return True if allowed is None else str(route_number) in allowed
+
+
+def _user_has_route_access(user_data: dict, route_number: str) -> bool:
+    """Mirror Firestore hasAccessToRoute for listener defense in depth."""
+    if not isinstance(user_data, dict) or not route_number:
+        return False
+
+    profile = user_data.get("profile")
+    profile = profile if isinstance(profile, dict) else {}
+    assignments = user_data.get("routeAssignments")
+    assignments = assignments if isinstance(assignments, dict) else {}
+
+    role = profile.get("role")
+    owner_scoped = role in ("owner", "ownerOnly") and (
+        profile.get("routeNumber") == route_number
+        or profile.get("currentRoute") == route_number
+        or (
+            isinstance(profile.get("additionalRoutes"), list)
+            and route_number in profile["additionalRoutes"]
+        )
+    )
+    explicitly_assigned = route_number in assignments and assignments.get(route_number) is not None
+    return owner_scoped or explicitly_assigned
+
+
+def _requester_has_route_access(fb_client: firestore.Client, user_id: object, route_number: str) -> bool:
+    if not isinstance(user_id, str) or not user_id:
+        return False
+    user_doc = fb_client.collection("users").document(user_id).get()
+    if not user_doc.exists:
+        return False
+    return _user_has_route_access(user_doc.to_dict() or {}, route_number)
+
+
+def _reject_unauthorized_request(doc_ref) -> None:
+    doc_ref.update({
+        "status": "error",
+        "error": "Archive request is not authorized",
+        "workerId": WORKER_ID,
+        "completedAt": firestore.SERVER_TIMESTAMP,
+    })
 
 
 def _skip_initial_snapshot() -> bool:
@@ -61,18 +102,26 @@ def handle_list_dates(route_number: str) -> dict:
         return {'error': str(e)}
 
 
-def handle_get_order(route_number: str, delivery_date: str) -> dict:
+def handle_get_order(
+    route_number: str,
+    order_id: str | None = None,
+    delivery_date: str | None = None,
+) -> dict:
     """Handle request to get a specific archived order."""
     try:
-        order = get_order_by_date(route_number, delivery_date)
+        order = (
+            get_order_by_id(route_number, order_id)
+            if order_id
+            else get_order_by_date(route_number, str(delivery_date))
+        )
         if not order:
-            return {'error': f'No order found for {delivery_date}'}
+            return {'error': 'No archived order found'}
         return {'order': order}
     except Exception as e:
         return {'error': str(e)}
 
 
-def handle_request(doc_ref, data: dict) -> bool:
+def handle_request(doc_ref, data: dict, fb_client: firestore.Client) -> bool:
     """Process a single archive request."""
     request_id = data.get("requestId", doc_ref.id)
     request_type = data.get("type")
@@ -88,6 +137,17 @@ def handle_request(doc_ref, data: dict) -> bool:
         return False
 
     if not _route_allowed(route_number):
+        return False
+
+    try:
+        if not _requester_has_route_access(fb_client, data.get("userId"), str(route_number)):
+            _reject_unauthorized_request(doc_ref)
+            print(f"     ⛔ Unauthorized archive request rejected ({request_id[:20]}...)")
+            return False
+    except Exception as e:
+        # Fail closed if the user membership check cannot be completed.
+        print(f"     ⚠️  Archive authorization check failed: {type(e).__name__}")
+        _reject_unauthorized_request(doc_ref)
         return False
     
     # Claim this request
@@ -112,11 +172,16 @@ def handle_request(doc_ref, data: dict) -> bool:
             result = handle_list_dates(route_number)
 
         elif request_type == "get_order":
+            order_id = data.get("orderId")
             delivery_date = data.get("deliveryDate")
-            if not delivery_date:
-                result = {'error': 'Missing deliveryDate'}
+            if not order_id and not delivery_date:
+                result = {'error': 'Missing orderId'}
             else:
-                result = handle_get_order(route_number, delivery_date)
+                result = handle_get_order(
+                    route_number,
+                    order_id=str(order_id) if order_id else None,
+                    delivery_date=str(delivery_date) if delivery_date else None,
+                )
         
         else:
             result = {'error': f'Unknown request type: {request_type}'}
@@ -195,7 +260,7 @@ def watch_requests(sa_path: str):
             
             # Process the request
             try:
-                handle_request(doc.reference, data)
+                handle_request(doc.reference, data, fb_client)
             except Exception as e:
                 print(f"     ❌ Unexpected error: {e}")
     

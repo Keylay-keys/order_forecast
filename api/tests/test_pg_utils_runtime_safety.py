@@ -63,3 +63,47 @@ class PgUtilsRuntimeSafetyTests(unittest.TestCase):
             application_name = pg_utils._postgres_application_name()
 
         self.assertEqual(application_name, "routespark-delivery_manifest_listener.py")
+
+    def test_read_reconnects_once_after_stale_ssl_connection(self):
+        dead_connection = MagicMock()
+        dead_cursor = dead_connection.cursor.return_value.__enter__.return_value
+        dead_cursor.execute.side_effect = pg_utils.psycopg2.OperationalError(
+            "SSL connection has been closed unexpectedly"
+        )
+
+        healthy_connection = MagicMock()
+        healthy_cursor = healthy_connection.cursor.return_value.__enter__.return_value
+        healthy_cursor.fetchall.return_value = [{"order_id": "order-1"}]
+
+        with patch.object(
+            pg_utils,
+            "get_pg_connection",
+            side_effect=[dead_connection, healthy_connection],
+        ) as get_connection:
+            rows = pg_utils.fetch_all("SELECT order_id FROM orders_historical")
+
+        self.assertEqual(rows, [{"order_id": "order-1"}])
+        self.assertEqual(get_connection.call_count, 2)
+        dead_connection.close.assert_called_once_with()
+
+    def test_read_stops_after_one_reconnect_attempt(self):
+        first_connection = MagicMock()
+        first_connection.cursor.return_value.__enter__.return_value.execute.side_effect = (
+            pg_utils.psycopg2.OperationalError("SSL connection has been closed unexpectedly")
+        )
+        second_connection = MagicMock()
+        second_connection.cursor.return_value.__enter__.return_value.execute.side_effect = (
+            pg_utils.psycopg2.OperationalError("server still unavailable")
+        )
+
+        with patch.object(
+            pg_utils,
+            "get_pg_connection",
+            side_effect=[first_connection, second_connection],
+        ) as get_connection:
+            with self.assertRaises(pg_utils.psycopg2.OperationalError):
+                pg_utils.fetch_one("SELECT 1")
+
+        self.assertEqual(get_connection.call_count, 2)
+        first_connection.close.assert_called_once_with()
+        second_connection.close.assert_called_once_with()

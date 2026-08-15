@@ -179,6 +179,17 @@ def _fake_execute_values(cur, sql, rows, page_size=100):
 
 
 class TestHandleSyncOrderProjectionReplacement(unittest.TestCase):
+    def setUp(self):
+        self.receipt_patcher = mock.patch.object(
+            worker,
+            "write_verified_order_archive_receipt",
+            return_value={"status": "verified"},
+        )
+        self.receipt_mock = self.receipt_patcher.start()
+
+    def tearDown(self):
+        self.receipt_patcher.stop()
+
     def test_schema_v2_snapshot_records_omitted_zero_add_and_changed_amounts(self):
         route_number = "988200"
         order_id = "order-988200-v2"
@@ -216,10 +227,13 @@ class TestHandleSyncOrderProjectionReplacement(unittest.TestCase):
             mock.patch.object(worker, "execute_values", side_effect=_fake_execute_values),
             mock.patch.object(worker, "resolve_store_id_from_db", side_effect=lambda conn, route, store: store),
             mock.patch.object(worker, "is_holiday_week", return_value=(False, "")),
+            mock.patch.object(worker.traceback, "print_exc"),
         ):
             result = worker.handle_sync_order(conn, db, {"orderId": order_id, "routeNumber": route_number})
 
         self.assertTrue(result["success"])
+        self.assertTrue(result["archiveReceiptWritten"])
+        self.receipt_mock.assert_called_once()
         self.assertEqual(result["correctionsExtracted"], 3)
         self.assertEqual(set(conn.forecast_corrections), {
             f"{order_id}-store-1-omitted-rm",
@@ -232,6 +246,42 @@ class TestHandleSyncOrderProjectionReplacement(unittest.TestCase):
         self.assertEqual((zero_add[9], zero_add[11], zero_add[12], zero_add[14]), (0, "order_only_zero", 3, 3))
         self.assertEqual(changed[11], "baseline")
         self.assertEqual(omitted[11], "last_order")
+
+    def test_receipt_write_failure_surfaces_after_postgres_commit(self):
+        route_number = "989262"
+        order_id = "order-receipt-failure"
+        order = {
+            "routeNumber": route_number,
+            "userId": "user-1",
+            "expectedDeliveryDate": "2026-08-17",
+            "orderDate": "2026-08-14",
+            "scheduleKey": "monday",
+            "stores": [{
+                "storeId": "store-1",
+                "storeName": "Store One",
+                "items": [{"sap": "100", "quantity": 2, "cases": 0}],
+            }],
+        }
+        db = _FakeFirestoreDB({(route_number, order_id): order}, {})
+        conn = _FakeConnection()
+        self.receipt_mock.side_effect = RuntimeError("firestore receipt unavailable")
+
+        with (
+            mock.patch.object(worker, "execute_values", side_effect=_fake_execute_values),
+            mock.patch.object(worker, "resolve_store_id_from_db", side_effect=lambda conn, route, store: store),
+            mock.patch.object(worker, "is_holiday_week", return_value=(False, "")),
+            mock.patch.object(worker.traceback, "print_exc"),
+        ):
+            result = worker.handle_sync_order(
+                conn,
+                db,
+                {"orderId": order_id, "routeNumber": route_number},
+            )
+
+        self.assertIn("firestore receipt unavailable", result["error"])
+        self.assertEqual(conn.commits, 1)
+        self.assertEqual(conn.rollbacks, 1)
+        self.assertIn(order_id, conn.orders_historical)
 
     def test_sync_order_replaces_removed_line_items_and_stale_corrections(self):
         route_number = "989262"

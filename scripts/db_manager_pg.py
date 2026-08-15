@@ -44,6 +44,11 @@ import psycopg2
 from psycopg2.extras import RealDictCursor, execute_values
 from google.cloud import firestore
 
+try:
+    from .order_archive_receipt import write_verified_order_archive_receipt
+except ImportError:
+    from order_archive_receipt import write_verified_order_archive_receipt
+
 # Global flag for graceful shutdown
 _shutdown_requested = False
 
@@ -401,6 +406,12 @@ def handle_sync_order(conn: psycopg2.extensions.connection, db: firestore.Client
                 delivery_date, order_date, status, total_units, store_count, is_holiday_week, synced_at
             ) VALUES (%s, %s, %s, %s, %s, %s, 'finalized', %s, %s, %s, %s)
             ON CONFLICT (order_id) DO UPDATE SET
+                route_number = EXCLUDED.route_number,
+                user_id = EXCLUDED.user_id,
+                schedule_key = EXCLUDED.schedule_key,
+                delivery_date = EXCLUDED.delivery_date,
+                order_date = EXCLUDED.order_date,
+                status = EXCLUDED.status,
                 total_units = EXCLUDED.total_units,
                 store_count = EXCLUDED.store_count,
                 is_holiday_week = EXCLUDED.is_holiday_week,
@@ -644,12 +655,27 @@ def handle_sync_order(conn: psycopg2.extensions.connection, db: firestore.Client
         
         conn.commit()
         cur.close()
+
+        # The receipt is intentionally written only after PostgreSQL commits.
+        # Cleanup fails closed when this write is missing or does not exactly
+        # match current Firestore order truth.
+        write_verified_order_archive_receipt(
+            db,
+            str(order_id),
+            str(route_number),
+            data,
+            archive_total_units=total_units,
+            archive_store_count=len(stores),
+            archive_line_item_count=len(line_item_rows),
+        )
         
         return {
             'success': True,
             'orderId': order_id,
             'totalUnits': total_units,
             'storeCount': len(stores),
+            'lineItemCount': len(line_item_rows),
+            'archiveReceiptWritten': True,
             'correctionsExtracted': len(correction_rows),
             'isHolidayWeek': holiday_week,
         }
@@ -700,7 +726,7 @@ def handle_get_archived_dates(conn: psycopg2.extensions.connection, payload: Dic
     """Get list of archived order dates with summary info.
     
     Returns ArchivedDateSummary objects matching the app's expected format:
-    { date: string, scheduleKey: string, itemCount: number }
+    { orderId: string, date: string, scheduleKey: string, itemCount: number }
     """
     route_number = payload.get('routeNumber')
     
@@ -712,6 +738,7 @@ def handle_get_archived_dates(conn: psycopg2.extensions.connection, payload: Dic
         # Group by order_id to get one row per order.
         cur.execute("""
             SELECT 
+                o.order_id,
                 o.delivery_date,
                 o.schedule_key,
                 COUNT(DISTINCT li.line_item_id) as item_count
@@ -728,6 +755,7 @@ def handle_get_archived_dates(conn: psycopg2.extensions.connection, payload: Dic
             delivery_date = row['delivery_date']
             date_str = delivery_date.strftime('%Y-%m-%d') if hasattr(delivery_date, 'strftime') else str(delivery_date)
             dates.append({
+                'orderId': row['order_id'],
                 'date': date_str,
                 'scheduleKey': row['schedule_key'] or 'unknown',
                 'itemCount': row['item_count'] or 0,
@@ -746,25 +774,37 @@ def handle_get_order(conn: psycopg2.extensions.connection, payload: Dict) -> Dic
     Returns the order in the exact format the app expects.
     """
     route_number = payload.get('routeNumber')
+    order_id = payload.get('orderId')
     delivery_date = payload.get('deliveryDate')
     
-    if not route_number or not delivery_date:
-        return {'error': 'Missing routeNumber or deliveryDate'}
+    if not route_number or (not order_id and not delivery_date):
+        return {'error': 'Missing routeNumber or orderId'}
     
     try:
         cur = conn.cursor(cursor_factory=RealDictCursor)
         
         # Get order header
-        cur.execute("""
-            SELECT order_id, schedule_key, order_date, total_units, store_count
-            FROM orders_historical
-            WHERE route_number = %s AND delivery_date = %s
-            LIMIT 1
-        """, [route_number, delivery_date])
+        if order_id:
+            cur.execute("""
+                SELECT order_id, user_id, schedule_key, order_date, delivery_date,
+                       finalized_at, synced_at, total_units, store_count
+                FROM orders_historical
+                WHERE route_number = %s AND order_id = %s
+                LIMIT 1
+            """, [route_number, order_id])
+        else:
+            cur.execute("""
+                SELECT order_id, user_id, schedule_key, order_date, delivery_date,
+                       finalized_at, synced_at, total_units, store_count
+                FROM orders_historical
+                WHERE route_number = %s AND delivery_date = %s
+                ORDER BY order_date DESC, order_id DESC
+                LIMIT 1
+            """, [route_number, delivery_date])
         
         order_row = cur.fetchone()
         if not order_row:
-            return {'error': f'No order found for {delivery_date}'}
+            return {'error': 'No archived order found'}
         
         order_id = order_row['order_id']
         
@@ -795,6 +835,15 @@ def handle_get_order(conn: psycopg2.extensions.connection, payload: Dict) -> Dic
         order_date = order_row['order_date']
         if hasattr(order_date, 'isoformat'):
             order_date = order_date.isoformat()
+        resolved_delivery_date = order_row['delivery_date']
+        if hasattr(resolved_delivery_date, 'isoformat'):
+            resolved_delivery_date = resolved_delivery_date.isoformat()
+        finalized_at = order_row['finalized_at']
+        if hasattr(finalized_at, 'isoformat'):
+            finalized_at = finalized_at.isoformat()
+        synced_at = order_row['synced_at']
+        if hasattr(synced_at, 'isoformat'):
+            synced_at = synced_at.isoformat()
         
         cur.close()
         
@@ -802,9 +851,14 @@ def handle_get_order(conn: psycopg2.extensions.connection, payload: Dict) -> Dic
             'order': {
                 'id': order_id,
                 'routeNumber': route_number,
+                'userId': order_row['user_id'] or '',
                 'scheduleKey': order_row['schedule_key'],
-                'deliveryDate': delivery_date,
+                'deliveryDate': resolved_delivery_date,
+                'expectedDeliveryDate': resolved_delivery_date,
                 'orderDate': order_date,
+                'status': 'finalized',
+                'createdAt': finalized_at or synced_at,
+                'updatedAt': synced_at or finalized_at,
                 'totalUnits': order_row['total_units'],
                 'storeCount': order_row['store_count'],
                 'stores': list(stores.values()),
