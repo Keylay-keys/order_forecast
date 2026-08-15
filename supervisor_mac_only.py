@@ -2,9 +2,8 @@
 """Mac-only supervisor for RouteSpark services.
 
 Use this AFTER the server is running (PostgreSQL and Docker services).
-This script only runs services that require macOS:
-- PCF OCR Listener (uses Apple Vision framework)
-- Catalog Upload Listener (depends on pcf_pipeline)
+This script only runs the PCF OCR Listener, which requires the macOS Apple
+Vision framework.
 
 All database operations use direct PostgreSQL connections to the server.
 
@@ -33,18 +32,11 @@ from typing import List, Optional
 
 # Paths
 BASE_DIR = Path(__file__).parent
-SCRIPTS_DIR = BASE_DIR / 'scripts'
-VENV_PYTHON = BASE_DIR / 'venv' / 'bin' / 'python'
 LOG_DIR = BASE_DIR / 'logs'
 
 # PCF Pipeline paths
 PCF_DIR = Path('/Users/kylemacmini/projects/pcf_pipeline')
-PCF_VENV_PYTHON = PCF_DIR / '.venv' / 'bin' / 'python'
-PCF_SA_PATH = PCF_DIR / 'config' / 'serviceAccountKey.json'
 PCF_START_SCRIPT = PCF_DIR / 'scripts' / 'start_listener.sh'
-
-# Service account
-DEFAULT_SA_PATH = '/Users/kylemacmini/Desktop/dev/firebase-tools/routespark-1f47d-firebase-adminsdk-tnv5k-b259331cbc.json'
 
 # PCF Archive settings - keep local during day, sync to server at night
 PCF_ARCHIVE_REMOTE = 'keylay@routespark:/mnt/archive/pcf/pcf_archive'
@@ -149,21 +141,7 @@ def log(msg: str):
 
 def create_services() -> List[Service]:
     """Create Mac-only service definitions."""
-    python = str(VENV_PYTHON)
     services = []
-    
-    # Catalog Upload Listener (depends on pcf_pipeline)
-    services.append(
-        Service(
-            name="Catalog Upload Listener",
-            cmd=[
-                python,
-                str(SCRIPTS_DIR / 'catalog_upload_listener.py'),
-                '--serviceAccount', DEFAULT_SA_PATH,
-            ],
-            log_file=LOG_DIR / 'catalog_upload.log',
-        )
-    )
     
     # PCF OCR Listener (macOS Vision)
     if PCF_DIR.exists() and PCF_START_SCRIPT.exists():
@@ -196,8 +174,7 @@ def cmd_start(args):
     log("🍎 Starting Mac-Only RouteSpark Services")
     log("=" * 50)
     log("")
-    log("These services require macOS and cannot run on the server:")
-    log("  - Catalog Upload Listener (depends on pcf_pipeline)")
+    log("This service requires macOS and cannot run on the server:")
     log("  - PCF OCR Listener (Apple Vision framework)")
     log("")
     log("⚠️  Make sure the SERVER is running (PostgreSQL + Docker services)!")
@@ -238,7 +215,6 @@ def cmd_stop(args):
     log("=" * 50)
     
     patterns = [
-        ('Catalog Upload', 'catalog_upload_listener.py'),
         ('PCF OCR', 'pcf_core.runner'),
     ]
     
@@ -271,7 +247,6 @@ def cmd_status(args):
     log("=" * 50)
     
     patterns = [
-        ('Catalog Upload Listener', 'catalog_upload_listener.py'),
         ('PCF OCR Listener', 'pcf_core.runner'),
     ]
     

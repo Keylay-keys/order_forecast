@@ -242,11 +242,6 @@ def create_services() -> List[Service]:
         ),
         # NOTE: Promo Email Listener disabled - feature not in use.
         # File kept at order_forecast/scripts/promo_email_listener.py for future use.
-        #
-        # NOTE: catalog_upload_listener depends on pcf_pipeline (macOS Vision)
-        # It must run on the Mac, not in the server container.
-        # See supervisor.py on Mac for that service.
-        #
         # Low-quantity notification daemon
         Service(
             name="Low-Qty Notification Daemon",
@@ -374,7 +369,6 @@ def cmd_stop(args):
         'retrain_daemon.py',
         'delivery_manifest_listener.py',
         'promo_email_listener.py',
-        # catalog_upload_listener runs on Mac
         'low_qty_notification_daemon.py',
         'config_sync_listener.py',
         'promo_sync_listener.py',
@@ -419,7 +413,6 @@ def cmd_status(args):
         ('Retrain Daemon', 'retrain_daemon.py'),
         ('Delivery Manifest', 'delivery_manifest_listener.py'),
         ('Promo Email', 'promo_email_listener.py'),
-        # Catalog Upload runs on Mac (depends on pcf_pipeline)
         ('Low-Qty Notifications', 'low_qty_notification_daemon.py'),
         ('Config Sync', 'config_sync_listener.py'),
         ('Promo Sync', 'promo_sync_listener.py'),

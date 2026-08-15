@@ -3,7 +3,7 @@
 
 Shows status of:
 - Server services (via API health checks)
-- Mac-only services (PCF OCR, Catalog Upload)
+- Mac-only PCF OCR service
 
 Usage:
     python desktop_widget.py
@@ -130,7 +130,6 @@ DEFAULT_SETTINGS = {
 # Mac-only services to monitor locally
 MAC_SERVICES = [
     ('PCF OCR', 'pcf_core.runner'),
-    ('Catalog Upload', 'catalog_upload_listener.py'),
 ]
 
 # Server services (checked via API heartbeat)
