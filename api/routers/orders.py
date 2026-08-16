@@ -25,8 +25,14 @@ from ..models import (
     Order,
     OrderCreateRequest,
     OrderUpdateRequest,
+    StoreReallocationRequest,
+    StoreReallocationResponse,
+    FullOrderAdjustmentConfirmRequest,
+    FullOrderAdjustmentConfirmResponse,
     ErrorResponse,
 )
+from ..order_full_adjustment import validate_and_merge_full_adjustment
+from ..order_reallocation import apply_store_reallocation, moves_signature
 
 try:
     from ...scripts.finalize_rollout import api_finalize_rollout_enabled_for_route
@@ -212,6 +218,247 @@ def _order_ref(db: firestore.Client, route_number: str, order_id: str):
     )
 
 
+def _requester_is_route_owner(user_data: Dict[str, Any], route_number: str) -> bool:
+    profile = user_data.get("profile", {}) or {}
+    if (
+        str(profile.get("role") or "").strip().lower() == "owner"
+        and _normalize_route_number(profile.get("routeNumber")) == route_number
+    ):
+        return True
+    assignments = user_data.get("routeAssignments", {}) or {}
+    assignment = assignments.get(route_number, {}) if isinstance(assignments, dict) else {}
+    return (
+        isinstance(assignment, dict)
+        and str(assignment.get("role") or "").strip().lower() == "owner"
+    )
+
+
+def _order_revision(order_data: Dict[str, Any]) -> int:
+    value = order_data.get("orderRevision")
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else 0
+
+
+def _validate_adjusted_store_allocations(
+    order_data: Dict[str, Any],
+    route_stores: Dict[str, Dict[str, Any]],
+) -> None:
+    """Validate the complete server-merged allocation before committing it."""
+    quantities: Dict[tuple[str, str], int] = {}
+    seen_store_ids: set[str] = set()
+    for store in order_data.get("stores") or []:
+        store_id = str(store.get("storeId") or store.get("id") or "").strip()
+        route_store = route_stores.get(store_id)
+        if not store_id or store_id in seen_store_ids or route_store is None:
+            raise StructuredApiError(422, "The adjusted order contains an invalid store.", "ADJUSTMENT_STORE_INVALID")
+        if route_store.get("isActive", True) is False:
+            raise StructuredApiError(409, "The adjusted order contains an inactive store.", "ADJUSTMENT_STORE_INACTIVE")
+        seen_store_ids.add(store_id)
+        carried = route_store.get("items")
+        carried_saps = {str(sap) for sap in carried} if isinstance(carried, list) else None
+        seen_saps: set[str] = set()
+        for item in store.get("items") or []:
+            sap = str(item.get("sap") or "").strip()
+            quantity = item.get("quantity")
+            if (
+                not sap
+                or sap in seen_saps
+                or isinstance(quantity, bool)
+                or not isinstance(quantity, int)
+                or quantity <= 0
+            ):
+                raise StructuredApiError(422, "The adjusted order contains an invalid item.", "ADJUSTMENT_ITEM_INVALID")
+            if carried_saps is not None and sap not in carried_saps:
+                raise StructuredApiError(409, "A store does not carry an adjusted item.", "ADJUSTMENT_ITEM_NOT_CARRIED")
+            seen_saps.add(sap)
+            quantities[(store_id, sap)] = quantity
+
+    inbound_floors: Dict[tuple[str, str], int] = {}
+    for allocation in order_data.get("inboundTransferStoreAllocations") or []:
+        key = (str(allocation.get("storeId") or ""), str(allocation.get("sap") or ""))
+        units = allocation.get("units")
+        if isinstance(units, int) and not isinstance(units, bool) and units > 0:
+            inbound_floors[key] = inbound_floors.get(key, 0) + units
+    for key, required_units in inbound_floors.items():
+        if quantities.get(key, 0) < required_units:
+            raise StructuredApiError(
+                409,
+                "The adjusted order conflicts with an inbound transfer allocation.",
+                "ADJUSTMENT_INBOUND_ALLOCATION_CONFLICT",
+            )
+
+
+@firestore.transactional
+def _confirm_full_order_adjustment_document(
+    transaction,
+    *,
+    order_ref,
+    adjustment_ref,
+    batch_ref,
+    audit_ref,
+    stores_ref,
+    route_number: str,
+    payload: FullOrderAdjustmentConfirmRequest,
+    actor_user_id: str,
+    requester_is_owner: bool,
+    now: datetime,
+) -> Dict[str, Any]:
+    order_doc = order_ref.get(transaction=transaction)
+    adjustment_doc = adjustment_ref.get(transaction=transaction)
+    batch_doc = batch_ref.get(transaction=transaction)
+    if not order_doc.exists:
+        raise StructuredApiError(404, "Order not found", "ORDER_NOT_FOUND")
+    if not adjustment_doc.exists or not batch_doc.exists:
+        raise StructuredApiError(404, "The sent adjustment was not found.", "ADJUSTMENT_BATCH_NOT_FOUND")
+
+    order_data = order_doc.to_dict() or {}
+    adjustment = adjustment_doc.to_dict() or {}
+    batch = batch_doc.to_dict() or {}
+    if str(order_data.get("routeNumber") or "") != route_number:
+        raise StructuredApiError(404, "Order not found", "ORDER_NOT_FOUND")
+    if str(adjustment.get("sourceOrderId") or "") != str(order_ref.id):
+        raise StructuredApiError(409, "The adjustment points to another order.", "ADJUSTMENT_ORDER_MISMATCH")
+    adjustment_actor = str(adjustment.get("userId") or "")
+    if adjustment_actor != actor_user_id and not requester_is_owner:
+        raise StructuredApiError(404, "The sent adjustment was not found.", "ADJUSTMENT_BATCH_NOT_FOUND")
+
+    prior_confirmation = adjustment.get("confirmation") or {}
+    if adjustment.get("status") == "confirmed":
+        if (
+            prior_confirmation.get("sentBatchId") == payload.sentBatchId
+            and sorted(prior_confirmation.get("acceptedLineSaps") or []) == sorted(payload.acceptedSaps)
+        ):
+            projection = adjustment.get("projection") or {}
+            return {
+                "orderId": str(order_ref.id),
+                "adjustmentId": payload.adjustmentId,
+                "orderRevision": int(prior_confirmation.get("appliedOrderRevision") or _order_revision(order_data)),
+                "changed": bool(prior_confirmation.get("changed")),
+                "idempotent": True,
+                "projectionStatus": projection.get("status"),
+            }
+        raise StructuredApiError(409, "This adjustment was already confirmed differently.", "ADJUSTMENT_ALREADY_CONFIRMED")
+
+    last_sent = adjustment.get("lastSent") or {}
+    if (
+        adjustment.get("status") != "sent"
+        or adjustment.get("mode") != "full_order"
+        or last_sent.get("batchId") != payload.sentBatchId
+        or last_sent.get("cumulativeSignature") != batch.get("cumulativeSignature")
+        or last_sent.get("workingCopySignature") != batch.get("workingCopySignature")
+        or str(batch.get("adjustmentId") or "") != payload.adjustmentId
+        or str(batch.get("sourceOrderId") or "") != str(order_ref.id)
+        or str(batch.get("routeNumber") or "") != route_number
+    ):
+        raise StructuredApiError(409, "The sent adjustment could not be verified.", "ADJUSTMENT_BATCH_MISMATCH")
+    if order_data.get("status") != "finalized":
+        raise StructuredApiError(409, "Only finalized orders can be adjusted.", "ADJUSTMENT_ORDER_NOT_FINALIZED")
+
+    current_revision = _order_revision(order_data)
+    if current_revision != payload.baseOrderRevision:
+        raise StructuredApiError(
+            409,
+            "The finalized order changed. Refresh and rebuild the adjustment.",
+            "ADJUSTMENT_STALE_ORDER",
+            {"currentOrderRevision": current_revision},
+        )
+    merged = validate_and_merge_full_adjustment(
+        current_order=order_data,
+        batch=batch,
+        accepted_saps=payload.acceptedSaps,
+    )
+    store_docs = list(stores_ref.stream(transaction=transaction))
+    route_stores = {str(doc.id): (doc.to_dict() or {}) for doc in store_docs}
+    _validate_adjusted_store_allocations(merged, route_stores)
+    if CORE_ITEM_ENFORCEMENT_ENABLED and payload.acceptedSaps:
+        issues = build_core_item_issues(
+            order_data=merged,
+            stores=[{"id": doc.id, **(doc.to_dict() or {})} for doc in store_docs],
+        )
+        if issues:
+            raise StructuredApiError(
+                409,
+                "Core item requirements must be resolved before confirming.",
+                "CORE_ITEMS_REQUIRED",
+                {"items": issues},
+            )
+
+    applied_at_ms = int(now.timestamp() * 1000)
+    changed = bool(payload.acceptedSaps)
+    applied_revision = current_revision + 1 if changed else current_revision
+    if changed:
+        transaction.update(order_ref, {
+            "stores": merged.get("stores") or [],
+            "routeTransfers": merged.get("routeTransfers") or [],
+            "routeSplittingEnabled": bool(merged.get("routeSplittingEnabled")),
+            "inboundTransfersUsed": merged.get("inboundTransfersUsed") or [],
+            "inboundTransferStoreAllocations": merged.get("inboundTransferStoreAllocations") or [],
+            "updatedAt": now,
+            "orderRevision": applied_revision,
+            "orderAdjustmentAppliedAtMs": applied_at_ms,
+            "lastMutation": {
+                "kind": "full_adjustment",
+                "mutationId": payload.adjustmentId,
+                "atMs": applied_at_ms,
+            },
+        })
+
+    emailed_lines = batch.get("cumulativeLines") or []
+    accepted = set(payload.acceptedSaps)
+    confirmation = {
+        "confirmedAtMs": applied_at_ms,
+        "confirmedByUserId": actor_user_id,
+        "emailedLines": emailed_lines,
+        "acceptedLines": [line for line in emailed_lines if str(line.get("sap") or "") in accepted],
+        "acceptedLineSaps": payload.acceptedSaps,
+        "rejectedLineSaps": sorted({str(line.get("sap") or "") for line in emailed_lines} - accepted),
+        "sentBatchId": payload.sentBatchId,
+        "sentBatchSignature": batch.get("cumulativeSignature"),
+        "notes": payload.notes,
+        "appliedOrderRevision": applied_revision,
+        "changed": changed,
+    }
+    adjustment_update: Dict[str, Any] = {
+        "status": "confirmed",
+        "confirmation": confirmation,
+        "reminderEnabled": False,
+        "reminderStatus": "skipped",
+        "reminderSkippedAtMs": applied_at_ms,
+        "reminderSkipReason": "adjustment_confirmed",
+        "updatedAt": now,
+    }
+    if changed:
+        adjustment_update["projection"] = {
+            "status": "pending",
+            "targetOrderRevision": applied_revision,
+            "attemptCount": 0,
+        }
+    transaction.update(adjustment_ref, adjustment_update)
+    transaction.set(audit_ref, {
+        "orderId": str(order_ref.id),
+        "routeNumber": route_number,
+        "userId": actor_user_id,
+        "action": "order_full_adjustment_confirmed",
+        "source": "api",
+        "meta": {
+            "adjustmentId": payload.adjustmentId,
+            "sentBatchId": payload.sentBatchId,
+            "acceptedSaps": payload.acceptedSaps,
+            "baseOrderRevision": current_revision,
+            "appliedOrderRevision": applied_revision,
+            "changed": changed,
+        },
+        "createdAt": now,
+    })
+    return {
+        "orderId": str(order_ref.id),
+        "adjustmentId": payload.adjustmentId,
+        "orderRevision": applied_revision,
+        "changed": changed,
+        "idempotent": False,
+        "projectionStatus": "pending" if changed else None,
+    }
+
+
 @firestore.transactional
 def _finalize_order_document(
     transaction,
@@ -228,6 +475,8 @@ def _finalize_order_document(
     order_data = order_doc.to_dict() or {}
     if str(order_data.get("routeNumber", "")) != route_number:
         raise HTTPException(403, "Route mismatch")
+    if order_data.get("status") != "draft":
+        raise HTTPException(409, "Only draft orders can be finalized")
 
     store_docs = []
     stores = []
@@ -253,12 +502,19 @@ def _finalize_order_document(
         stores=stores,
     )
 
+    next_revision = max(1, _order_revision(order_data) + 1)
+    updated_at_ms = int(now.timestamp() * 1000)
     transaction.update(order_ref, {
         "status": "finalized",
         "submittedAt": now,
         "updatedAt": now,
+        "orderRevision": next_revision,
+        "lastMutation": {
+            "kind": "finalization",
+            "mutationId": str(order_data.get("id") or order_ref.id),
+            "atMs": updated_at_ms,
+        },
     })
-    updated_at_ms = int(now.timestamp() * 1000)
     for store_doc in store_docs:
         if store_doc.id not in next_order_updates:
             continue
@@ -267,6 +523,196 @@ def _finalize_order_document(
             "updatedAt": updated_at_ms,
         })
     return order_data
+
+
+@firestore.transactional
+def _apply_store_reallocation_document(
+    transaction,
+    *,
+    order_ref,
+    adjustment_ref,
+    audit_ref,
+    stores_ref,
+    products_ref,
+    route_number: str,
+    payload: StoreReallocationRequest,
+    actor_user_id: str,
+    requester_is_owner: bool,
+    local_date: str,
+    timezone_name: str,
+    now: datetime,
+) -> Dict[str, Any]:
+    """Atomically materialize a store reallocation into the finalized order."""
+    order_doc = order_ref.get(transaction=transaction)
+    if not order_doc.exists:
+        raise StructuredApiError(404, "Order not found", "ORDER_NOT_FOUND")
+    order_data = order_doc.to_dict() or {}
+    if str(order_data.get("routeNumber") or "") != route_number:
+        raise StructuredApiError(404, "Order not found", "ORDER_NOT_FOUND")
+
+    signature = moves_signature(payload.moves)
+    adjustment_doc = adjustment_ref.get(transaction=transaction)
+    if adjustment_doc.exists:
+        existing = adjustment_doc.to_dict() or {}
+        existing_reallocation = existing.get("storeReallocation") or {}
+        same_operation = (
+            str(existing.get("sourceOrderId") or "") == str(order_data.get("id") or order_ref.id)
+            and str(existing_reallocation.get("movesSignature") or "") == signature
+            and str(existing.get("status") or "") == "applied"
+        )
+        if not same_operation:
+            raise StructuredApiError(
+                409,
+                "This reallocation ID has already been used.",
+                "REALLOCATION_ID_CONFLICT",
+            )
+        existing_actor = str(existing_reallocation.get("appliedByUserId") or existing.get("userId") or "")
+        if existing_actor != actor_user_id and not requester_is_owner:
+            raise StructuredApiError(404, "Order not found", "ORDER_NOT_FOUND")
+        projection = existing.get("projection") or {}
+        return {
+            "orderId": str(order_data.get("id") or order_ref.id),
+            "reallocationId": str(payload.reallocationId),
+            "orderRevision": int(existing_reallocation.get("appliedOrderRevision") or 1),
+            "appliedAtMs": int(existing_reallocation.get("appliedAtMs") or 1),
+            "reallocationCount": int(existing_reallocation.get("reallocationCount") or 1),
+            "idempotent": True,
+            "projectionStatus": str(projection.get("status") or "pending"),
+        }
+
+    if order_data.get("status") != "finalized":
+        raise StructuredApiError(
+            409,
+            "Only finalized orders can be reallocated.",
+            "REALLOCATION_ORDER_NOT_FINALIZED",
+        )
+    delivery_date = str(order_data.get("expectedDeliveryDate") or "").strip()
+    if not delivery_date or delivery_date < local_date:
+        raise StructuredApiError(
+            409,
+            "This delivery is closed for reallocation.",
+            "REALLOCATION_DELIVERY_CLOSED",
+        )
+
+    current_revision = _order_revision(order_data)
+    if current_revision != payload.baseOrderRevision:
+        raise StructuredApiError(
+            409,
+            "The order changed. Refresh allocations and review the move again.",
+            "REALLOCATION_STALE_ORDER",
+            {"currentOrderRevision": current_revision},
+        )
+
+    store_docs = list(stores_ref.stream(transaction=transaction))
+    route_stores = {
+        str(store_doc.id): (store_doc.to_dict() or {})
+        for store_doc in store_docs
+    }
+    products: Dict[str, Dict[str, Any]] = {}
+    for sap in sorted({move.sap for move in payload.moves}):
+        product_doc = products_ref.document(sap).get(transaction=transaction)
+        if product_doc.exists:
+            products[sap] = product_doc.to_dict() or {}
+
+    mutation = apply_store_reallocation(
+        order_data=order_data,
+        moves=payload.moves,
+        route_stores=route_stores,
+        products=products,
+        enforce_core_items=CORE_ITEM_ENFORCEMENT_ENABLED,
+    )
+
+    applied_at_ms = int(now.timestamp() * 1000)
+    applied_revision = current_revision + 1
+    prior_summary = order_data.get("storeReallocationSummary") or {}
+    prior_count = prior_summary.get("count")
+    reallocation_count = (
+        prior_count if isinstance(prior_count, int) and not isinstance(prior_count, bool) and prior_count >= 0 else 0
+    ) + 1
+    reallocation_id = str(payload.reallocationId)
+    order_id = str(order_data.get("id") or order_ref.id)
+
+    transaction.update(order_ref, {
+        "stores": mutation["stores"],
+        "updatedAt": now,
+        "orderRevision": applied_revision,
+        "lastMutation": {
+            "kind": "store_reallocation",
+            "mutationId": reallocation_id,
+            "atMs": applied_at_ms,
+        },
+        "storeReallocationSummary": {
+            "count": reallocation_count,
+            "lastAppliedAtMs": applied_at_ms,
+            "lastAdjustmentId": reallocation_id,
+        },
+    })
+    transaction.set(adjustment_ref, {
+        "id": reallocation_id,
+        "routeNumber": route_number,
+        "userId": actor_user_id,
+        "status": "applied",
+        "mode": "store_reallocation",
+        "sourceOrderId": order_id,
+        "sourceOrderDate": order_data.get("orderDate"),
+        "sourceOrderExpectedDeliveryDate": delivery_date,
+        "sourceOrderSubmittedAtMs": int(
+            (_to_datetime(order_data.get("submittedAt")) or now).timestamp() * 1000
+        ),
+        "adjustmentDate": local_date,
+        "targetDeliveryDate": delivery_date,
+        "timezone": timezone_name,
+        "lines": [],
+        "email": {},
+        "storeReallocation": {
+            "sourceOrderId": order_id,
+            "moves": mutation["auditMoves"],
+            "movesSignature": signature,
+            "baseOrderRevision": current_revision,
+            "appliedOrderRevision": applied_revision,
+            "reallocationCount": reallocation_count,
+            "appliedAtMs": applied_at_ms,
+            "appliedByUserId": actor_user_id,
+        },
+        "projection": {
+            "status": "pending",
+            "targetOrderRevision": applied_revision,
+            "attemptCount": 0,
+        },
+        "reminderEnabled": False,
+        "reminderStatus": "skipped",
+        "reminderSkippedAtMs": applied_at_ms,
+        "reminderSkipReason": "store_reallocation_applied",
+        "createdAt": now,
+        "updatedAt": now,
+    })
+    transaction.set(audit_ref, {
+        "orderId": order_id,
+        "routeNumber": route_number,
+        "userId": actor_user_id,
+        "action": "order_store_reallocated",
+        "source": "api",
+        "meta": {
+            "reallocationId": reallocation_id,
+            "movesSignature": signature,
+            "moveCount": len(payload.moves),
+            "baseOrderRevision": current_revision,
+            "appliedOrderRevision": applied_revision,
+            "beforeTotals": mutation["beforeTotals"],
+            "afterTotals": mutation["afterTotals"],
+        },
+        "createdAt": now,
+    })
+
+    return {
+        "orderId": order_id,
+        "reallocationId": reallocation_id,
+        "orderRevision": applied_revision,
+        "appliedAtMs": applied_at_ms,
+        "reallocationCount": reallocation_count,
+        "idempotent": False,
+        "projectionStatus": "pending",
+    }
 
 
 def _log_order_audit(
@@ -436,7 +882,7 @@ async def update_order(
     db: firestore.Client = Depends(get_firestore),
 ) -> Order:
     """Merge draft order store/item patches into the current Firestore order."""
-    await require_route_feature_access(route, "ordering", decoded_token, db)
+    requester_user_data = await require_route_feature_access(route, "ordering", decoded_token, db)
 
     order_ref = _order_ref(db, route, order_id)
     order_doc = order_ref.get()
@@ -874,6 +1320,137 @@ async def finalize_order(
         "sync": sync_result,
         "forecastQueue": forecast_queue_result,
     }
+
+
+@router.post(
+    "/orders/{order_id}/reallocations",
+    response_model=StoreReallocationResponse,
+    responses={
+        401: {"model": ErrorResponse},
+        403: {"model": ErrorResponse},
+        404: {"model": ErrorResponse},
+        409: {"model": ErrorResponse},
+        422: {"model": ErrorResponse},
+    },
+)
+@rate_limit_write
+async def create_store_reallocation(
+    request: Request,
+    order_id: str,
+    payload: StoreReallocationRequest,
+    route: str = Query(..., pattern=r"^\d{1,10}$", description="Route number"),
+    decoded_token: dict = Depends(verify_firebase_token),
+    db: firestore.Client = Depends(get_firestore),
+) -> StoreReallocationResponse:
+    """Atomically reallocate finalized units between stores without forecasting."""
+    requester_user_data = await require_route_feature_access(
+        route,
+        "ordering",
+        decoded_token,
+        db,
+    )
+    order_ref = _order_ref(db, route, order_id)
+    reallocation_id = str(payload.reallocationId)
+    adjustment_ref = (
+        db.collection("routes")
+        .document(route)
+        .collection("orderAdjustments")
+        .document(reallocation_id)
+    )
+    audit_ref = order_ref.collection("audit").document(
+        f"store-reallocation-{reallocation_id}"
+    )
+    route_ref = db.collection("routes").document(route)
+    now = datetime.now(timezone.utc)
+    result = _apply_store_reallocation_document(
+        db.transaction(),
+        order_ref=order_ref,
+        adjustment_ref=adjustment_ref,
+        audit_ref=audit_ref,
+        stores_ref=route_ref.collection("stores"),
+        products_ref=(
+            db.collection("masterCatalog")
+            .document(route)
+            .collection("products")
+        ),
+        route_number=route,
+        payload=payload,
+        actor_user_id=str(decoded_token["uid"]),
+        requester_is_owner=_requester_is_route_owner(requester_user_data, route),
+        local_date=_get_local_order_date(db, route),
+        timezone_name=get_route_timezone(db, route) or "UTC",
+        now=now,
+    )
+    logger.info(
+        "store_reallocation_applied route=%s order_id=%s reallocation_id=%s revision=%s idempotent=%s",
+        route,
+        order_id,
+        reallocation_id,
+        result["orderRevision"],
+        result["idempotent"],
+    )
+    return StoreReallocationResponse(**result)
+
+
+@router.post(
+    "/orders/{order_id}/adjustments/{adjustment_id}/confirm",
+    response_model=FullOrderAdjustmentConfirmResponse,
+    responses={
+        401: {"model": ErrorResponse},
+        403: {"model": ErrorResponse},
+        404: {"model": ErrorResponse},
+        409: {"model": ErrorResponse},
+        422: {"model": ErrorResponse},
+    },
+)
+@rate_limit_write
+async def confirm_full_order_adjustment(
+    request: Request,
+    order_id: str,
+    adjustment_id: str,
+    payload: FullOrderAdjustmentConfirmRequest,
+    route: str = Query(..., pattern=r"^\d{1,10}$", description="Route number"),
+    decoded_token: dict = Depends(verify_firebase_token),
+    db: firestore.Client = Depends(get_firestore),
+) -> FullOrderAdjustmentConfirmResponse:
+    """Verify a sent batch and atomically revise the canonical finalized order."""
+    requester_user_data = await require_route_feature_access(
+        route,
+        "ordering",
+        decoded_token,
+        db,
+    )
+    if payload.adjustmentId != adjustment_id:
+        raise StructuredApiError(422, "Adjustment ID mismatch.", "ADJUSTMENT_ID_MISMATCH")
+
+    route_ref = db.collection("routes").document(route)
+    order_ref = route_ref.collection("orders").document(order_id)
+    adjustment_ref = route_ref.collection("orderAdjustments").document(adjustment_id)
+    batch_ref = adjustment_ref.collection("emailBatches").document(payload.sentBatchId)
+    audit_ref = order_ref.collection("audit").document(f"full-adjustment-{adjustment_id}")
+    result = _confirm_full_order_adjustment_document(
+        db.transaction(),
+        order_ref=order_ref,
+        adjustment_ref=adjustment_ref,
+        batch_ref=batch_ref,
+        audit_ref=audit_ref,
+        stores_ref=route_ref.collection("stores"),
+        route_number=route,
+        payload=payload,
+        actor_user_id=str(decoded_token["uid"]),
+        requester_is_owner=_requester_is_route_owner(requester_user_data, route),
+        now=datetime.now(timezone.utc),
+    )
+    logger.info(
+        "full_order_adjustment_confirmed route=%s order_id=%s adjustment_id=%s revision=%s changed=%s idempotent=%s",
+        route,
+        order_id,
+        adjustment_id,
+        result["orderRevision"],
+        result["changed"],
+        result["idempotent"],
+    )
+    return FullOrderAdjustmentConfirmResponse(**result)
 
 
 @router.get(

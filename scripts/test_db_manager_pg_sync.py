@@ -33,6 +33,9 @@ class _FakeOrdersCollection:
     def document(self, order_id: str):
         return _FakeOrderDocument(self._store, self._route_number, order_id)
 
+    def stream(self):
+        return []
+
 
 class _FakeForecastDoc:
     def __init__(self, doc_id: str, data):
@@ -61,6 +64,8 @@ class _FakeRouteDocument:
     def collection(self, name: str):
         if self._parent_collection == "routes" and name == "orders":
             return _FakeOrdersCollection(self._orders_store, self._route_number)
+        if self._parent_collection == "routes" and name == "stores":
+            return _FakeOrdersCollection({}, self._route_number)
         if self._parent_collection == "forecasts" and name == "cached":
             return _FakeForecastsCollection(self._forecast_store.get(self._route_number, []))
         raise KeyError((self._parent_collection, self._route_number, name))
@@ -95,7 +100,9 @@ class _FakeFirestoreDB:
 class _FakeCursor:
     def __init__(self, conn):
         self.conn = conn
+        self.connection = conn
         self._fetchone = None
+        self.description = None
 
     def execute(self, sql, params=None):
         normalized = " ".join(sql.split()).lower()
@@ -119,8 +126,16 @@ class _FakeCursor:
                 "total_units": params[6],
                 "store_count": params[7],
                 "is_holiday_week": params[8],
-                "synced_at": params[9],
+                "order_revision": params[9],
+                "last_mutation_kind": params[10],
+                "last_mutation_id": params[11],
+                "synced_at": params[16],
             }
+            return
+
+        if normalized.startswith("select order_revision from orders_historical"):
+            row = self.conn.orders_historical.get(params[0])
+            self._fetchone = (row.get("order_revision", 0),) if row else None
             return
 
         if normalized.startswith("delete from order_line_items where order_id = %s"):
@@ -137,6 +152,28 @@ class _FakeCursor:
             }
             return
 
+
+        if normalized.startswith("delete from delivery_allocations where source_order_id = %s"):
+            order_id = params[0]
+            self.conn.delivery_allocations = {
+                key: row for key, row in self.conn.delivery_allocations.items() if row[2] != order_id
+            }
+            return
+
+        if normalized.startswith("delete from promo_order_history where order_id = %s"):
+            order_id = params[0]
+            self.conn.promo_order_history = {
+                key: row for key, row in self.conn.promo_order_history.items() if row[3] != order_id
+            }
+            return
+
+        if normalized.startswith("with primary_dates as"):
+            return
+
+        if normalized.startswith("select pi.promo_id"):
+            self._fetchone = None
+            return
+
         raise AssertionError(f"Unexpected SQL in fake cursor: {sql}")
 
     def fetchone(self):
@@ -151,6 +188,8 @@ class _FakeConnection:
         self.orders_historical = {}
         self.order_line_items = {}
         self.forecast_corrections = {}
+        self.delivery_allocations = {}
+        self.promo_order_history = {}
         self.store_aliases = {}
         self.commits = 0
         self.rollbacks = 0
@@ -175,10 +214,24 @@ def _fake_execute_values(cur, sql, rows, page_size=100):
         for row in rows:
             cur.conn.forecast_corrections[row[0]] = row
         return
+    if "insert into delivery_allocations" in normalized:
+        for row in rows:
+            cur.conn.delivery_allocations[row[0]] = row
+        return
+    if "insert into promo_order_history" in normalized:
+        for row in rows:
+            cur.conn.promo_order_history[row[0]] = row
+        return
     raise AssertionError(f"Unexpected execute_values SQL: {sql}")
 
 
 class TestHandleSyncOrderProjectionReplacement(unittest.TestCase):
+    def test_route_988200_store_delivery_date_uses_configured_weekday(self):
+        self.assertEqual(
+            worker._store_delivery_date("2026-08-18", "2026-08-20", [4]),
+            "2026-08-21",
+        )
+
     def setUp(self):
         self.receipt_patcher = mock.patch.object(
             worker,
@@ -280,7 +333,9 @@ class TestHandleSyncOrderProjectionReplacement(unittest.TestCase):
 
         self.assertIn("firestore receipt unavailable", result["error"])
         self.assertEqual(conn.commits, 1)
-        self.assertEqual(conn.rollbacks, 1)
+        # PostgreSQL has already committed; a receipt retry must not pretend the
+        # durable projection can be rolled back.
+        self.assertEqual(conn.rollbacks, 0)
         self.assertIn(order_id, conn.orders_historical)
 
     def test_sync_order_replaces_removed_line_items_and_stale_corrections(self):
@@ -382,6 +437,68 @@ class TestHandleSyncOrderProjectionReplacement(unittest.TestCase):
         self.assertEqual(conn.forecast_corrections, {})
         self.assertEqual(conn.rollbacks, 0)
         self.assertEqual(conn.commits, 2)
+
+    def test_route_988200_revision_replaces_allocations_and_retry_is_idempotent(self):
+        route_number = "988200"
+        order_id = "order-988200-reallocation-projection"
+        order = {
+            "routeNumber": route_number,
+            "userId": "user-988200",
+            "expectedDeliveryDate": "2026-08-20",
+            "orderDate": "2026-08-18",
+            "scheduleKey": "tuesday",
+            "orderRevision": 1,
+            "lastMutation": {
+                "kind": "finalization",
+                "mutationId": order_id,
+                "atMs": 1787068800000,
+            },
+            "stores": [
+                {"storeId": "store-a", "items": [{"sap": "100", "quantity": 8}]},
+                {"storeId": "store-b", "items": []},
+            ],
+        }
+        orders_store = {(route_number, order_id): order}
+        db = _FakeFirestoreDB(orders_store, {})
+        conn = _FakeConnection()
+
+        with (
+            mock.patch.object(worker, "execute_values", side_effect=_fake_execute_values),
+            mock.patch.object(worker, "resolve_store_id_from_db", side_effect=lambda conn, route, store: store),
+            mock.patch.object(worker, "is_holiday_week", return_value=(False, "")),
+        ):
+            first = worker.handle_sync_order(conn, db, {"orderId": order_id, "routeNumber": route_number})
+            self.assertFalse(first["alreadyProjected"])
+            self.assertEqual(first["projectedRevision"], 1)
+
+            order["orderRevision"] = 2
+            order["lastMutation"] = {
+                "kind": "store_reallocation",
+                "mutationId": "reallocation-1",
+                "atMs": 1787068860000,
+            }
+            order["storeReallocationSummary"] = {
+                "count": 1,
+                "lastAppliedAtMs": 1787068860000,
+                "lastAdjustmentId": "reallocation-1",
+            }
+            order["stores"][0]["items"][0]["quantity"] = 5
+            order["stores"][1]["items"] = [{"sap": "100", "quantity": 3}]
+            second = worker.handle_sync_order(conn, db, {"orderId": order_id, "routeNumber": route_number})
+            retry = worker.handle_sync_order(conn, db, {"orderId": order_id, "routeNumber": route_number})
+
+        self.assertFalse(second["alreadyProjected"])
+        self.assertTrue(retry["alreadyProjected"])
+        self.assertEqual(conn.orders_historical[order_id]["order_revision"], 2)
+        self.assertEqual(conn.orders_historical[order_id]["last_mutation_kind"], "store_reallocation")
+        self.assertEqual(conn.promo_order_history, {})
+        self.assertEqual(
+            {key: row[7] for key, row in conn.delivery_allocations.items()},
+            {
+                f"{order_id}-store-a-100": 5,
+                f"{order_id}-store-b-100": 3,
+            },
+        )
 
 
 if __name__ == "__main__":

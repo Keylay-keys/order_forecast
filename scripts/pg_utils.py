@@ -133,11 +133,20 @@ def get_archived_dates(route_number: str) -> list[dict]:
             o.order_id,
             o.delivery_date,
             o.schedule_key,
+            o.order_revision,
+            o.last_mutation_kind,
+            o.last_mutation_id,
+            o.last_mutation_at,
+            o.reallocation_count,
+            o.last_reallocated_at,
+            o.last_reallocation_id,
             COUNT(DISTINCT li.line_item_id) as item_count
         FROM orders_historical o
         LEFT JOIN order_line_items li ON o.order_id = li.order_id
         WHERE o.route_number = %s
-        GROUP BY o.order_id, o.delivery_date, o.schedule_key
+        GROUP BY o.order_id, o.delivery_date, o.schedule_key, o.order_revision,
+                 o.last_mutation_kind, o.last_mutation_id, o.last_mutation_at,
+                 o.reallocation_count, o.last_reallocated_at, o.last_reallocation_id
         ORDER BY o.delivery_date DESC
         LIMIT 200
     """, [route_number])
@@ -150,6 +159,17 @@ def get_archived_dates(route_number: str) -> list[dict]:
             'date': date_str,
             'scheduleKey': row.get('schedule_key') or 'unknown',
             'itemCount': row.get('item_count') or 0,
+            'orderRevision': row.get('order_revision') or 0,
+            'lastMutation': {
+                'kind': row.get('last_mutation_kind'),
+                'mutationId': row.get('last_mutation_id'),
+                'atMs': int(row['last_mutation_at'].timestamp() * 1000),
+            } if row.get('last_mutation_kind') and row.get('last_mutation_at') else None,
+            'storeReallocationSummary': {
+                'count': row.get('reallocation_count') or 0,
+                'lastAppliedAtMs': int(row['last_reallocated_at'].timestamp() * 1000),
+                'lastAdjustmentId': row.get('last_reallocation_id') or '',
+            } if (row.get('reallocation_count') or 0) > 0 else None,
         })
     return dates
 
@@ -203,6 +223,17 @@ def _build_archived_order(route_number: str, order_row: dict) -> dict:
         'updatedAt': synced_at or finalized_at,
         'totalUnits': order_row.get('total_units'),
         'storeCount': order_row.get('store_count'),
+        'orderRevision': order_row.get('order_revision') or 0,
+        'lastMutation': {
+            'kind': order_row.get('last_mutation_kind'),
+            'mutationId': order_row.get('last_mutation_id'),
+            'atMs': int(order_row['last_mutation_at'].timestamp() * 1000),
+        } if order_row.get('last_mutation_kind') and order_row.get('last_mutation_at') else None,
+        'storeReallocationSummary': {
+            'count': order_row.get('reallocation_count') or 0,
+            'lastAppliedAtMs': int(order_row['last_reallocated_at'].timestamp() * 1000),
+            'lastAdjustmentId': order_row.get('last_reallocation_id') or '',
+        } if (order_row.get('reallocation_count') or 0) > 0 else None,
         'stores': list(stores.values()),
     }
 
@@ -211,7 +242,10 @@ def get_order_by_id(route_number: str, order_id: str) -> Optional[dict]:
     """Get an archived order by its canonical ID, scoped to its route."""
     order_row = fetch_one("""
         SELECT order_id, user_id, schedule_key, order_date, delivery_date,
-               finalized_at, synced_at, total_units, store_count
+               finalized_at, synced_at, total_units, store_count,
+               order_revision, last_mutation_kind, last_mutation_id,
+               last_mutation_at, reallocation_count, last_reallocated_at,
+               last_reallocation_id
         FROM orders_historical
         WHERE route_number = %s AND order_id = %s
         LIMIT 1
@@ -223,7 +257,10 @@ def get_order_by_date(route_number: str, delivery_date: str) -> Optional[dict]:
     """Compatibility lookup for older clients; deterministic across duplicates."""
     order_row = fetch_one("""
         SELECT order_id, user_id, schedule_key, order_date, delivery_date,
-               finalized_at, synced_at, total_units, store_count
+               finalized_at, synced_at, total_units, store_count,
+               order_revision, last_mutation_kind, last_mutation_id,
+               last_mutation_at, reallocation_count, last_reallocated_at,
+               last_reallocation_id
         FROM orders_historical
         WHERE route_number = %s AND delivery_date = %s
         ORDER BY order_date DESC, order_id DESC

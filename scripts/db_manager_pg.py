@@ -36,7 +36,7 @@ import socket
 import sys
 import time
 import traceback
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -198,6 +198,135 @@ def resolve_store_id_from_db(conn: psycopg2.extensions.connection, route_number:
     return store_id
 
 
+DAY_TO_WEEKDAY = {
+    'monday': 0, 'tuesday': 1, 'wednesday': 2, 'thursday': 3,
+    'friday': 4, 'saturday': 5, 'sunday': 6,
+    'mon': 0, 'tue': 1, 'wed': 2, 'thu': 3, 'fri': 4, 'sat': 5, 'sun': 6,
+}
+
+
+def _store_delivery_days(db: firestore.Client, route_number: str) -> Dict[str, List[int]]:
+    """Return configured delivery weekdays without turning missing metadata into a sync failure."""
+    result: Dict[str, List[int]] = {}
+    try:
+        stores = db.collection('routes').document(str(route_number)).collection('stores').stream()
+        for store_doc in stores:
+            store_data = store_doc.to_dict() or {}
+            weekdays = []
+            for day in store_data.get('deliveryDays') or []:
+                normalized = str(day).strip().lower()
+                if normalized in DAY_TO_WEEKDAY:
+                    weekdays.append(DAY_TO_WEEKDAY[normalized])
+            result[str(store_doc.id)] = weekdays
+    except Exception as exc:
+        print(
+            "     ⚠️  Could not load store delivery days; using primary delivery date"
+            f" code=STORE_DELIVERY_DAYS_UNAVAILABLE type={type(exc).__name__}"
+        )
+    return result
+
+
+def _parse_order_date(value: Any) -> Optional[datetime]:
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        return value
+    try:
+        text = str(value)
+        if '/' in text:
+            return datetime.strptime(text, '%m/%d/%Y')
+        return datetime.fromisoformat(text.replace('Z', '+00:00'))
+    except (TypeError, ValueError):
+        return None
+
+
+def _mutation_timestamp(value: Any) -> Any:
+    """Normalize Firestore epoch-millisecond audit fields for PostgreSQL."""
+    if isinstance(value, (int, float)):
+        return datetime.fromtimestamp(float(value) / 1000.0, tz=timezone.utc)
+    return value
+
+
+def _store_delivery_date(order_date: Any, primary_delivery_date: Any, weekdays: List[int]) -> str:
+    primary = _parse_order_date(primary_delivery_date)
+    if primary is None:
+        return str(primary_delivery_date or '')
+    if not weekdays or primary.weekday() in weekdays:
+        return primary.strftime('%Y-%m-%d')
+    placed = _parse_order_date(order_date) or (primary - timedelta(days=3))
+    for days_ahead in range(1, 8):
+        candidate = placed + timedelta(days=days_ahead)
+        if candidate.weekday() in weekdays:
+            return candidate.strftime('%Y-%m-%d')
+    return primary.strftime('%Y-%m-%d')
+
+
+def _project_delivery_allocations(
+    cur: Any,
+    db: firestore.Client,
+    *,
+    order_id: str,
+    route_number: str,
+    order_data: Dict[str, Any],
+) -> int:
+    """Replace one order's delivery projection inside the caller's transaction."""
+    cur.execute("DELETE FROM delivery_allocations WHERE source_order_id = %s", [order_id])
+    primary_delivery = order_data.get('expectedDeliveryDate') or order_data.get('deliveryDate')
+    if not primary_delivery:
+        return 0
+
+    delivery_days = _store_delivery_days(db, route_number)
+    rows = []
+    source_order_date = order_data.get('orderDate') or primary_delivery
+    for store in order_data.get('stores') or []:
+        raw_store_id = str(store.get('id') or store.get('storeId') or '').strip()
+        if not raw_store_id:
+            continue
+        store_id = resolve_store_id_from_db(cur.connection, route_number, raw_store_id)
+        actual_delivery = _store_delivery_date(
+            source_order_date,
+            primary_delivery,
+            delivery_days.get(store_id, delivery_days.get(raw_store_id, [])),
+        )
+        store_name = store.get('name') or store.get('storeName') or ''
+        for item in store.get('items') or []:
+            sap = str(item.get('sap') or '').strip()
+            quantity = int(item.get('quantity') or 0)
+            if not sap or quantity == 0:
+                continue
+            rows.append((
+                f"{order_id}-{store_id}-{sap}", route_number, order_id,
+                source_order_date, sap, store_id, store_name, quantity,
+                actual_delivery, False,
+            ))
+
+    if rows:
+        execute_values(cur, """
+            INSERT INTO delivery_allocations (
+                allocation_id, route_number, source_order_id, source_order_date,
+                sap, store_id, store_name, quantity, delivery_date, is_case_split
+            ) VALUES %s
+        """, rows, page_size=100)
+
+    # Case-split status is a property of all allocations sharing a store/delivery,
+    # so recalculate it as part of the same transaction.
+    cur.execute("""
+        WITH primary_dates AS (
+            SELECT store_id, delivery_date, MAX(source_order_date) AS primary_order_date
+            FROM delivery_allocations
+            WHERE route_number = %s
+            GROUP BY store_id, delivery_date
+        )
+        UPDATE delivery_allocations da
+        SET is_case_split = da.source_order_date < pd.primary_order_date
+        FROM primary_dates pd
+        WHERE da.route_number = %s
+          AND da.store_id = pd.store_id
+          AND da.delivery_date = pd.delivery_date
+    """, [route_number, route_number])
+    return len(rows)
+
+
 def _load_archived_forecast(
     route_number: str,
     delivery_date: str,
@@ -270,11 +399,18 @@ def handle_sync_order(conn: psycopg2.extensions.connection, db: firestore.Client
     """Sync an order from Firebase to PostgreSQL."""
     order_id = payload.get('orderId')
     route_number = payload.get('routeNumber')
+    committed = False
+    original_autocommit = getattr(conn, 'autocommit', None)
     
     if not order_id:
         return {'error': 'No orderId provided'}
     
     try:
+        # The listener historically used an autocommit connection, which made the
+        # derived projections independently visible. Own one explicit transaction.
+        if original_autocommit is True:
+            conn.autocommit = False
+
         # Fetch order from Firebase
         order_ref = db.collection('routes').document(str(route_number)).collection('orders').document(order_id)
         order_doc = order_ref.get()
@@ -289,6 +425,14 @@ def handle_sync_order(conn: psycopg2.extensions.connection, db: firestore.Client
         order_date = data.get('orderDate', '')
         schedule_key = data.get('scheduleKey', 'unknown')
         stores = data.get('stores', [])
+        incoming_revision_raw = data.get('orderRevision')
+        incoming_revision = int(incoming_revision_raw) if incoming_revision_raw is not None else None
+        last_mutation = data.get('lastMutation') if isinstance(data.get('lastMutation'), dict) else {}
+        reallocation_summary = (
+            data.get('storeReallocationSummary')
+            if isinstance(data.get('storeReallocationSummary'), dict)
+            else {}
+        )
 
         attached_context = data.get('forecastContext') if isinstance(data.get('forecastContext'), dict) else {}
         has_attached_context = (
@@ -398,13 +542,59 @@ def handle_sync_order(conn: psycopg2.extensions.connection, db: firestore.Client
                 total_units += item.get('quantity', 0)
         
         cur = conn.cursor()
+
+        # Revisioned orders are idempotent. Legacy orders intentionally keep the
+        # old replay behavior because they have no monotonic version contract.
+        if incoming_revision is not None:
+            cur.execute(
+                "SELECT order_revision FROM orders_historical WHERE order_id = %s FOR UPDATE",
+                [order_id],
+            )
+            current_row = cur.fetchone()
+            if current_row:
+                current_revision = (
+                    int(current_row.get('order_revision') or 0)
+                    if isinstance(current_row, dict)
+                    else int(current_row[0] or 0)
+                )
+                if current_revision >= incoming_revision:
+                    conn.commit()
+                    committed = True
+                    cur.close()
+                    write_verified_order_archive_receipt(
+                        db,
+                        str(order_id),
+                        str(route_number),
+                        data,
+                        archive_total_units=total_units,
+                        archive_store_count=len(stores),
+                        archive_line_item_count=sum(
+                            1
+                            for store in stores
+                            for item in (store.get('items') or [])
+                            if item.get('sap') and int(item.get('quantity') or 0) != 0
+                        ),
+                    )
+                    return {
+                        'success': True,
+                        'orderId': order_id,
+                        'totalUnits': total_units,
+                        'storeCount': len(stores),
+                        'projectedRevision': current_revision,
+                        'alreadyProjected': True,
+                        'archiveReceiptWritten': True,
+                        'correctionsExtracted': 0,
+                    }
         
         # Insert/update order header using PostgreSQL ON CONFLICT
         cur.execute("""
             INSERT INTO orders_historical (
                 order_id, route_number, user_id, schedule_key,
-                delivery_date, order_date, status, total_units, store_count, is_holiday_week, synced_at
-            ) VALUES (%s, %s, %s, %s, %s, %s, 'finalized', %s, %s, %s, %s)
+                delivery_date, order_date, status, total_units, store_count, is_holiday_week,
+                order_revision, last_mutation_kind, last_mutation_id, last_mutation_at,
+                reallocation_count, last_reallocated_at, last_reallocation_id, synced_at
+            ) VALUES (%s, %s, %s, %s, %s, %s, 'finalized', %s, %s, %s,
+                      %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (order_id) DO UPDATE SET
                 route_number = EXCLUDED.route_number,
                 user_id = EXCLUDED.user_id,
@@ -415,6 +605,13 @@ def handle_sync_order(conn: psycopg2.extensions.connection, db: firestore.Client
                 total_units = EXCLUDED.total_units,
                 store_count = EXCLUDED.store_count,
                 is_holiday_week = EXCLUDED.is_holiday_week,
+                order_revision = EXCLUDED.order_revision,
+                last_mutation_kind = EXCLUDED.last_mutation_kind,
+                last_mutation_id = EXCLUDED.last_mutation_id,
+                last_mutation_at = EXCLUDED.last_mutation_at,
+                reallocation_count = EXCLUDED.reallocation_count,
+                last_reallocated_at = EXCLUDED.last_reallocated_at,
+                last_reallocation_id = EXCLUDED.last_reallocation_id,
                 synced_at = EXCLUDED.synced_at
         """, [
             order_id,
@@ -426,6 +623,13 @@ def handle_sync_order(conn: psycopg2.extensions.connection, db: firestore.Client
             total_units,
             len(stores),
             holiday_week,
+            incoming_revision or 0,
+            last_mutation.get('kind'),
+            last_mutation.get('mutationId'),
+            _mutation_timestamp(last_mutation.get('atMs')),
+            int(reallocation_summary.get('count') or 0),
+            _mutation_timestamp(reallocation_summary.get('lastAppliedAtMs')),
+            reallocation_summary.get('lastAdjustmentId'),
             now
         ])
 
@@ -652,8 +856,16 @@ def handle_sync_order(conn: psycopg2.extensions.connection, db: firestore.Client
                     promo_id = EXCLUDED.promo_id,
                     promo_active = EXCLUDED.promo_active
             """, correction_rows, page_size=100)
-        
+
+        allocation_count = _project_delivery_allocations(
+            cur,
+            db,
+            order_id=str(order_id),
+            route_number=str(route_number),
+            order_data=data,
+        )
         conn.commit()
+        committed = True
         cur.close()
 
         # The receipt is intentionally written only after PostgreSQL commits.
@@ -677,13 +889,23 @@ def handle_sync_order(conn: psycopg2.extensions.connection, db: firestore.Client
             'lineItemCount': len(line_item_rows),
             'archiveReceiptWritten': True,
             'correctionsExtracted': len(correction_rows),
+            'deliveryAllocationCount': allocation_count,
+            'projectedRevision': incoming_revision or 0,
+            'alreadyProjected': False,
             'isHolidayWeek': holiday_week,
         }
         
     except Exception as e:
-        conn.rollback()
+        if not committed:
+            conn.rollback()
         traceback.print_exc()
         return {'error': str(e)}
+    finally:
+        if original_autocommit is True:
+            try:
+                conn.autocommit = True
+            except Exception:
+                pass
 
 
 def handle_get_historical_shares(conn: psycopg2.extensions.connection, payload: Dict) -> Dict:
@@ -741,11 +963,20 @@ def handle_get_archived_dates(conn: psycopg2.extensions.connection, payload: Dic
                 o.order_id,
                 o.delivery_date,
                 o.schedule_key,
+                o.order_revision,
+                o.last_mutation_kind,
+                o.last_mutation_id,
+                o.last_mutation_at,
+                o.reallocation_count,
+                o.last_reallocated_at,
+                o.last_reallocation_id,
                 COUNT(DISTINCT li.line_item_id) as item_count
             FROM orders_historical o
             LEFT JOIN order_line_items li ON o.order_id = li.order_id
             WHERE o.route_number = %s
-            GROUP BY o.order_id, o.delivery_date, o.schedule_key
+            GROUP BY o.order_id, o.delivery_date, o.schedule_key, o.order_revision,
+                     o.last_mutation_kind, o.last_mutation_id, o.last_mutation_at,
+                     o.reallocation_count, o.last_reallocated_at, o.last_reallocation_id
             ORDER BY o.delivery_date DESC
             LIMIT 200
         """, [route_number])
@@ -759,6 +990,18 @@ def handle_get_archived_dates(conn: psycopg2.extensions.connection, payload: Dic
                 'date': date_str,
                 'scheduleKey': row['schedule_key'] or 'unknown',
                 'itemCount': row['item_count'] or 0,
+                'orderRevision': row['order_revision'] or 0,
+                'lastMutation': {
+                    'kind': row['last_mutation_kind'],
+                    'mutationId': row['last_mutation_id'],
+                    'atMs': int(row['last_mutation_at'].timestamp() * 1000),
+                } if row['last_mutation_kind'] and row['last_mutation_at'] else None,
+                'storeReallocationSummary': {
+                    'count': row['reallocation_count'] or 0,
+                    'lastAppliedAtMs': int(row['last_reallocated_at'].timestamp() * 1000)
+                        if row['last_reallocated_at'] else 0,
+                    'lastAdjustmentId': row['last_reallocation_id'] or '',
+                } if (row['reallocation_count'] or 0) > 0 else None,
             })
         cur.close()
         
@@ -787,7 +1030,10 @@ def handle_get_order(conn: psycopg2.extensions.connection, payload: Dict) -> Dic
         if order_id:
             cur.execute("""
                 SELECT order_id, user_id, schedule_key, order_date, delivery_date,
-                       finalized_at, synced_at, total_units, store_count
+                       finalized_at, synced_at, total_units, store_count,
+                       order_revision, last_mutation_kind, last_mutation_id,
+                       last_mutation_at, reallocation_count, last_reallocated_at,
+                       last_reallocation_id
                 FROM orders_historical
                 WHERE route_number = %s AND order_id = %s
                 LIMIT 1
@@ -795,7 +1041,10 @@ def handle_get_order(conn: psycopg2.extensions.connection, payload: Dict) -> Dic
         else:
             cur.execute("""
                 SELECT order_id, user_id, schedule_key, order_date, delivery_date,
-                       finalized_at, synced_at, total_units, store_count
+                       finalized_at, synced_at, total_units, store_count,
+                       order_revision, last_mutation_kind, last_mutation_id,
+                       last_mutation_at, reallocation_count, last_reallocated_at,
+                       last_reallocation_id
                 FROM orders_historical
                 WHERE route_number = %s AND delivery_date = %s
                 ORDER BY order_date DESC, order_id DESC
@@ -861,6 +1110,17 @@ def handle_get_order(conn: psycopg2.extensions.connection, payload: Dict) -> Dic
                 'updatedAt': synced_at or finalized_at,
                 'totalUnits': order_row['total_units'],
                 'storeCount': order_row['store_count'],
+                'orderRevision': order_row['order_revision'] or 0,
+                'lastMutation': {
+                    'kind': order_row['last_mutation_kind'],
+                    'mutationId': order_row['last_mutation_id'],
+                    'atMs': int(order_row['last_mutation_at'].timestamp() * 1000),
+                } if order_row['last_mutation_kind'] and order_row['last_mutation_at'] else None,
+                'storeReallocationSummary': {
+                    'count': order_row['reallocation_count'] or 0,
+                    'lastAppliedAtMs': int(order_row['last_reallocated_at'].timestamp() * 1000),
+                    'lastAdjustmentId': order_row['last_reallocation_id'] or '',
+                } if (order_row['reallocation_count'] or 0) > 0 else None,
                 'stores': list(stores.values()),
             }
         }

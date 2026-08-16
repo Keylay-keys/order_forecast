@@ -192,6 +192,110 @@ class CoreItemOverride(BaseModel):
     overriddenByUserId: str
 
 
+class OrderMutation(BaseModel):
+    """Server-owned description of the most recent canonical order mutation."""
+    kind: Literal['finalization', 'store_reallocation', 'full_adjustment']
+    mutationId: str = Field(..., min_length=1, max_length=255)
+    atMs: int = Field(..., ge=1)
+
+    model_config = ConfigDict(extra='forbid')
+
+
+class StoreReallocationSummary(BaseModel):
+    """Compact order-level marker used by current and archived history."""
+    count: int = Field(..., ge=1)
+    lastAppliedAtMs: int = Field(..., ge=1)
+    lastAdjustmentId: str = Field(..., min_length=1, max_length=255)
+
+    model_config = ConfigDict(extra='forbid')
+
+
+class StoreReallocationMoveRequest(BaseModel):
+    """Semantic move input. Display metadata is always resolved server-side."""
+    sap: str
+    fromStoreId: str
+    toStoreId: str
+    unitQuantity: int = Field(..., ge=1, le=1_000_000)
+
+    @field_validator('sap')
+    @classmethod
+    def validate_move_sap(cls, value: str) -> str:
+        normalized = value.strip()
+        if not SAP_PATTERN.fullmatch(normalized):
+            raise ValueError('Invalid SAP format')
+        return normalized
+
+    @field_validator('fromStoreId', 'toStoreId')
+    @classmethod
+    def validate_move_store_id(cls, value: str) -> str:
+        normalized = value.strip()
+        if not STORE_ID_PATTERN.fullmatch(normalized):
+            raise ValueError('Invalid store ID format')
+        return normalized
+
+    model_config = ConfigDict(extra='forbid')
+
+
+class StoreReallocationRequest(BaseModel):
+    reallocationId: str = Field(..., min_length=8, max_length=128, pattern=r"^[A-Za-z0-9_-]+$")
+    baseOrderRevision: int = Field(..., ge=0)
+    moves: List[StoreReallocationMoveRequest] = Field(..., min_length=1, max_length=250)
+
+    @field_validator('moves')
+    @classmethod
+    def validate_unique_moves(
+        cls,
+        moves: List[StoreReallocationMoveRequest],
+    ) -> List[StoreReallocationMoveRequest]:
+        keys = [(move.sap, move.fromStoreId, move.toStoreId) for move in moves]
+        if len(keys) != len(set(keys)):
+            raise ValueError('Duplicate store reallocation move')
+        return moves
+
+    model_config = ConfigDict(extra='forbid')
+
+
+class StoreReallocationResponse(BaseModel):
+    orderId: str
+    reallocationId: str
+    orderRevision: int = Field(..., ge=1)
+    appliedAtMs: int = Field(..., ge=1)
+    reallocationCount: int = Field(..., ge=1)
+    idempotent: bool
+    projectionStatus: Literal['pending', 'succeeded', 'failed']
+
+
+class FullOrderAdjustmentConfirmRequest(BaseModel):
+    adjustmentId: str = Field(..., min_length=8, max_length=128, pattern=r"^[A-Za-z0-9_-]+$")
+    sentBatchId: str = Field(..., min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_-]+$")
+    baseOrderRevision: int = Field(..., ge=0)
+    acceptedSaps: List[str] = Field(default_factory=list, max_length=250)
+    notes: Optional[str] = Field(default=None, max_length=2000)
+
+    model_config = ConfigDict(extra="forbid")
+
+    @field_validator("acceptedSaps")
+    @classmethod
+    def validate_accepted_saps(cls, value: List[str]) -> List[str]:
+        normalized = [str(sap).strip() for sap in value]
+        if any(not sap or len(sap) > 20 for sap in normalized):
+            raise ValueError("acceptedSaps contains an invalid SAP")
+        if len(set(normalized)) != len(normalized):
+            raise ValueError("acceptedSaps contains duplicates")
+        return normalized
+
+
+class FullOrderAdjustmentConfirmResponse(BaseModel):
+    orderId: str
+    adjustmentId: str
+    orderRevision: int
+    changed: bool
+    idempotent: bool
+    projectionStatus: Optional[Literal['pending', 'succeeded', 'failed']] = None
+
+    model_config = ConfigDict(extra='forbid')
+
+
 class OrderItem(BaseModel):
     """Single product line item in an order."""
     sap: str
@@ -283,6 +387,9 @@ class Order(BaseModel):
     notes: Optional[str] = None
     isHolidaySchedule: Optional[bool] = None
     orderAdjustmentAppliedAtMs: Optional[int] = None
+    orderRevision: Optional[int] = Field(default=None, ge=0)
+    lastMutation: Optional[OrderMutation] = None
+    storeReallocationSummary: Optional[StoreReallocationSummary] = None
     coreItemPolicyVersion: Optional[int] = Field(default=None, ge=1, le=1)
     coreItemOverrides: Optional[List[CoreItemOverride]] = None
     # User-defined SAP row order for the portal editor and finalized printouts.
@@ -381,6 +488,8 @@ class OrderHistoryItem(BaseModel):
     totalUnits: int
     storeCount: int
     status: str
+    orderRevision: Optional[int] = Field(default=None, ge=0)
+    storeReallocationSummary: Optional[StoreReallocationSummary] = None
 
 
 class OrderHistoryResponse(BaseModel):

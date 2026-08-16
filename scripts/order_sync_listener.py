@@ -21,7 +21,7 @@ import socket
 import time
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from typing import Optional, Dict, List
+from typing import Any, Optional, Dict, List
 
 import psycopg2
 from psycopg2.extras import execute_values, RealDictCursor
@@ -167,10 +167,6 @@ def is_holiday_week(order_date_str: str) -> tuple[bool, str]:
 
 # Worker ID for this instance
 WORKER_ID = f"order-sync-{socket.gethostname()}-{__import__('os').getpid()}"
-
-# Cache for store ID aliases (loaded once per route)
-_store_alias_cache: Dict[str, Dict[str, str]] = {}  # route_number -> {alias_id: canonical_id}
-
 
 def _allowed_routes() -> Optional[set[str]]:
     raw = os.environ.get("ROUTESPARK_ALLOWED_ROUTES", "").strip()
@@ -376,69 +372,6 @@ def _extract_finalized_at(data: dict) -> datetime:
         if parsed is not None:
             return parsed
     return datetime.now(timezone.utc)
-
-
-# =============================================================================
-# Store ID Alias Resolution
-# =============================================================================
-
-def load_store_aliases(route_number: str) -> Dict[str, str]:
-    """Load store ID aliases for a route from PostgreSQL.
-    
-    Returns:
-        Dict mapping alias_id -> canonical_id
-    """
-    global _store_alias_cache
-    
-    # Check cache first
-    if route_number in _store_alias_cache:
-        return _store_alias_cache[route_number]
-    
-    try:
-        conn = get_pg_connection()
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute(
-                """
-                SELECT alias_id, canonical_id 
-                FROM store_id_aliases 
-                WHERE route_number = %s
-                """,
-                [route_number],
-            )
-            rows = cur.fetchall()
-        aliases = {row['alias_id']: row['canonical_id'] for row in rows}
-        
-        # Cache it
-        _store_alias_cache[route_number] = aliases
-        if aliases:
-            print(f"  📋 Loaded {len(aliases)} store ID aliases for route {route_number}")
-        return aliases
-        
-    except Exception as e:
-        print(f"  ⚠️ Error loading store aliases: {e}")
-        return {}
-
-
-def resolve_store_id(route_number: str, store_id: str) -> str:
-    """Resolve a store_id to its canonical form using the alias table.
-    
-    If the store_id is found in the alias table, returns the canonical_id.
-    Otherwise, returns the original store_id unchanged.
-    """
-    aliases = load_store_aliases(route_number)
-    canonical = aliases.get(store_id)
-    if canonical:
-        return canonical
-    return store_id
-
-
-def clear_alias_cache(route_number: str = None):
-    """Clear the store alias cache. Call when aliases are updated."""
-    global _store_alias_cache
-    if route_number:
-        _store_alias_cache.pop(route_number, None)
-    else:
-        _store_alias_cache.clear()
 
 
 # =============================================================================
@@ -792,6 +725,13 @@ def handle_finalized_order(fb_client: firestore.Client, order_id: str, data: dic
     
     if not _route_allowed(route_number):
         return
+
+    mutation_kind = str((data.get('lastMutation') or {}).get('kind') or '').strip()
+    if mutation_kind in {'store_reallocation', 'full_adjustment'}:
+        # The durable adjustment receipt owns projection retries. An order MODIFIED
+        # event must never be mistaken for another finalization/forecast event.
+        print(f"  ↪️  Order revision awaiting adjustment projection: {order_id} ({mutation_kind})")
+        return
     
     print(f"  ✅ Order finalized: {order_id}")
 
@@ -828,9 +768,6 @@ def handle_finalized_order(fb_client: firestore.Client, order_id: str, data: dic
             corrections_count = result.get('correctionsExtracted', 0)
             if corrections_count > 0:
                 print(f"     📊 Extracted {corrections_count} corrections for ML training")
-            create_delivery_allocations(fb_client, order_id, route_number, data)
-            link_promos_for_order(order_id, route_number, data)
-            
             # Update Firebase sync status so app knows data is current
             update_firebase_sync_status(fb_client, route_number, True)
 
@@ -883,6 +820,62 @@ def handle_finalized_order(fb_client: firestore.Client, order_id: str, data: dic
                 mark_finalize_event_error(str(finalize_event_key), f"sync_exception:{e}")
             except Exception:
                 pass
+
+
+def handle_pending_adjustment_projection(
+    fb_client: firestore.Client,
+    adjustment_ref: Any,
+    adjustment_data: dict,
+) -> Dict[str, Any]:
+    """Project the current canonical order for one durable adjustment receipt."""
+    route_number = str(adjustment_data.get('routeNumber') or '').strip()
+    order_id = str(adjustment_data.get('sourceOrderId') or '').strip()
+    projection = adjustment_data.get('projection') or {}
+    target_revision = int(projection.get('targetOrderRevision') or 0)
+    if not route_number or not order_id or target_revision < 1:
+        adjustment_ref.update({
+            'projection.status': 'failed',
+            'projection.lastErrorCode': 'INVALID_PROJECTION_RECEIPT',
+            'projection.lastAttemptAt': firestore.SERVER_TIMESTAMP,
+            'projection.attemptCount': firestore.Increment(1),
+            'updatedAt': firestore.SERVER_TIMESTAMP,
+        })
+        return {'error': 'INVALID_PROJECTION_RECEIPT'}
+
+    result = handle_sync_order(get_pg_connection(), fb_client, {
+        'orderId': order_id,
+        'routeNumber': route_number,
+    })
+    projected_revision = int(result.get('projectedRevision') or 0) if 'error' not in result else 0
+    if 'error' in result or projected_revision < target_revision:
+        print(
+            f"     ❌ Adjustment projection failed: route={route_number} "
+            f"order={order_id} target_revision={target_revision} code=ORDER_PROJECTION_FAILED"
+        )
+        adjustment_ref.update({
+            'projection.status': 'failed',
+            'projection.lastErrorCode': 'ORDER_PROJECTION_FAILED',
+            'projection.lastAttemptAt': firestore.SERVER_TIMESTAMP,
+            'projection.attemptCount': firestore.Increment(1),
+            'updatedAt': firestore.SERVER_TIMESTAMP,
+        })
+        return {'error': 'ORDER_PROJECTION_FAILED'}
+
+    adjustment_ref.update({
+        'projection.status': 'succeeded',
+        'projection.projectedOrderRevision': projected_revision,
+        'projection.completedAt': firestore.SERVER_TIMESTAMP,
+        'projection.lastAttemptAt': firestore.SERVER_TIMESTAMP,
+        'projection.lastErrorCode': firestore.DELETE_FIELD,
+        'projection.attemptCount': firestore.Increment(1),
+        'updatedAt': firestore.SERVER_TIMESTAMP,
+    })
+    update_firebase_sync_status(fb_client, route_number, True)
+    print(
+        f"     ✓ Adjustment projected: route={route_number} order={order_id} "
+        f"revision={projected_revision}"
+    )
+    return result
 
 
 def regenerate_forecasts_after_finalization(
@@ -1104,465 +1097,6 @@ def cleanup_old_forecasts(fb_client: firestore.Client, route_number: str) -> int
 
 
 # =============================================================================
-# Delivery Allocation Helpers
-# =============================================================================
-
-# Day name to weekday number mapping
-DAY_TO_WEEKDAY = {
-    'monday': 0, 'tuesday': 1, 'wednesday': 2, 'thursday': 3,
-    'friday': 4, 'saturday': 5, 'sunday': 6,
-    'mon': 0, 'tue': 1, 'wed': 2, 'thu': 3, 'fri': 4, 'sat': 5, 'sun': 6,
-}
-
-
-def get_store_delivery_days(fb_client: firestore.Client, route_number: str) -> Dict[str, List[int]]:
-    """Load delivery days for all stores in a route from Firebase.
-    
-    Returns: {store_id: [weekday_numbers]} where 0=Monday, 6=Sunday
-    """
-    store_delivery_days = {}
-    try:
-        stores_ref = fb_client.collection('routes').document(route_number).collection('stores')
-        for store_doc in stores_ref.stream():
-            store_data = store_doc.to_dict() or {}
-            delivery_days = store_data.get('deliveryDays', [])
-            
-            # Convert day names to weekday numbers
-            weekdays = []
-            for day in delivery_days:
-                day_lower = day.lower().strip()
-                if day_lower in DAY_TO_WEEKDAY:
-                    weekdays.append(DAY_TO_WEEKDAY[day_lower])
-            
-            store_delivery_days[store_doc.id] = weekdays
-    except Exception as e:
-        print(f"     ⚠️  Error loading store delivery days: {e}")
-    
-    return store_delivery_days
-
-
-def calculate_store_delivery_date(
-    order_date_str: str,
-    primary_delivery_date_str: str,
-    store_delivery_weekdays: List[int],
-) -> tuple[str, bool]:
-    """Calculate the actual delivery date for a store based on their delivery schedule.
-    
-    Args:
-        order_date_str: When the order was placed (YYYY-MM-DD)
-        primary_delivery_date_str: The order's primary delivery date (YYYY-MM-DD)
-        store_delivery_weekdays: List of weekday numbers (0=Mon, 6=Sun) when store gets deliveries
-    
-    Returns:
-        (delivery_date, is_case_split) - the actual delivery date and whether it's a case split
-    """
-    # Parse dates
-    try:
-        if '/' in primary_delivery_date_str:
-            # Handle MM/DD/YYYY format
-            primary_delivery = datetime.strptime(primary_delivery_date_str, '%m/%d/%Y')
-        else:
-            primary_delivery = datetime.fromisoformat(primary_delivery_date_str)
-        
-        if order_date_str:
-            if '/' in order_date_str:
-                order_date = datetime.strptime(order_date_str, '%m/%d/%Y')
-            else:
-                order_date = datetime.fromisoformat(order_date_str)
-        else:
-            order_date = primary_delivery - timedelta(days=3)  # Assume 3 days lead time
-    except (ValueError, TypeError):
-        # Can't parse dates, use primary delivery date
-        return primary_delivery_date_str, False
-    
-    primary_weekday = primary_delivery.weekday()
-    
-    # If store has no configured delivery days, use primary
-    if not store_delivery_weekdays:
-        return primary_delivery.strftime('%Y-%m-%d'), False
-    
-    # Check if primary delivery day matches store's delivery days
-    if primary_weekday in store_delivery_weekdays:
-        # Store can receive on the primary delivery day - no case split
-        return primary_delivery.strftime('%Y-%m-%d'), False
-    
-    # Store can't receive on primary day - find next valid delivery day after order date
-    # Look for the next occurrence of a valid delivery day
-    # NOTE: is_case_split = FALSE here because this item is part of THIS order's normal flow.
-    # Case splits are only marked when items from PREVIOUS orders are allocated to this delivery.
-    for days_ahead in range(1, 8):
-        check_date = order_date + timedelta(days=days_ahead)
-        if check_date.weekday() in store_delivery_weekdays:
-            return check_date.strftime('%Y-%m-%d'), False  # Not a case split - part of this order
-    
-    # Shouldn't happen, but fall back to primary
-    return primary_delivery.strftime('%Y-%m-%d'), False
-
-
-def create_delivery_allocations(
-    fb_client: firestore.Client,
-    order_id: str,
-    route_number: str,
-    data: dict,
-) -> None:
-    """Create delivery allocation rows for a finalized order.
-    
-    Uses direct PostgreSQL with batch inserts for efficiency (no Firebase round-trips).
-    Calculates the correct delivery date per store based on their configured
-    delivery days. Marks items as case splits when delivery differs from primary.
-    """
-    delivery_date = data.get('expectedDeliveryDate') or data.get('deliveryDate')
-    order_date = data.get('orderDate')
-    stores = data.get('stores', []) or []
-
-    if not delivery_date:
-        print(f"     ⚠️  Skipping allocations: missing delivery date for order {order_id}")
-        return
-
-    # Load store delivery days from Firebase
-    store_delivery_days = get_store_delivery_days(fb_client, route_number)
-    
-    # Collect all rows for batch insert
-    allocation_rows = []
-    case_splits = 0
-    
-    for store in stores:
-        raw_store_id = store.get('id') or store.get('storeId') or ''
-        store_name = store.get('name') or store.get('storeName') or ''
-        items = store.get('items', []) or []
-
-        if not raw_store_id:
-            continue
-
-        # Resolve store ID to canonical form (handles old/alias IDs)
-        store_id = resolve_store_id(route_number, raw_store_id)
-        if store_id != raw_store_id:
-            print(f"     📍 Resolved store alias: {raw_store_id} -> {store_id}")
-
-        # Calculate the actual delivery date for this store
-        store_weekdays = store_delivery_days.get(store_id, []) or store_delivery_days.get(raw_store_id, [])
-        actual_delivery_date, is_case_split = calculate_store_delivery_date(
-            order_date,
-            delivery_date,
-            store_weekdays,
-        )
-        
-        if is_case_split:
-            case_splits += 1
-
-        for item in items:
-            sap = item.get('sap')
-            qty = item.get('quantity', 0)
-            if not sap or qty == 0:
-                continue
-
-            allocation_id = f"{order_id}-{store_id}-{sap}"
-            allocation_rows.append((
-                allocation_id,
-                route_number,
-                order_id,
-                order_date or delivery_date,
-                sap,
-                store_id,
-                store_name,
-                qty,
-                actual_delivery_date,
-                is_case_split,
-            ))
-
-    # Batch insert using direct PostgreSQL (no Firebase round-trips)
-    if allocation_rows:
-        try:
-            conn = get_pg_connection()
-            with conn.cursor() as cur:
-                execute_values(
-                    cur,
-                    """
-                    INSERT INTO delivery_allocations (
-                        allocation_id, route_number, source_order_id, source_order_date,
-                        sap, store_id, store_name, quantity, delivery_date, is_case_split
-                    ) VALUES %s
-                    ON CONFLICT (allocation_id) DO UPDATE SET
-                        route_number = EXCLUDED.route_number,
-                        source_order_date = EXCLUDED.source_order_date,
-                        store_name = EXCLUDED.store_name,
-                        quantity = EXCLUDED.quantity,
-                        delivery_date = EXCLUDED.delivery_date,
-                        is_case_split = EXCLUDED.is_case_split
-                    """,
-                    allocation_rows,
-                )
-            
-            msg = f"     ✓ Created/updated {len(allocation_rows)} delivery allocation rows"
-            if case_splits > 0:
-                msg += f" ({case_splits} stores with case splits)"
-            print(msg)
-        except Exception as e:
-            print(f"     ⚠️  Failed to batch insert allocations: {e}")
-    
-    # Post-process: Mark case splits based on comparing source order dates
-    # For each store+delivery_date, the LATEST source_order_date is the "primary"
-    # Earlier source_order_dates are case splits
-    mark_case_splits_for_route(route_number)
-
-
-def mark_case_splits_for_route(route_number: str) -> None:
-    """Mark case splits by comparing source order dates per store+delivery_date.
-    
-    Uses direct PostgreSQL for efficiency (no Firebase round-trips).
-    
-    For each store+delivery_date combination:
-    - The LATEST source_order_date is the "primary" order (is_case_split = FALSE)
-    - Earlier source_order_dates are case splits (is_case_split = TRUE)
-    """
-    try:
-        conn = get_pg_connection()
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            # Find all store+delivery_date combinations
-            cur.execute("""
-                WITH order_dates_per_delivery AS (
-                    SELECT 
-                        store_id,
-                        delivery_date,
-                        MAX(source_order_date) as primary_order_date
-                    FROM delivery_allocations
-                    WHERE route_number = %s
-                    GROUP BY store_id, delivery_date
-                )
-                SELECT store_id, delivery_date, primary_order_date
-                FROM order_dates_per_delivery
-            """, [route_number])
-            
-            rows = cur.fetchall()
-            if not rows:
-                return
-            
-            # For each store+delivery_date, set is_case_split based on source_order_date
-            updates = 0
-            for row in rows:
-                store_id = row['store_id']
-                delivery_date = row['delivery_date']
-                primary_order_date = row['primary_order_date']
-                
-                # Set is_case_split = FALSE for items from primary order date
-                cur.execute("""
-                    UPDATE delivery_allocations
-                    SET is_case_split = FALSE
-                    WHERE route_number = %s
-                      AND store_id = %s
-                      AND delivery_date = %s
-                      AND source_order_date = %s
-                """, [route_number, store_id, delivery_date, primary_order_date])
-                
-                # Set is_case_split = TRUE for items from earlier order dates
-                cur.execute("""
-                    UPDATE delivery_allocations
-                    SET is_case_split = TRUE
-                    WHERE route_number = %s
-                      AND store_id = %s
-                      AND delivery_date = %s
-                      AND source_order_date < %s
-                """, [route_number, store_id, delivery_date, primary_order_date])
-                
-                updates += 1
-            
-            if updates > 0:
-                print(f"     ✓ Updated case split flags for {updates} store+delivery combinations")
-    except Exception as e:
-        print(f"     ⚠️  Error marking case splits: {e}")
-
-
-# =============================================================================
-# Promo linkage
-# =============================================================================
-
-def link_promos_for_order(order_id: str, route_number: str, data: dict) -> None:
-    """Link finalized order items to active promos (date-window + SAP) and compute ML features."""
-    order_date = data.get('orderDate') or data.get('expectedDeliveryDate')
-    stores = data.get('stores', []) or []
-
-    if not order_date:
-        print(f"     ⚠️  Skipping promo linkage: missing order date for {order_id}")
-        return
-
-    promo_items = []
-    for store in stores:
-        raw_store_id = store.get('id') or store.get('storeId') or ''
-        # Resolve store ID to canonical form
-        store_id = resolve_store_id(route_number, raw_store_id) if raw_store_id else ''
-        
-        for item in store.get('items', []) or []:
-            sap = item.get('sap')
-            qty = item.get('quantity', 0)
-            cases = item.get('cases', 0)
-            if not sap or qty == 0:
-                continue
-            promo_info = _find_promo_info(route_number, sap, order_date)
-            if promo_info:
-                # Get baseline quantity (avg non-promo orders for this store/sap)
-                baseline = _get_baseline_quantity(route_number, store_id, sap)
-                quantity_lift = qty / baseline if baseline and baseline > 0 else None
-                
-                promo_items.append({
-                    'promo_id': promo_info['promo_id'],
-                    'store_id': store_id,
-                    'sap': sap,
-                    'quantity': qty,
-                    'cases': cases,
-                    'promo_price': promo_info.get('special_price'),
-                    'discount_percent': promo_info.get('discount_percent'),
-                    'baseline_quantity': baseline,
-                    'quantity_lift': quantity_lift,
-                    'weeks_into_promo': promo_info.get('weeks_into_promo', 1),
-                    'is_first_occurrence': promo_info.get('is_first_occurrence', True),
-                })
-
-    if not promo_items:
-        return
-
-    # Batch insert using direct PostgreSQL
-    try:
-        rows = []
-        for entry in promo_items:
-            rows.append((
-                f"{order_id}-{entry['store_id']}-{entry['sap']}-{entry['promo_id']}",
-                route_number,
-                entry['promo_id'],
-                order_id,
-                entry['store_id'],
-                entry['sap'],
-                entry['promo_price'],
-                entry['discount_percent'],
-                entry['quantity'],
-                entry['cases'],
-                entry['baseline_quantity'],
-                entry['quantity_lift'],
-                entry['weeks_into_promo'],
-                entry['is_first_occurrence'],
-            ))
-        
-        conn = get_pg_connection()
-        with conn.cursor() as cur:
-            execute_values(
-                cur,
-                """
-                INSERT INTO promo_order_history (
-                    id, route_number, promo_id, order_id, store_id, sap,
-                    promo_price, discount_percent,
-                    quantity_ordered, cases_ordered,
-                    baseline_quantity, quantity_lift,
-                    weeks_into_promo, is_first_promo_occurrence,
-                    created_at
-                ) VALUES %s
-                ON CONFLICT (id) DO UPDATE SET
-                    quantity_ordered = EXCLUDED.quantity_ordered,
-                    cases_ordered = EXCLUDED.cases_ordered,
-                    baseline_quantity = EXCLUDED.baseline_quantity,
-                    quantity_lift = EXCLUDED.quantity_lift
-                """,
-                rows,
-                template="(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)",
-            )
-        
-        print(f"     ✓ Linked {len(promo_items)} promo items for order {order_id}")
-    except Exception as e:
-        print(f"     ⚠️  Failed to write promo_order_history: {e}")
-
-
-def _find_promo_info(route_number: str, sap: str, order_date: str) -> dict | None:
-    """Lookup promo info for sap/date window including ML features.
-    
-    Uses direct PostgreSQL for efficiency.
-    """
-    try:
-        conn = get_pg_connection()
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute(
-                """
-                SELECT 
-                    pi.promo_id,
-                    pi.special_price,
-                    pi.discount_percent,
-                    ph.start_date,
-                    ph.times_seen
-                FROM promo_items pi
-                JOIN promo_history ph ON pi.promo_id = ph.promo_id
-                WHERE pi.sap = %s
-                  AND ph.route_number = %s
-                  AND DATE(%s) BETWEEN ph.start_date AND ph.end_date
-                LIMIT 1
-                """,
-                [sap, route_number, order_date],
-            )
-            row = cur.fetchone()
-            if row:
-                promo_id = row.get('promo_id')
-                start_date = row.get('start_date')
-                times_seen = row.get('times_seen', 0)
-                
-                # Calculate weeks into promo
-                weeks_into = 1
-                if start_date and order_date:
-                    try:
-                        if isinstance(start_date, str):
-                            start_dt = datetime.fromisoformat(start_date.replace('/', '-'))
-                        else:
-                            start_dt = start_date
-                        if isinstance(order_date, str):
-                            if '/' in order_date:
-                                order_dt = datetime.strptime(order_date, '%m/%d/%Y')
-                            else:
-                                order_dt = datetime.fromisoformat(order_date)
-                        else:
-                            order_dt = order_date
-                        weeks_into = max(1, ((order_dt - start_dt).days // 7) + 1)
-                    except:
-                        pass
-                
-                return {
-                    'promo_id': promo_id,
-                    'special_price': row.get('special_price'),
-                    'discount_percent': row.get('discount_percent'),
-                    'weeks_into_promo': weeks_into,
-                    'is_first_occurrence': times_seen == 0,
-                }
-    except Exception as e:
-        print(f"     ⚠️  Promo lookup failed for SAP {sap}: {e}")
-    return None
-
-
-def _get_baseline_quantity(route_number: str, store_id: str, sap: str) -> float | None:
-    """Get baseline (non-promo) average quantity for this store/sap.
-    
-    Uses direct PostgreSQL for efficiency.
-    """
-    try:
-        conn = get_pg_connection()
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute(
-                """
-                SELECT AVG(oli.quantity) as avg_qty
-                FROM order_line_items oli
-                LEFT JOIN promo_order_history poh 
-                    ON oli.order_id = poh.order_id 
-                    AND oli.store_id = poh.store_id 
-                    AND oli.sap = poh.sap
-                WHERE oli.route_number = %s
-                  AND oli.store_id = %s
-                  AND oli.sap = %s
-                  AND poh.id IS NULL  -- Only non-promo orders
-                """,
-                [route_number, store_id, sap],
-            )
-            row = cur.fetchone()
-            if row and row.get('avg_qty'):
-                return float(row['avg_qty'])
-    except Exception as e:
-        print(f"     ⚠️  Baseline lookup failed for {store_id}/{sap}: {e}")
-    return None
-
-
-# =============================================================================
 # Real-time Listener
 # =============================================================================
 
@@ -1582,6 +1116,13 @@ def watch_all_orders(sa_path: str):
             print(f"⚠️  Failed to ensure forecast queue tables: {e}")
     # Watch all orders
     orders_col = fb_client.collection_group('orders')
+    adjustments_col = fb_client.collection_group('orderAdjustments')
+    if FieldFilter is not None:
+        pending_adjustments = adjustments_col.where(
+            filter=FieldFilter('projection.status', '==', 'pending')
+        )
+    else:
+        pending_adjustments = adjustments_col.where('projection.status', '==', 'pending')
     
     # Track seen orders to avoid reprocessing
     seen_orders = set()
@@ -1632,9 +1173,34 @@ def watch_all_orders(sa_path: str):
                     if order_id not in seen_orders:
                         seen_orders.add(order_id)
                     handle_finalized_order(fb_client, order_id, data)
+
+    def on_adjustment_snapshot(col_snapshot, changes, read_time):
+        """Process durable projection receipts, including pending docs on startup."""
+        for change in changes:
+            if change.type.name not in {'ADDED', 'MODIFIED'}:
+                continue
+            doc = change.document
+            data = doc.to_dict() or {}
+            path_parts = doc.reference.path.split('/')
+            if (
+                len(path_parts) != 4
+                or path_parts[0] != 'routes'
+                or path_parts[2] != 'orderAdjustments'
+                or (data.get('projection') or {}).get('status') != 'pending'
+            ):
+                continue
+            try:
+                handle_pending_adjustment_projection(fb_client, doc.reference, data)
+            except Exception as exc:
+                print(
+                    "     ❌ Unhandled adjustment projection error:"
+                    f" receipt={doc.id} code=UNHANDLED_PROJECTION_EXCEPTION"
+                    f" type={type(exc).__name__}"
+                )
     
     # Start real-time listener
     watcher = orders_col.on_snapshot(on_snapshot)
+    adjustment_watcher = pending_adjustments.on_snapshot(on_adjustment_snapshot)
     
     try:
         while True:
@@ -1642,6 +1208,7 @@ def watch_all_orders(sa_path: str):
     except KeyboardInterrupt:
         print("\n\n👋 Stopping listener...")
         watcher.unsubscribe()
+        adjustment_watcher.unsubscribe()
 
 
 # =============================================================================

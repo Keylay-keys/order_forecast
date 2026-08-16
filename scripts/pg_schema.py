@@ -130,9 +130,23 @@ def _create_order_tables(cur) -> None:
             store_count INTEGER DEFAULT 0,
             status VARCHAR(20) DEFAULT 'finalized',
             is_holiday_week BOOLEAN DEFAULT FALSE,
+            order_revision INTEGER NOT NULL DEFAULT 0,
+            last_mutation_kind VARCHAR(32),
+            last_mutation_id VARCHAR(255),
+            last_mutation_at TIMESTAMP WITH TIME ZONE,
+            reallocation_count INTEGER NOT NULL DEFAULT 0,
+            last_reallocated_at TIMESTAMP WITH TIME ZONE,
+            last_reallocation_id VARCHAR(255),
             synced_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
         )
     """)
+    cur.execute("ALTER TABLE orders_historical ADD COLUMN IF NOT EXISTS order_revision INTEGER NOT NULL DEFAULT 0")
+    cur.execute("ALTER TABLE orders_historical ADD COLUMN IF NOT EXISTS last_mutation_kind VARCHAR(32)")
+    cur.execute("ALTER TABLE orders_historical ADD COLUMN IF NOT EXISTS last_mutation_id VARCHAR(255)")
+    cur.execute("ALTER TABLE orders_historical ADD COLUMN IF NOT EXISTS last_mutation_at TIMESTAMP WITH TIME ZONE")
+    cur.execute("ALTER TABLE orders_historical ADD COLUMN IF NOT EXISTS reallocation_count INTEGER NOT NULL DEFAULT 0")
+    cur.execute("ALTER TABLE orders_historical ADD COLUMN IF NOT EXISTS last_reallocated_at TIMESTAMP WITH TIME ZONE")
+    cur.execute("ALTER TABLE orders_historical ADD COLUMN IF NOT EXISTS last_reallocation_id VARCHAR(255)")
     
     # Individual line items (one row per store/item in each order)
     cur.execute("""

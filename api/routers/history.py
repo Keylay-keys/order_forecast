@@ -121,7 +121,10 @@ def _fetch_firestore_products(db, route: str) -> Dict[str, Dict[str, Any]]:
                 ),
             }
     except Exception as e:
-        print(f"[history] Warning: Failed to fetch Firestore catalog products: {e}")
+        print(
+            "[history] Catalog product lookup failed"
+            f" code=HISTORY_CATALOG_UNAVAILABLE type={type(e).__name__}"
+        )
     return products
 
 
@@ -241,6 +244,8 @@ async def get_order_history(
                 totalUnits=total_units,
                 storeCount=len(data.get("stores") or []),
                 status=str(data.get("status") or "finalized"),
+                orderRevision=_coerce_int(data.get("orderRevision")),
+                storeReallocationSummary=data.get("storeReallocationSummary"),
             ))
         
         next_cursor = None
@@ -263,8 +268,8 @@ async def get_order_history(
         
     except HTTPException:
         raise
-    except Exception as e:
-        raise HTTPException(500, f"History error: {str(e)}")
+    except Exception:
+        raise HTTPException(500, "Order history is temporarily unavailable")
 
 
 @router.get(
@@ -321,7 +326,10 @@ async def get_order_details(
                     if alt_id:
                         store_numbers[str(alt_id)] = store_num
         except Exception as e:
-            print(f"[history] Warning: Failed to fetch store numbers from Firestore: {e}")
+            print(
+                "[history] Store number lookup failed"
+                f" code=HISTORY_STORES_UNAVAILABLE type={type(e).__name__}"
+            )
 
         stores = []
         for store in order_data.get("stores") or []:
@@ -368,11 +376,14 @@ async def get_order_details(
             "storeCount": len(order_data.get("stores") or []),
             "status": str(order_data.get("status") or "finalized"),
             "orderAdjustmentAppliedAtMs": order_data.get("orderAdjustmentAppliedAtMs"),
+            "orderRevision": _coerce_int(order_data.get("orderRevision")),
+            "lastMutation": order_data.get("lastMutation"),
+            "storeReallocationSummary": order_data.get("storeReallocationSummary"),
             "sapOrder": order_data.get("sapOrder") or [],
             "stores": stores,
         }
         
     except HTTPException:
         raise
-    except Exception as e:
-        raise HTTPException(500, f"History error: {str(e)}")
+    except Exception:
+        raise HTTPException(500, "Order history is temporarily unavailable")

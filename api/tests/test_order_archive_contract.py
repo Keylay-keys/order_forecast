@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import unittest
-from datetime import date
+from datetime import date, datetime, timezone
 from unittest.mock import patch
 
 from order_forecast.scripts import pg_utils
@@ -14,6 +14,13 @@ class OrderArchiveContractTests(unittest.TestCase):
             "delivery_date": date(2026, 5, 11),
             "schedule_key": "monday",
             "item_count": 147,
+            "order_revision": 0,
+            "last_mutation_kind": None,
+            "last_mutation_id": None,
+            "last_mutation_at": None,
+            "reallocation_count": 0,
+            "last_reallocated_at": None,
+            "last_reallocation_id": None,
         }]):
             summaries = pg_utils.get_archived_dates("989262")
 
@@ -22,7 +29,31 @@ class OrderArchiveContractTests(unittest.TestCase):
             "date": "2026-05-11",
             "scheduleKey": "monday",
             "itemCount": 147,
+            "orderRevision": 0,
+            "lastMutation": None,
+            "storeReallocationSummary": None,
         }])
+
+    def test_route_988200_archived_summary_preserves_reallocation_badge_metadata(self):
+        applied_at = datetime(2026, 8, 16, 12, tzinfo=timezone.utc)
+        with patch.object(pg_utils, "fetch_all", return_value=[{
+            "order_id": "order-988200-archived",
+            "delivery_date": date(2026, 8, 20),
+            "schedule_key": "thursday",
+            "item_count": 131,
+            "order_revision": 4,
+            "last_mutation_kind": "store_reallocation",
+            "last_mutation_id": "adjustment-988200",
+            "last_mutation_at": applied_at,
+            "reallocation_count": 1,
+            "last_reallocated_at": applied_at,
+            "last_reallocation_id": "adjustment-988200",
+        }]):
+            [summary] = pg_utils.get_archived_dates("988200")
+
+        self.assertEqual(summary["orderRevision"], 4)
+        self.assertEqual(summary["lastMutation"]["kind"], "store_reallocation")
+        self.assertEqual(summary["storeReallocationSummary"]["count"], 1)
 
     def test_exact_id_lookup_is_scoped_to_route(self):
         with patch.object(pg_utils, "fetch_one", return_value={
