@@ -226,6 +226,80 @@ class StoreReallocationTransactionTests(unittest.TestCase):
         self.assertEqual(second["orderRevision"], 4)
         self.assertEqual(self.order_ref.data["stores"][0]["items"][0]["quantity"], 6)
 
+    def test_client_created_draft_is_atomically_promoted(self):
+        created_at = datetime(2026, 8, 16, 11, tzinfo=timezone.utc)
+        self.adjustment_ref.data = {
+            "id": str(REALLOCATION_ID),
+            "routeNumber": ROUTE,
+            "userId": "member-988200",
+            "status": "draft",
+            "mode": "store_reallocation",
+            "sourceOrderId": self.order_ref.id,
+            "lines": [],
+            "email": {},
+            "createdAt": created_at,
+        }
+
+        result = self._apply(_Transaction())
+
+        self.assertFalse(result["idempotent"])
+        self.assertEqual(result["orderRevision"], 4)
+        self.assertEqual(self.adjustment_ref.data["status"], "applied")
+        self.assertEqual(self.adjustment_ref.data["createdAt"], created_at)
+        self.assertEqual(
+            self.adjustment_ref.data["storeReallocation"]["appliedByUserId"],
+            "member-988200",
+        )
+
+    def test_client_draft_owned_by_another_user_is_hidden(self):
+        self.adjustment_ref.data = {
+            "id": str(REALLOCATION_ID),
+            "routeNumber": ROUTE,
+            "userId": "other-member-988200",
+            "status": "draft",
+            "mode": "store_reallocation",
+            "sourceOrderId": self.order_ref.id,
+        }
+
+        with self.assertRaises(StructuredApiError) as raised:
+            self._apply(_Transaction())
+
+        self.assertEqual(raised.exception.status_code, 404)
+        self.assertEqual(raised.exception.code, "ORDER_NOT_FOUND")
+
+    def test_client_draft_for_another_order_is_rejected(self):
+        self.adjustment_ref.data = {
+            "id": str(REALLOCATION_ID),
+            "routeNumber": ROUTE,
+            "userId": "member-988200",
+            "status": "draft",
+            "mode": "store_reallocation",
+            "sourceOrderId": "order-988200-other",
+        }
+
+        with self.assertRaises(StructuredApiError) as raised:
+            self._apply(_Transaction())
+
+        self.assertEqual(raised.exception.status_code, 409)
+        self.assertEqual(raised.exception.code, "REALLOCATION_ID_CONFLICT")
+
+    def test_client_draft_with_server_owned_fields_is_rejected(self):
+        self.adjustment_ref.data = {
+            "id": str(REALLOCATION_ID),
+            "routeNumber": ROUTE,
+            "userId": "member-988200",
+            "status": "draft",
+            "mode": "store_reallocation",
+            "sourceOrderId": self.order_ref.id,
+            "projection": {"status": "pending"},
+        }
+
+        with self.assertRaises(StructuredApiError) as raised:
+            self._apply(_Transaction())
+
+        self.assertEqual(raised.exception.status_code, 409)
+        self.assertEqual(raised.exception.code, "REALLOCATION_ID_CONFLICT")
+
     def test_stale_new_reallocation_is_rejected(self):
         self._apply(_Transaction())
         new_payload = StoreReallocationRequest(

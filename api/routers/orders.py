@@ -552,33 +552,49 @@ def _apply_store_reallocation_document(
 
     signature = moves_signature(payload.moves)
     adjustment_doc = adjustment_ref.get(transaction=transaction)
+    draft_created_at = None
     if adjustment_doc.exists:
         existing = adjustment_doc.to_dict() or {}
         existing_reallocation = existing.get("storeReallocation") or {}
+        order_id = str(order_data.get("id") or order_ref.id)
         same_operation = (
-            str(existing.get("sourceOrderId") or "") == str(order_data.get("id") or order_ref.id)
+            str(existing.get("sourceOrderId") or "") == order_id
             and str(existing_reallocation.get("movesSignature") or "") == signature
             and str(existing.get("status") or "") == "applied"
         )
-        if not same_operation:
+        if same_operation:
+            existing_actor = str(existing_reallocation.get("appliedByUserId") or existing.get("userId") or "")
+            if existing_actor != actor_user_id and not requester_is_owner:
+                raise StructuredApiError(404, "Order not found", "ORDER_NOT_FOUND")
+            projection = existing.get("projection") or {}
+            return {
+                "orderId": order_id,
+                "reallocationId": str(payload.reallocationId),
+                "orderRevision": int(existing_reallocation.get("appliedOrderRevision") or 1),
+                "appliedAtMs": int(existing_reallocation.get("appliedAtMs") or 1),
+                "reallocationCount": int(existing_reallocation.get("reallocationCount") or 1),
+                "idempotent": True,
+                "projectionStatus": str(projection.get("status") or "pending"),
+            }
+
+        existing_actor = str(existing.get("userId") or "")
+        if existing_actor != actor_user_id:
+            raise StructuredApiError(404, "Order not found", "ORDER_NOT_FOUND")
+        promotable_draft = (
+            str(existing.get("routeNumber") or "") == route_number
+            and str(existing.get("sourceOrderId") or "") == order_id
+            and str(existing.get("status") or "") == "draft"
+            and str(existing.get("mode") or "") == "store_reallocation"
+            and not existing.get("storeReallocation")
+            and not existing.get("projection")
+        )
+        if not promotable_draft:
             raise StructuredApiError(
                 409,
                 "This reallocation ID has already been used.",
                 "REALLOCATION_ID_CONFLICT",
             )
-        existing_actor = str(existing_reallocation.get("appliedByUserId") or existing.get("userId") or "")
-        if existing_actor != actor_user_id and not requester_is_owner:
-            raise StructuredApiError(404, "Order not found", "ORDER_NOT_FOUND")
-        projection = existing.get("projection") or {}
-        return {
-            "orderId": str(order_data.get("id") or order_ref.id),
-            "reallocationId": str(payload.reallocationId),
-            "orderRevision": int(existing_reallocation.get("appliedOrderRevision") or 1),
-            "appliedAtMs": int(existing_reallocation.get("appliedAtMs") or 1),
-            "reallocationCount": int(existing_reallocation.get("reallocationCount") or 1),
-            "idempotent": True,
-            "projectionStatus": str(projection.get("status") or "pending"),
-        }
+        draft_created_at = existing.get("createdAt")
 
     if order_data.get("status") != "finalized":
         raise StructuredApiError(
@@ -683,7 +699,7 @@ def _apply_store_reallocation_document(
         "reminderStatus": "skipped",
         "reminderSkippedAtMs": applied_at_ms,
         "reminderSkipReason": "store_reallocation_applied",
-        "createdAt": now,
+        "createdAt": draft_created_at or now,
         "updatedAt": now,
     })
     transaction.set(audit_ref, {
