@@ -21,15 +21,38 @@ import socket
 import threading
 import time
 from datetime import datetime, timezone
-from typing import Optional, Dict, List, Set
+from typing import Any, Optional, Dict, List, Set
 
 import psycopg2
 from psycopg2.extras import execute_values, RealDictCursor
 from google.cloud import firestore  # type: ignore
+from google.cloud.firestore_v1.base_query import FieldFilter
 
 try:
+    from .low_qty_notification_store import (
+        EnabledPreference,
+        reconcile_complete_enabled_snapshot,
+        schema_ready as low_qty_schema_ready,
+    )
+    from .low_qty_schedule import (
+        InvalidReminderSetting,
+        next_scheduled_instant,
+        parse_reminder_minute,
+        validate_timezone,
+    )
     from .schedule_cycle import normalize_order_cycle
 except ImportError:
+    from low_qty_notification_store import (
+        EnabledPreference,
+        reconcile_complete_enabled_snapshot,
+        schema_ready as low_qty_schema_ready,
+    )
+    from low_qty_schedule import (
+        InvalidReminderSetting,
+        next_scheduled_instant,
+        parse_reminder_minute,
+        validate_timezone,
+    )
     from schedule_cycle import normalize_order_cycle
 
 # Worker ID for this instance
@@ -482,18 +505,38 @@ def resolve_route_owner_user_id(
     and retain the PostgreSQL user only as a compatibility fallback.
     """
     try:
-        snapshot = fb_client.collection('routes').document(str(route_number)).get()
-        if snapshot.exists:
-            data = snapshot.to_dict() or {}
-            owner_user_id = str(data.get('ownerUid') or data.get('userId') or '').strip()
-            if owner_user_id:
-                return owner_user_id
+        owner_user_id = resolve_authoritative_route_owner(fb_client, route_number)
+        if owner_user_id:
+            return owner_user_id
     except Exception as exc:
         print(
             f"  [Schedule] ⚠️ Could not resolve route owner for {route_number};"
             f" using discovery fallback: {exc}"
         )
     return str(fallback_user_id or '').strip()
+
+
+def resolve_authoritative_route_owner(
+    fb_client: firestore.Client,
+    route_number: str,
+) -> Optional[str]:
+    """Resolve the complete route-owner authority chain without failing open."""
+    route_number = str(route_number).strip()
+    lookups = (
+        ("routes", ("ownerUid", "userId")),
+        ("routeEntitlements", ("ownerUid",)),
+        ("routeNumbers", ("userId", "userID")),
+    )
+    for collection_name, owner_fields in lookups:
+        snapshot = fb_client.collection(collection_name).document(route_number).get()
+        if not snapshot.exists:
+            continue
+        data = snapshot.to_dict() or {}
+        for owner_field in owner_fields:
+            owner_uid = data.get(owner_field)
+            if isinstance(owner_uid, str) and owner_uid.strip():
+                return owner_uid.strip()
+    return None
 
 
 # =============================================================================
@@ -514,6 +557,200 @@ class ConfigSyncManager:
         self._products_initialized: Set[str] = set()
         self._schedules_initialized: Set[str] = set()
         self._refresh_timers: Dict[str, threading.Timer] = {}
+        self._low_qty_watch = None
+        self._low_qty_owner_watchers: Dict[str, Any] = {}
+        self._low_qty_user_snapshots: List[Any] = []
+        self._low_qty_lock = threading.RLock()
+        self._low_qty_sync_ready = False
+        self._low_qty_metrics: Dict[str, int] = {
+            "snapshots_received": 0,
+            "snapshots_committed": 0,
+            "snapshot_errors": 0,
+            "owner_watch_errors": 0,
+            "invalid_settings": 0,
+            "non_owner_users": 0,
+            "enabled_preferences": 0,
+            "disabled_preferences": 0,
+        }
+
+    @staticmethod
+    def _low_qty_sync_enabled() -> bool:
+        return os.environ.get("LOW_QTY_PREFERENCE_SYNC_ENABLED", "false").strip().lower() == "true"
+
+    @staticmethod
+    def _order_reminder_settings(user_data: Dict[str, Any]) -> Dict[str, Any]:
+        settings = user_data.get("userSettings")
+        if not isinstance(settings, dict):
+            return {}
+        notifications = settings.get("notifications")
+        if not isinstance(notifications, dict):
+            return {}
+        reminder = notifications.get("orderReminders")
+        return reminder if isinstance(reminder, dict) else {}
+
+    def _emit_low_qty_metrics(self, event: str) -> None:
+        print(
+            "  [LowQtyMetrics] "
+            + json.dumps(
+                {"event": event, **self._low_qty_metrics},
+                sort_keys=True,
+            )
+        )
+
+    def _build_low_qty_preferences(
+        self,
+        user_snapshots: List[Any],
+        read_time: Any,
+    ) -> List[EnabledPreference]:
+        if isinstance(read_time, datetime) and read_time.tzinfo is not None:
+            schedule_after = read_time.astimezone(timezone.utc)
+        else:
+            schedule_after = datetime.now(timezone.utc)
+
+        preferences: List[EnabledPreference] = []
+        for snapshot in user_snapshots:
+            if not snapshot.exists:
+                continue
+            data = snapshot.to_dict() or {}
+            order_reminders = self._order_reminder_settings(data)
+            if order_reminders.get("enabled") is not True:
+                continue
+
+            profile = data.get("profile", {}) if isinstance(data.get("profile"), dict) else {}
+            route_number = str(profile.get("currentRoute") or profile.get("routeNumber") or "").strip()
+            if not route_number:
+                self._low_qty_metrics["invalid_settings"] += 1
+                print(f"  [LowQty] Invalid enabled reminder for user {snapshot.id}: missing_route")
+                continue
+
+            owner_uid = resolve_authoritative_route_owner(self.fb_client, route_number)
+            if not owner_uid:
+                self._low_qty_metrics["invalid_settings"] += 1
+                print(f"  [LowQty] Invalid enabled reminder for route {route_number}: unresolved_owner")
+                continue
+            if owner_uid != snapshot.id:
+                self._low_qty_metrics["non_owner_users"] += 1
+                print(f"  [LowQty] Ignoring enabled non-owner {snapshot.id} for route {route_number}")
+                continue
+
+            try:
+                reminder_minute = parse_reminder_minute(order_reminders.get("time"))
+                timezone_name = validate_timezone(profile.get("timezone"))
+                _next_local_date, next_due_at = next_scheduled_instant(
+                    reminder_minute,
+                    timezone_name,
+                    after_utc=schedule_after,
+                )
+                preferences.append(
+                    EnabledPreference(
+                        route_number=route_number,
+                        owner_uid=owner_uid,
+                        reminder_minute_local=reminder_minute,
+                        timezone_name=timezone_name,
+                        next_due_at=next_due_at,
+                    ).validated()
+                )
+            except (InvalidReminderSetting, ValueError) as exc:
+                self._low_qty_metrics["invalid_settings"] += 1
+                print(f"  [LowQty] Invalid enabled reminder for route {route_number}: {exc}")
+        return preferences
+
+    def _sync_low_qty_snapshot(self, user_snapshots: List[Any], read_time: Any) -> None:
+        """Resolve Firebase state completely before opening the SQL transaction."""
+        with self._low_qty_lock:
+            self._low_qty_metrics["snapshots_received"] += 1
+            preferences = self._build_low_qty_preferences(user_snapshots, read_time)
+            # Retain only a completely resolved query snapshot. If PostgreSQL is
+            # temporarily unavailable, an owner event can retry this current
+            # snapshot instead of replaying older user settings.
+            self._low_qty_user_snapshots = list(user_snapshots)
+            result = reconcile_complete_enabled_snapshot(preferences)
+            self._low_qty_metrics["snapshots_committed"] += 1
+            self._low_qty_metrics["enabled_preferences"] = result["enabled"]
+            self._low_qty_metrics["disabled_preferences"] += result["disabled"]
+            self._reconcile_low_qty_owner_watchers(
+                {preference.route_number for preference in preferences}
+            )
+            print(
+                "  [LowQty] Preference snapshot committed: "
+                f"enabled={result['enabled']} disabled={result['disabled']}"
+            )
+            self._emit_low_qty_metrics("snapshot_committed")
+
+    def _reconcile_low_qty_owner_watchers(self, route_numbers: Set[str]) -> None:
+        stale_routes = set(self._low_qty_owner_watchers) - route_numbers
+        for route_number in sorted(stale_routes):
+            watcher = self._low_qty_owner_watchers.pop(route_number, None)
+            if watcher is not None:
+                try:
+                    watcher.unsubscribe()
+                except Exception:
+                    pass
+
+        for route_number in sorted(route_numbers - set(self._low_qty_owner_watchers)):
+            self._low_qty_owner_watchers[route_number] = None
+
+            def on_owner_snapshot(doc_snapshots, changes, owner_read_time, route=route_number):
+                try:
+                    with self._low_qty_lock:
+                        current_snapshots = list(self._low_qty_user_snapshots)
+                    if current_snapshots:
+                        self._sync_low_qty_snapshot(current_snapshots, owner_read_time)
+                except Exception as exc:
+                    self._low_qty_metrics["owner_watch_errors"] += 1
+                    self._emit_low_qty_metrics("owner_watch_error")
+                    print(f"  [LowQty] Owner watch error for route {route}: {exc}")
+
+            try:
+                watcher = (
+                    self.fb_client.collection("routes")
+                    .document(route_number)
+                    .on_snapshot(on_owner_snapshot)
+                )
+                self._low_qty_owner_watchers[route_number] = watcher
+            except Exception:
+                self._low_qty_owner_watchers.pop(route_number, None)
+                raise
+
+    def start_low_qty_preference_listener(self) -> bool:
+        """Start an isolated filtered mirror only when schema and flag are ready."""
+        if not self._low_qty_sync_enabled():
+            print("  [LowQty] Preference sync disabled")
+            return False
+        try:
+            if not low_qty_schema_ready():
+                self._low_qty_metrics["snapshot_errors"] += 1
+                self._emit_low_qty_metrics("schema_not_ready")
+                print("  [LowQty] Preference schema is not ready; existing config listeners continue")
+                return False
+
+            query = self.fb_client.collection("users").where(
+                filter=FieldFilter(
+                    "userSettings.notifications.orderReminders.enabled",
+                    "==",
+                    True,
+                )
+            )
+
+            def on_low_qty_snapshot(doc_snapshots, changes, read_time):
+                try:
+                    self._sync_low_qty_snapshot(list(doc_snapshots), read_time)
+                except Exception as exc:
+                    self._low_qty_metrics["snapshot_errors"] += 1
+                    self._emit_low_qty_metrics("snapshot_error")
+                    print(f"  [LowQty] Preference snapshot failed without affecting config-sync: {exc}")
+
+            self._low_qty_watch = query.on_snapshot(on_low_qty_snapshot)
+            self.watchers.append(self._low_qty_watch)
+            self._low_qty_sync_ready = True
+            print("  [LowQty] Watching enabled reminder users")
+            return True
+        except Exception as exc:
+            self._low_qty_sync_ready = False
+            self._low_qty_metrics["snapshot_errors"] += 1
+            self._emit_low_qty_metrics("listener_start_error")
+            print(f"  [LowQty] Preference listener unavailable; existing config listeners continue: {exc}")
+            return False
 
     def _schedule_forecast_refresh(self, route_number: str, reason: str) -> None:
         previous = self._refresh_timers.pop(route_number, None)
@@ -767,6 +1004,13 @@ class ConfigSyncManager:
             except:
                 pass
         self.watchers.clear()
+        for watcher in self._low_qty_owner_watchers.values():
+            if watcher is not None:
+                try:
+                    watcher.unsubscribe()
+                except Exception:
+                    pass
+        self._low_qty_owner_watchers.clear()
         for timer in self._refresh_timers.values():
             timer.cancel()
         self._refresh_timers.clear()
@@ -807,6 +1051,9 @@ def main(sa_path: str):
 
     # Create sync manager and start listeners
     manager = ConfigSyncManager(fb_client)
+
+    # Low-quantity preference mirroring is independently gated and failure-isolated.
+    manager.start_low_qty_preference_listener()
 
     try:
         # Discover existing routes and start listeners

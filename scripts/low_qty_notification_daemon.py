@@ -1,8 +1,7 @@
-"""Low-Quantity Notification Daemon
+"""One-shot low-quantity notification worker.
 
-Sends push notifications for low-qty items that need ordering today.
-Uses snapshot listener to track users with reminders enabled.
-At each user's reminder time, computes low-qty items and sends notification.
+Claims due route slots from PostgreSQL before loading PCF inventory. Firestore
+remains the due-time authority for route ownership, device tokens, and PCF data.
 
 Usage:
     python scripts/low_qty_notification_daemon.py --serviceAccount /path/to/sa.json
@@ -11,54 +10,91 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
 import socket
-import time
 from dataclasses import dataclass, field
-from datetime import datetime
-from typing import Dict, List, Optional, Any, Tuple
+from datetime import datetime, timezone
+from typing import Callable, Dict, List, Optional, Any, Tuple
 
-import pytz
 import requests
 from google.cloud import firestore
-from google.cloud.firestore_v1.watch import Watch
+from google.cloud.firestore_v1.base_query import FieldFilter
 
 try:
-    from .pg_utils import fetch_one, execute
-    from .low_quantity_loader import get_items_for_order_date, get_user_timezone
+    from .low_qty_notification_store import (
+        ClaimedExecution,
+        EnabledPreference,
+        begin_dispatch,
+        claim_next_due,
+        complete_claim,
+        disable_claimed_preference,
+        load_preference_run_counts,
+        mark_retryable,
+        mark_zero_ticket_retryable,
+        reconcile_complete_enabled_snapshot,
+        record_accepted_tickets,
+        store_claim_payload,
+        upsert_enabled_preference,
+    )
+    from .low_qty_schedule import next_scheduled_instant, parse_reminder_minute, validate_timezone
+    from .low_quantity_loader import get_items_for_order_date
 except ImportError:
-    from pg_utils import fetch_one, execute
-    from low_quantity_loader import get_items_for_order_date, get_user_timezone
+    from low_qty_notification_store import (
+        ClaimedExecution,
+        EnabledPreference,
+        begin_dispatch,
+        claim_next_due,
+        complete_claim,
+        disable_claimed_preference,
+        load_preference_run_counts,
+        mark_retryable,
+        mark_zero_ticket_retryable,
+        reconcile_complete_enabled_snapshot,
+        record_accepted_tickets,
+        store_claim_payload,
+        upsert_enabled_preference,
+    )
+    from low_qty_schedule import next_scheduled_instant, parse_reminder_minute, validate_timezone
+    from low_quantity_loader import get_items_for_order_date
 
 WORKER_ID = f"low-qty-notif-{socket.gethostname()}-{os.getpid()}"
 EXPO_PUSH_URL = "https://exp.host/--/api/v2/push/send"
 EXPO_RECEIPTS_URL = "https://exp.host/--/api/v2/push/getReceipts"
-LOW_QTY_NOTIFICATIONS_ENABLED = os.environ.get("LOW_QTY_NOTIFICATIONS_ENABLED", "true").lower() == "true"
 LOW_QTY_NOTIFICATION_DRY_RUN = os.environ.get("LOW_QTY_NOTIFICATION_DRY_RUN", "false").lower() == "true"
-CHECK_INTERVAL_SECONDS = int(os.environ.get("LOW_QTY_NOTIFICATION_CHECK_INTERVAL_SECONDS", "60"))
-EXPO_RECEIPT_POLL_SECONDS = int(os.environ.get("LOW_QTY_EXPO_RECEIPT_POLL_SECONDS", "5"))
-EXPO_RECEIPT_MAX_WAIT_SECONDS = int(os.environ.get("LOW_QTY_EXPO_RECEIPT_MAX_WAIT_SECONDS", "30"))
-DEFAULT_REMINDER_TOLERANCE_MINUTES = int(os.environ.get("LOW_QTY_NOTIFICATION_TOLERANCE_MINUTES", "2"))
 DEFAULT_ONCE_LATE_TOLERANCE_MINUTES = int(
     os.environ.get("LOW_QTY_NOTIFICATION_ONCE_LATE_TOLERANCE_MINUTES", "20")
 )
 
-# In-memory cache of users with reminders enabled
-# Updated by snapshot listener
-reminder_cache: Dict[str, Dict] = {}
-# {
-#     "user_abc123": {
-#         "route_number": "989262",
-#         "reminder_time": {"hour": 8, "minute": 0, "period": "AM"},
-#         "timezone": "America/Denver",
-#     }
-# }
+def _notifications_enabled() -> bool:
+    """Read the opt-in at run time so absent configuration always fails closed."""
+    return os.environ.get("LOW_QTY_NOTIFICATIONS_ENABLED", "false").strip().lower() == "true"
 
-# Keep reference to watcher to prevent garbage collection
-_users_watcher: Optional[Watch] = None
 
+def _recipient_source() -> str:
+    source = os.environ.get("LOW_QTY_RECIPIENT_SOURCE", "").strip().lower()
+    if source not in {"firebase", "postgres"}:
+        raise RuntimeError("LOW_QTY_RECIPIENT_SOURCE must be explicitly set to firebase or postgres")
+    return source
+
+
+def _positive_int_env(name: str, default: int) -> int:
+    try:
+        value = int(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
+    return value if value > 0 else default
+
+
+def _order_reminder_settings(user_data: Dict[str, Any]) -> Dict[str, Any]:
+    settings = user_data.get("userSettings")
+    if not isinstance(settings, dict):
+        return {}
+    notifications = settings.get("notifications")
+    if not isinstance(notifications, dict):
+        return {}
+    reminder = notifications.get("orderReminders")
+    return reminder if isinstance(reminder, dict) else {}
 
 def _allowed_routes() -> set[str] | None:
     raw = os.environ.get("ROUTESPARK_ALLOWED_ROUTES", "").strip()
@@ -80,203 +116,32 @@ def get_firestore_client(sa_path: str) -> firestore.Client:
     return firestore.Client.from_service_account_json(sa_path)
 
 
-def get_route_owner(db: firestore.Client, route_number: str) -> Optional[str]:
-    """Get the owner user_id for a route.
-    
-    Returns:
-        The owner UID from the best available route metadata source, or None if not found.
-    """
-    try:
-        route_doc = db.collection("routes").document(route_number).get()
-        if route_doc.exists:
-            data = route_doc.to_dict()
-            # Check both field names (ownerUid is current, userId is legacy)
-            owner_uid = data.get("ownerUid") or data.get("userId")
-            if owner_uid:
-                return owner_uid
-
-        entitlement_doc = db.collection("routeEntitlements").document(route_number).get()
-        if entitlement_doc.exists:
-            data = entitlement_doc.to_dict() or {}
-            owner_uid = data.get("ownerUid")
-            if owner_uid:
-                return owner_uid
-
-        route_number_doc = db.collection("routeNumbers").document(route_number).get()
-        if route_number_doc.exists:
-            data = route_number_doc.to_dict() or {}
-            owner_uid = data.get("userId") or data.get("userID")
-            if owner_uid:
-                return owner_uid
-    except Exception as e:
-        print(f"    [route] Error getting owner for route {route_number}: {e}")
+def get_route_owner_strict(db: firestore.Client, route_number: str) -> Optional[str]:
+    """Resolve the complete owner chain and propagate lookup failures."""
+    lookups = (
+        ("routes", ("ownerUid", "userId")),
+        ("routeEntitlements", ("ownerUid",)),
+        ("routeNumbers", ("userId", "userID")),
+    )
+    for collection_name, owner_fields in lookups:
+        snapshot = db.collection(collection_name).document(str(route_number)).get()
+        if not snapshot.exists:
+            continue
+        data = snapshot.to_dict() or {}
+        for owner_field in owner_fields:
+            owner_uid = data.get(owner_field)
+            if isinstance(owner_uid, str) and owner_uid.strip():
+                return owner_uid.strip()
     return None
 
 
-def setup_reminder_listener(db: firestore.Client) -> Watch:
-    """Set up snapshot listener on users with reminders enabled.
-    
-    Updates reminder_cache when user settings change.
-    
-    Returns:
-        Watch handle (must be kept to prevent garbage collection)
-    """
-    global _users_watcher
-    
-    users_ref = db.collection("users")
-    
-    def on_snapshot(col_snapshot, changes, read_time):
-        """Handle collection changes."""
-        for change in changes:
-            doc = change.document
-            user_id = doc.id
-            data = doc.to_dict() or {}
-            
-            # Get reminder settings
-            user_settings = data.get("userSettings", {})
-            notifications = user_settings.get("notifications", {})
-            order_reminders = notifications.get("orderReminders", {})
-            
-            enabled = order_reminders.get("enabled", False)
-            reminder_time = order_reminders.get("time", {})
-            
-            # Get route number from profile
-            # Prefer currentRoute (active route), fall back to routeNumber (legacy)
-            profile = data.get("profile", {})
-            route_number = profile.get("currentRoute") or profile.get("routeNumber")
-            timezone = profile.get("timezone", "America/Denver")
-
-            if not _route_allowed(route_number):
-                if user_id in reminder_cache:
-                    del reminder_cache[user_id]
-                continue
-            
-            if change.type.name == "REMOVED":
-                if user_id in reminder_cache:
-                    del reminder_cache[user_id]
-                    print(f"  [cache] Removed user {user_id}")
-            elif enabled and route_number and reminder_time:
-                reminder_cache[user_id] = {
-                    "route_number": route_number,
-                    "reminder_time": reminder_time,
-                    "timezone": timezone,
-                }
-                print(f"  [cache] Updated user {user_id}: route={route_number}, time={reminder_time}")
-            elif user_id in reminder_cache:
-                # User disabled reminders
-                del reminder_cache[user_id]
-                print(f"  [cache] Removed user {user_id} (reminders disabled)")
-    
-    # Start listening - IMPORTANT: keep reference to prevent GC
-    _users_watcher = users_ref.on_snapshot(on_snapshot)
-    print(f"  [listener] Watching users collection for reminder changes")
-    
-    return _users_watcher
-
-
-def load_reminder_cache_once(db: firestore.Client) -> int:
-    """Populate reminder cache from a one-time users scan."""
-    reminder_cache.clear()
-    users_ref = db.collection("users")
-    count = 0
-
-    for doc in users_ref.stream():
-        user_id = doc.id
-        data = doc.to_dict() or {}
-
-        user_settings = data.get("userSettings", {})
-        notifications = user_settings.get("notifications", {})
-        order_reminders = notifications.get("orderReminders", {})
-
-        enabled = order_reminders.get("enabled", False)
-        reminder_time = order_reminders.get("time", {})
-
-        profile = data.get("profile", {})
-        route_number = profile.get("currentRoute") or profile.get("routeNumber")
-        timezone = profile.get("timezone", "America/Denver")
-
-        if not _route_allowed(route_number):
-            continue
-
-        if enabled and route_number and reminder_time:
-            reminder_cache[user_id] = {
-                "route_number": route_number,
-                "reminder_time": reminder_time,
-                "timezone": timezone,
-            }
-            count += 1
-
-    return count
-
-
-def reminder_time_to_minutes(reminder_time: Dict) -> int:
-    """Convert reminder time to minutes since midnight.
-    
-    Args:
-        reminder_time: {"hour": 8, "minute": 0, "period": "AM"}
-    
-    Returns:
-        Minutes since midnight (0-1439)
-    """
-    hour = reminder_time.get("hour", 8)
-    minute = reminder_time.get("minute", 0)
-    period = reminder_time.get("period", "AM")
-    
-    # Convert to 24h
-    if period == "PM" and hour != 12:
-        hour += 12
-    elif period == "AM" and hour == 12:
-        hour = 0
-    
-    return hour * 60 + minute
-
-
-def is_reminder_time_now(reminder_time: Dict, timezone: str, tolerance_minutes: int = 2) -> bool:
-    """Check if current time matches user's reminder time.
-    
-    Args:
-        reminder_time: {"hour": 8, "minute": 0, "period": "AM"}
-        timezone: e.g., "America/Denver"
-        tolerance_minutes: How many minutes before/after to match
-    
-    Returns:
-        True if within tolerance of reminder time
-    """
+def get_route_owner(db: firestore.Client, route_number: str) -> Optional[str]:
+    """Compatibility wrapper that fails closed for legacy preview callers."""
     try:
-        tz = pytz.timezone(timezone)
-    except pytz.UnknownTimeZoneError:
-        tz = pytz.timezone("America/Denver")
-    
-    now = datetime.now(tz)
-    current_minutes = now.hour * 60 + now.minute
-    target_minutes = reminder_time_to_minutes(reminder_time)
-    
-    return abs(current_minutes - target_minutes) <= tolerance_minutes
-
-
-def is_reminder_time_due(
-    reminder_time: Dict,
-    timezone: str,
-    *,
-    early_tolerance_minutes: int = 2,
-    late_tolerance_minutes: int = 2,
-) -> bool:
-    """Check whether the reminder is due in the user's local day.
-
-    CronJob mode uses a larger late tolerance so a delayed or skipped run can
-    still send the reminder once. The sent-table dedupe prevents repeat sends.
-    """
-    try:
-        tz = pytz.timezone(timezone)
-    except pytz.UnknownTimeZoneError:
-        tz = pytz.timezone("America/Denver")
-
-    now = datetime.now(tz)
-    current_minutes = now.hour * 60 + now.minute
-    target_minutes = reminder_time_to_minutes(reminder_time)
-    delta = current_minutes - target_minutes
-
-    return -early_tolerance_minutes <= delta <= late_tolerance_minutes
+        return get_route_owner_strict(db, route_number)
+    except Exception as e:
+        print(f"    [route] Error getting owner for route {route_number}: {e}")
+    return None
 
 
 def get_fcm_tokens(db: firestore.Client, user_id: str) -> List[str]:
@@ -284,37 +149,11 @@ def get_fcm_tokens(db: firestore.Client, user_id: str) -> List[str]:
     user_doc = db.collection("users").document(user_id).get()
     if not user_doc.exists:
         return []
-    return user_doc.to_dict().get("fcmTokens", [])
-
-
-def check_already_sent(route_number: str, user_id: str,
-                       order_date: str, saps_hash: str) -> bool:
-    """Check if this notification was already sent today for this user.
-
-    Dedup includes user_id to allow multiple users on same route to get notifications.
-    """
-    row = fetch_one("""
-        SELECT 1 FROM low_qty_notifications_sent
-        WHERE route_number = %s AND user_id = %s AND order_by_date = %s AND saps_hash = %s
-        LIMIT 1
-    """, [route_number, user_id, order_date, saps_hash])
-
-    return row is not None
-
-
-def mark_as_sent(route_number: str, user_id: str,
-                 order_date: str, saps: List[str], saps_hash: str) -> None:
-    """Record that notification was sent."""
-    execute("""
-        INSERT INTO low_qty_notifications_sent
-        (route_number, user_id, order_by_date, saps, saps_hash, items_count, sent_at)
-        VALUES (%s, %s, %s, %s, %s, %s, %s)
-        ON CONFLICT (route_number, user_id, order_by_date, saps_hash) DO NOTHING
-    """, [
-        route_number, user_id, order_date,
-        json.dumps(saps), saps_hash, len(saps),
-        datetime.utcnow().isoformat()
-    ])
+    user_data = user_doc.to_dict() or {}
+    tokens = user_data.get("fcmTokens")
+    if not isinstance(tokens, list):
+        return []
+    return [token for token in tokens if isinstance(token, str)]
 
 
 def is_valid_expo_token(token: str) -> bool:
@@ -322,23 +161,75 @@ def is_valid_expo_token(token: str) -> bool:
     
     Accepts both ExponentPushToken[...] and ExpoPushToken[...] formats.
     """
-    if not token:
+    if not isinstance(token, str):
         return False
-    return token.startswith("ExponentPushToken[") or token.startswith("ExpoPushToken[")
+    for prefix in ("ExponentPushToken[", "ExpoPushToken["):
+        if token.startswith(prefix) and token.endswith("]"):
+            value = token[len(prefix):-1]
+            return bool(value and not any(character.isspace() for character in value))
+    return False
 
 
 @dataclass
 class PushDeliveryResult:
+    valid_token_count: int = 0
     delivered_count: int = 0
     pending_count: int = 0
     failed_count: int = 0
     invalid_tokens: List[str] = field(default_factory=list)
+    accepted_ticket_ids: List[str] = field(default_factory=list)
+    ambiguous: bool = False
 
     @property
     def successful(self) -> bool:
         # A receipt can remain pending beyond this short-lived CronJob. Keep
         # accepted pending tickets deduplicated to avoid duplicate pushes.
         return self.delivered_count > 0 or self.pending_count > 0
+
+    @property
+    def definitive_no_valid_token(self) -> bool:
+        return bool(
+            self.valid_token_count
+            and not self.ambiguous
+            and self.delivered_count == 0
+            and self.pending_count == 0
+            and len(set(self.invalid_tokens)) == self.valid_token_count
+        )
+
+
+@dataclass
+class NotificationRunCounters:
+    preferences_enabled: int = 0
+    preferences_due: int = 0
+    claims_acquired: int = 0
+    claims_recovered: int = 0
+    claims_skipped: int = 0
+    pcf_evaluations: int = 0
+    dispatches_started: int = 0
+    accepted_tickets: int = 0
+    sent: int = 0
+    retryable: int = 0
+    ownership_mismatches: int = 0
+    closed: Dict[str, int] = field(default_factory=dict)
+
+    def record_closed(self, reason: str) -> None:
+        self.closed[reason] = self.closed.get(reason, 0) + 1
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {
+            "preferences_enabled": self.preferences_enabled,
+            "preferences_due": self.preferences_due,
+            "claims_acquired": self.claims_acquired,
+            "claims_recovered": self.claims_recovered,
+            "claims_skipped": self.claims_skipped,
+            "pcf_evaluations": self.pcf_evaluations,
+            "dispatches_started": self.dispatches_started,
+            "accepted_tickets": self.accepted_tickets,
+            "sent": self.sent,
+            "retryable": self.retryable,
+            "ownership_mismatches": self.ownership_mismatches,
+            "closed": dict(sorted(self.closed.items())),
+        }
 
 
 def _receipt_invalidates_token(receipt: Dict[str, Any]) -> bool:
@@ -366,28 +257,6 @@ def _fetch_push_receipts(ticket_tokens: List[Tuple[str, str]]) -> Dict[str, Dict
     return receipts if isinstance(receipts, dict) else {}
 
 
-def _wait_for_push_receipts(ticket_tokens: List[Tuple[str, str]]) -> Dict[str, Dict[str, Any]]:
-    if not ticket_tokens or EXPO_RECEIPT_MAX_WAIT_SECONDS <= 0:
-        return {}
-
-    receipts: Dict[str, Dict[str, Any]] = {}
-    waited = 0
-    while waited < EXPO_RECEIPT_MAX_WAIT_SECONDS:
-        sleep_seconds = min(
-            max(EXPO_RECEIPT_POLL_SECONDS, 1),
-            EXPO_RECEIPT_MAX_WAIT_SECONDS - waited,
-        )
-        time.sleep(sleep_seconds)
-        waited += sleep_seconds
-        try:
-            receipts.update(_fetch_push_receipts(ticket_tokens))
-        except Exception as error:
-            print(f"    [push] Receipt check failed: {error}")
-        if all(ticket_id in receipts for ticket_id, _token in ticket_tokens):
-            break
-    return receipts
-
-
 def remove_invalid_push_tokens(
     db: firestore.Client,
     user_id: str,
@@ -407,6 +276,8 @@ def send_push_notification(
     title: str,
     body: str,
     data: Dict,
+    *,
+    accepted_ticket_callback: Optional[Callable[[List[str]], bool]] = None,
 ) -> PushDeliveryResult:
     """Send push notification via Expo Push API.
     
@@ -424,7 +295,7 @@ def send_push_notification(
         return delivery
     
     messages = []
-    for token in fcm_tokens:
+    for token in dict.fromkeys(fcm_tokens):
         if not is_valid_expo_token(token):
             continue
         messages.append({
@@ -438,6 +309,7 @@ def send_push_notification(
     
     if not messages:
         return delivery
+    delivery.valid_token_count = len(messages)
     
     # Expo Push API limits batches to 100 messages
     BATCH_SIZE = 100
@@ -453,23 +325,43 @@ def send_push_notification(
                 timeout=10,
             )
             response.raise_for_status()
-            tickets = response.json().get("data") or []
+            response_payload = response.json()
+            tickets = response_payload.get("data") if isinstance(response_payload, dict) else None
+            if not isinstance(tickets, list) or len(tickets) != len(batch):
+                delivery.ambiguous = True
+                print("    [push] Ambiguous Expo response: ticket count did not match request")
+                break
             for message, ticket in zip(batch, tickets):
                 token = message["to"]
-                if ticket.get("status") == "ok" and ticket.get("id"):
+                if isinstance(ticket, dict) and ticket.get("status") == "ok" and ticket.get("id"):
                     ticket_tokens.append((ticket["id"], token))
                     continue
                 delivery.failed_count += 1
-                if ticket.get("details", {}).get("error") == "DeviceNotRegistered":
+                if isinstance(ticket, dict) and ticket.get("details", {}).get("error") == "DeviceNotRegistered":
                     delivery.invalid_tokens.append(token)
-            if len(tickets) < len(batch):
-                delivery.failed_count += len(batch) - len(tickets)
-                
         except Exception as e:
-            print(f"    [push] Batch error: {e}")
-            delivery.failed_count += len(batch)
+            print(f"    [push] Ambiguous batch error: {e}")
+            delivery.ambiguous = True
+            break
 
-    receipts = _wait_for_push_receipts(ticket_tokens)
+    delivery.accepted_ticket_ids = [ticket_id for ticket_id, _token in ticket_tokens]
+    if delivery.accepted_ticket_ids and accepted_ticket_callback is not None:
+        try:
+            if not accepted_ticket_callback(delivery.accepted_ticket_ids):
+                delivery.ambiguous = True
+                print("    [push] Could not persist accepted ticket IDs")
+        except Exception as error:
+            delivery.ambiguous = True
+            print(f"    [push] Could not persist accepted ticket IDs: {error}")
+
+    receipts: Dict[str, Dict[str, Any]] = {}
+    if ticket_tokens and not delivery.ambiguous:
+        try:
+            receipts = _fetch_push_receipts(ticket_tokens)
+        except Exception as error:
+            # Ticket acceptance is authoritative. An unavailable receipt is
+            # pending, not a reason to resend.
+            print(f"    [push] Immediate receipt check unavailable: {error}")
     for ticket_id, token in ticket_tokens:
         receipt = receipts.get(ticket_id)
         if not receipt:
@@ -486,121 +378,408 @@ def send_push_notification(
         "    [push] "
         f"{delivery.delivered_count} delivered, "
         f"{delivery.pending_count} pending, "
-        f"{delivery.failed_count} failed"
+        f"{delivery.failed_count} failed, "
+        f"ambiguous={str(delivery.ambiguous).lower()}"
     )
     return delivery
 
 
-def check_and_notify(
+def sync_firebase_recipient_snapshot(
     db: firestore.Client,
     *,
-    early_tolerance_minutes: int = DEFAULT_REMINDER_TOLERANCE_MINUTES,
-    late_tolerance_minutes: int = DEFAULT_REMINDER_TOLERANCE_MINUTES,
-) -> int:
-    """Check all users and send notifications if it's their reminder time.
+    now_utc: datetime,
+) -> dict[str, int]:
+    """Materialize the explicit Firebase rollback source into the same ledger authority."""
+    query = db.collection("users").where(
+        filter=FieldFilter(
+            "userSettings.notifications.orderReminders.enabled",
+            "==",
+            True,
+        )
+    )
+    snapshots = list(query.stream())
+    preferences: List[EnabledPreference] = []
+    for snapshot in snapshots:
+        data = snapshot.to_dict() or {}
+        profile = data.get("profile", {}) if isinstance(data.get("profile"), dict) else {}
+        order_reminders = _order_reminder_settings(data)
+        route_number = str(profile.get("currentRoute") or profile.get("routeNumber") or "").strip()
+        if not route_number or order_reminders.get("enabled") is not True:
+            continue
 
-    Called every 60 seconds by the main loop.
-    Only notifies route owners (userId field on route document).
-    """
-    if not reminder_cache:
+        owner_uid = get_route_owner_strict(db, route_number)
+        if not owner_uid or owner_uid != snapshot.id:
+            continue
+        try:
+            reminder_minute = parse_reminder_minute(order_reminders.get("time"))
+            timezone_name = validate_timezone(profile.get("timezone"))
+            _local_date, next_due_at = next_scheduled_instant(
+                reminder_minute,
+                timezone_name,
+                after_utc=now_utc,
+            )
+            preferences.append(
+                EnabledPreference(
+                    route_number=route_number,
+                    owner_uid=owner_uid,
+                    reminder_minute_local=reminder_minute,
+                    timezone_name=timezone_name,
+                    next_due_at=next_due_at,
+                )
+            )
+        except ValueError as exc:
+            print(f"  [source:firebase] Invalid reminder for route {route_number}: {exc}")
+
+    result = reconcile_complete_enabled_snapshot(preferences)
+    print(
+        "  [source:firebase] Preference snapshot committed: "
+        f"enabled={result['enabled']} disabled={result['disabled']}"
+    )
+    return result
+
+
+def _current_claim_owner(db: firestore.Client, claim: ClaimedExecution) -> Optional[str]:
+    return get_route_owner_strict(db, claim.route_number)
+
+
+def _reconcile_changed_claim_owner(
+    db: firestore.Client,
+    claim: ClaimedExecution,
+    current_owner: Optional[str],
+    *,
+    now_utc: datetime,
+) -> None:
+    """Refresh one stale route preference without a collection reconciliation."""
+    if not current_owner:
+        disable_claimed_preference(claim, "unresolved_owner")
+        return
+
+    owner_snapshot = db.collection("users").document(current_owner).get()
+    if not owner_snapshot.exists:
+        disable_claimed_preference(claim, "owner_not_eligible")
+        return
+    owner_data = owner_snapshot.to_dict() or {}
+    profile = owner_data.get("profile", {}) if isinstance(owner_data.get("profile"), dict) else {}
+    owner_route = str(profile.get("currentRoute") or profile.get("routeNumber") or "").strip()
+    reminder = _order_reminder_settings(owner_data)
+    if owner_route != claim.route_number or reminder.get("enabled") is not True:
+        disable_claimed_preference(claim, "owner_not_eligible")
+        return
+
+    try:
+        reminder_minute = parse_reminder_minute(reminder.get("time"))
+        timezone_name = validate_timezone(profile.get("timezone"))
+        _local_date, next_due_at = next_scheduled_instant(
+            reminder_minute,
+            timezone_name,
+            after_utc=now_utc,
+        )
+    except ValueError:
+        disable_claimed_preference(claim, "invalid_owner_settings")
+        return
+
+    upsert_enabled_preference(
+        EnabledPreference(
+            route_number=claim.route_number,
+            owner_uid=current_owner,
+            reminder_minute_local=reminder_minute,
+            timezone_name=timezone_name,
+            next_due_at=next_due_at,
+        )
+    )
+
+
+def _close_changed_owner(
+    db: firestore.Client,
+    claim: ClaimedExecution,
+    current_owner: Optional[str],
+    *,
+    now_utc: datetime,
+    counters: Optional[NotificationRunCounters] = None,
+) -> int:
+    try:
+        _reconcile_changed_claim_owner(
+            db,
+            claim,
+            current_owner,
+            now_utc=now_utc,
+        )
+        if not complete_claim(
+            claim,
+            status="closed",
+            reason="owner_changed",
+            now_utc=now_utc,
+        ):
+            print(f"  [claim] Lost owner-change completion for route {claim.route_number}")
+            return 1
+    except Exception as exc:
+        mark_retryable(claim, error=f"owner_reconcile_failed:{type(exc).__name__}")
+        print(f"  [claim] Owner reconciliation failed for route {claim.route_number}: {exc}")
+        return 1
+    if counters is not None:
+        counters.ownership_mismatches += 1
+        counters.record_closed("owner_changed")
+    print(f"  [claim] Closed stale owner for route {claim.route_number}")
+    return 0
+
+
+def _process_claim(
+    db: firestore.Client,
+    claim: ClaimedExecution,
+    counters: Optional[NotificationRunCounters] = None,
+) -> int:
+    """Process one claimed slot; return one on a safely recorded retryable failure."""
+    now_utc = datetime.now(timezone.utc)
+    if not _route_allowed(claim.route_number):
+        completed = complete_claim(
+            claim,
+            status="closed",
+            reason="policy_excluded",
+            now_utc=now_utc,
+        )
+        if not completed:
+            print(f"  [claim] Lost policy completion for route {claim.route_number}")
+            return 1
+        if counters is not None:
+            counters.record_closed("policy_excluded")
+        print(f"  [claim] Closed policy-excluded route {claim.route_number}")
         return 0
 
-    failure_count = 0
-    
-    for user_id, user_data in list(reminder_cache.items()):
-        reminder_time = user_data["reminder_time"]
-        timezone = user_data["timezone"]
-        route_number = user_data["route_number"]
+    try:
+        current_owner = _current_claim_owner(db, claim)
+        if current_owner != claim.owner_uid:
+            return _close_changed_owner(
+                db,
+                claim,
+                current_owner,
+                now_utc=now_utc,
+                counters=counters,
+            )
+    except Exception as exc:
+        mark_retryable(claim, error=f"owner_lookup_failed:{type(exc).__name__}")
+        print(f"  [claim] Owner lookup failed for route {claim.route_number}: {exc}")
+        return 1
 
-        if not _route_allowed(route_number):
-            continue
-        
-        # Check if it's reminder time for this user
-        if not is_reminder_time_due(
-            reminder_time,
-            timezone,
-            early_tolerance_minutes=early_tolerance_minutes,
-            late_tolerance_minutes=late_tolerance_minutes,
-        ):
-            continue
-        
-        print(f"  [check] Reminder time for user {user_id} (route {route_number})")
-        
-        # Only notify route owner to prevent duplicate notifications
-        # Fail closed: if owner is unknown, skip to avoid notifying wrong user
-        route_owner = get_route_owner(db, route_number)
-        if not route_owner:
-            print(f"    Skipping: route {route_number} has no owner (userId field missing)")
-            continue
-        if route_owner != user_id:
-            print(f"    Skipping: user {user_id} is not route owner (owner: {route_owner})")
-            continue
-        
+    payload = claim.computed_payload
+    saps = claim.computed_saps
+    if payload is None or saps is None:
+        if counters is not None:
+            counters.pcf_evaluations += 1
         try:
-            # Get today in user's timezone
-            # Note: get_items_for_order_date uses route-owner timezone internally,
-            # which should match since we're only notifying owners
-            try:
-                tz = pytz.timezone(timezone)
-            except pytz.UnknownTimeZoneError:
-                tz = pytz.timezone("America/Denver")
-            today = datetime.now(tz).strftime("%Y-%m-%d")
-            
-            # Get low-qty items for today
-            items = get_items_for_order_date(db, route_number, today)
-            
-            if not items:
-                print(f"    No low-qty items for route {route_number}")
-                continue
-            
-            # Compute dedup hash
-            saps = sorted([item.sap for item in items])
-            saps_hash = hashlib.md5(json.dumps(saps).encode()).hexdigest()
-            
-            # Check if already sent (per user to allow team members if added later)
-            if check_already_sent(route_number, user_id, today, saps_hash):
-                print(f"    Already sent notification for route {route_number} today")
-                continue
-            
-            # Get FCM tokens (re-read to get latest)
-            tokens = get_fcm_tokens(db, user_id)
-            if not tokens:
-                print(f"    No FCM tokens for user {user_id}")
-                continue
+            items = get_items_for_order_date(
+                db,
+                claim.route_number,
+                claim.scheduled_local_date.isoformat(),
+                resolved_timezone=claim.timezone_name,
+            )
+        except Exception as exc:
+            mark_retryable(claim, error=f"pcf_failed:{type(exc).__name__}")
+            if counters is not None:
+                counters.retryable += 1
+            print(f"  [claim] PCF evaluation failed for route {claim.route_number}: {exc}")
+            return 1
 
-            # Build and send notification
-            item_count = len(items)
-            title = "Low Stock Alert"
-            body = f"{item_count} item{'s' if item_count != 1 else ''} need to be ordered today"
-            data = {
+        if not items:
+            completed = complete_claim(
+                claim,
+                status="closed",
+                reason="no_items",
+                now_utc=datetime.now(timezone.utc),
+            )
+            if not completed:
+                print(f"  [claim] Lost empty-result completion for route {claim.route_number}")
+                return 1
+            if counters is not None:
+                counters.record_closed("no_items")
+            print(f"  [claim] No low-quantity items for route {claim.route_number}")
+            return 0
+
+        saps = sorted({str(item.sap) for item in items})
+        item_count = len(items)
+        item_label = "item" if item_count == 1 else "items"
+        verb = "needs" if item_count == 1 else "need"
+        payload = {
+            "title": "Low Stock Alert",
+            "body": f"{item_count} {item_label} {verb} to be ordered today",
+            "data": {
                 "type": "low_quantity",
-                "routeNumber": route_number,
-                "orderDate": today,
+                "routeNumber": claim.route_number,
+                "orderDate": claim.scheduled_local_date.isoformat(),
                 "saps": saps,
-            }
+            },
+        }
+        if not store_claim_payload(claim, payload=payload, saps=saps):
+            print(f"  [claim] Lost payload ownership for route {claim.route_number}")
+            return 1
 
-            if LOW_QTY_NOTIFICATION_DRY_RUN:
-                print(
-                    f"    [dry-run] Would send notification: {item_count} items "
-                    f"to {len(tokens)} token(s) for route {route_number}"
-                )
-                continue
+    try:
+        current_owner = _current_claim_owner(db, claim)
+        if current_owner != claim.owner_uid:
+            return _close_changed_owner(
+                db,
+                claim,
+                current_owner,
+                now_utc=datetime.now(timezone.utc),
+                counters=counters,
+            )
+        tokens = get_fcm_tokens(db, claim.owner_uid)
+    except Exception as exc:
+        mark_retryable(claim, error=f"token_lookup_failed:{type(exc).__name__}")
+        if counters is not None:
+            counters.retryable += 1
+        print(f"  [claim] Token lookup failed for route {claim.route_number}: {exc}")
+        return 1
 
-            delivery = send_push_notification(tokens, title, body, data)
-            if delivery.invalid_tokens:
-                remove_invalid_push_tokens(db, user_id, delivery.invalid_tokens)
+    valid_tokens = [token for token in dict.fromkeys(tokens) if is_valid_expo_token(token)]
+    if not valid_tokens:
+        completed = complete_claim(
+            claim,
+            status="closed",
+            reason="no_valid_token",
+            now_utc=datetime.now(timezone.utc),
+        )
+        if not completed:
+            print(f"  [claim] Lost no-token completion for route {claim.route_number}")
+            return 1
+        if counters is not None:
+            counters.record_closed("no_valid_token")
+        print(f"  [claim] No valid notification token for route {claim.route_number}")
+        return 0
 
-            if delivery.successful:
-                mark_as_sent(route_number, user_id, today, saps, saps_hash)
-                print(f"    ✅ Sent notification: {item_count} items")
-            else:
-                print(f"    ❌ Failed to send notification")
-                failure_count += 1
-                
-        except Exception as e:
-            print(f"    ❌ Error processing user {user_id}: {e}")
+    dispatch_at = datetime.now(timezone.utc)
+    if not begin_dispatch(claim, now_utc=dispatch_at):
+        print(f"  [claim] Lost dispatch ownership for route {claim.route_number}")
+        return 1
+    if counters is not None:
+        counters.dispatches_started += 1
+
+    delivery = send_push_notification(
+        valid_tokens,
+        str(payload["title"]),
+        str(payload["body"]),
+        dict(payload["data"]),
+        accepted_ticket_callback=lambda ticket_ids: record_accepted_tickets(claim, ticket_ids),
+    )
+    if counters is not None:
+        counters.accepted_tickets += len(delivery.accepted_ticket_ids)
+    if delivery.invalid_tokens:
+        try:
+            remove_invalid_push_tokens(db, claim.owner_uid, delivery.invalid_tokens)
+        except Exception as exc:
+            print(f"  [claim] Could not remove invalid token(s): {exc}")
+
+    completion_at = datetime.now(timezone.utc)
+    if delivery.ambiguous:
+        completed = complete_claim(
+            claim,
+            status="closed",
+            reason="delivery_unknown",
+            now_utc=completion_at,
+            accepted_ticket_ids=delivery.accepted_ticket_ids,
+            error="ambiguous_expo_dispatch",
+        )
+        if not completed:
+            print(f"  [claim] Lost ambiguous completion for route {claim.route_number}")
+        elif counters is not None:
+            counters.record_closed("delivery_unknown")
+        print(f"  [claim] Closed ambiguous dispatch for route {claim.route_number}")
+        return 1
+    if delivery.definitive_no_valid_token:
+        completed = complete_claim(
+            claim,
+            status="closed",
+            reason="no_valid_token",
+            now_utc=completion_at,
+            accepted_ticket_ids=delivery.accepted_ticket_ids,
+        )
+        if not completed:
+            print(f"  [claim] Lost invalid-token completion for route {claim.route_number}")
+            return 1
+        if counters is not None:
+            counters.record_closed("no_valid_token")
+        print(f"  [claim] All tokens invalid for route {claim.route_number}")
+        return 0
+    if delivery.accepted_ticket_ids:
+        completed = complete_claim(
+            claim,
+            status="sent",
+            reason="accepted",
+            now_utc=completion_at,
+            accepted_ticket_ids=delivery.accepted_ticket_ids,
+        )
+        if not completed:
+            print(f"  [claim] Lost sent completion for route {claim.route_number}")
+            return 1
+        if counters is not None:
+            counters.sent += 1
+        print(f"  [claim] Sent notification for route {claim.route_number}: {len(saps)} SAP(s)")
+        return 0
+
+    if not mark_zero_ticket_retryable(claim, error="expo_accepted_zero_tickets"):
+        print(f"  [claim] Could not record zero-ticket retry for route {claim.route_number}")
+        return 1
+    if counters is not None:
+        counters.retryable += 1
+    print(f"  [claim] Expo accepted zero tickets for route {claim.route_number}; retry deferred")
+    return 1
+
+
+def check_and_notify_postgres(
+    db: firestore.Client,
+    *,
+    late_tolerance_minutes: int = DEFAULT_ONCE_LATE_TOLERANCE_MINUTES,
+) -> int:
+    """Claim and process due PostgreSQL preferences in a bounded run."""
+    failure_count = 0
+    processed = 0
+    counters = NotificationRunCounters()
+    initial_counts = load_preference_run_counts(now_utc=datetime.now(timezone.utc))
+    counters.preferences_enabled = initial_counts["enabled"]
+    counters.preferences_due = initial_counts["due"]
+    batch_limit = min(_positive_int_env("LOW_QTY_NOTIFICATION_BATCH_LIMIT", 100), 500)
+    lease_seconds = _positive_int_env("LOW_QTY_CLAIM_LEASE_SECONDS", 300)
+    max_attempts = _positive_int_env("LOW_QTY_MAX_ATTEMPTS", 3)
+    for _ in range(batch_limit):
+        claim = claim_next_due(
+            now_utc=datetime.now(timezone.utc),
+            lease_seconds=lease_seconds,
+            late_tolerance_minutes=late_tolerance_minutes,
+            max_attempts=max_attempts,
+        )
+        if claim is None:
+            break
+        processed += 1
+        counters.claims_acquired += 1
+        if claim.attempt_count > 1:
+            counters.claims_recovered += 1
+        try:
+            failure_count += _process_claim(db, claim, counters)
+        except Exception as exc:
+            # Once dispatching, an unrecorded failure is recovered as
+            # delivery_unknown after the lease. Before dispatch, try to retain
+            # a bounded retry without hiding the failed CronJob run.
+            try:
+                if mark_retryable(
+                    claim,
+                    error=f"claim_processing_failed:{type(exc).__name__}",
+                ):
+                    counters.retryable += 1
+            except Exception:
+                pass
+            print(f"  [claim] Unhandled failure for route {claim.route_number}: {exc}")
             failure_count += 1
-
+    counters.claims_skipped = max(counters.preferences_due - counters.claims_acquired, 0)
+    print(
+        "  [metrics] "
+        + json.dumps(
+            {
+                **counters.as_dict(),
+                "failures": failure_count,
+                "processed": processed,
+            },
+            sort_keys=True,
+        )
+    )
     return failure_count
 
 
@@ -610,56 +789,46 @@ def run_daemon(
     run_once: bool = False,
     once_late_tolerance_minutes: int = DEFAULT_ONCE_LATE_TOLERANCE_MINUTES,
 ) -> None:
-    """Main daemon loop."""
-    global _users_watcher
+    """Run the sole supported one-shot CronJob execution path."""
+
+    notifications_enabled = _notifications_enabled()
 
     print(f"\n📦 Low-Quantity Notification Daemon")
     print(f"   Worker ID: {WORKER_ID}")
-    print(f"   Enabled: {LOW_QTY_NOTIFICATIONS_ENABLED}")
+    print(f"   Enabled: {notifications_enabled}")
     print(f"   Dry Run: {LOW_QTY_NOTIFICATION_DRY_RUN}")
-    print(f"   Using: Direct PostgreSQL (pg_utils)")
-    print(f"   Checking every {CHECK_INTERVAL_SECONDS} seconds")
-    print(f"\n   Press Ctrl+C to stop\n")
 
-    db = get_firestore_client(sa_path)
-
-    if run_once:
-        loaded = load_reminder_cache_once(db)
-        print(f"  [cache] {loaded} users with reminders enabled (one-time scan)")
-        if LOW_QTY_NOTIFICATIONS_ENABLED:
-            failure_count = check_and_notify(
-                db,
-                early_tolerance_minutes=DEFAULT_REMINDER_TOLERANCE_MINUTES,
-                late_tolerance_minutes=once_late_tolerance_minutes,
-            )
-            if failure_count:
-                raise RuntimeError(
-                    f"Low-quantity notification cycle failed for {failure_count} user(s)"
-                )
-        else:
-            print("  [skip] LOW_QTY_NOTIFICATIONS_ENABLED=false; notification cycle skipped")
+    if not notifications_enabled:
+        print("  [skip] LOW_QTY_NOTIFICATIONS_ENABLED is not explicitly true; exiting before Firebase initialization")
         return
 
-    # Set up snapshot listener for users with reminders
-    # Keep reference to prevent garbage collection
-    _users_watcher = setup_reminder_listener(db)
+    if not run_once:
+        raise RuntimeError("Low-quantity notifications support only the --once CronJob path")
+    if LOW_QTY_NOTIFICATION_DRY_RUN:
+        raise RuntimeError(
+            "The scheduled low-quantity worker cannot run in dry-run mode; "
+            "use test_low_qty_send_now.py for preview"
+        )
+    if once_late_tolerance_minutes < 0 or once_late_tolerance_minutes > 60:
+        raise ValueError("once_late_tolerance_minutes must be between 0 and 60")
 
-    # Give listener time to populate cache
-    time.sleep(3)
-    print(f"  [cache] {len(reminder_cache)} users with reminders enabled")
+    source = _recipient_source()
+    print(f"   Recipient source: {source}")
 
-    try:
-        while True:
-            if not LOW_QTY_NOTIFICATIONS_ENABLED:
-                print("  [skip] LOW_QTY_NOTIFICATIONS_ENABLED=false; notification cycle skipped")
-                time.sleep(CHECK_INTERVAL_SECONDS)
-                continue
-            check_and_notify(db)
-            time.sleep(CHECK_INTERVAL_SECONDS)
-    except KeyboardInterrupt:
-        print("\n\n👋 Stopping daemon...")
-        if _users_watcher:
-            _users_watcher.unsubscribe()
+    db = get_firestore_client(sa_path)
+    if source == "firebase":
+        # Explicit rollback mode only. It uses the bounded enabled-user query
+        # and materializes into the same PostgreSQL claim authority.
+        sync_firebase_recipient_snapshot(db, now_utc=datetime.now(timezone.utc))
+
+    failure_count = check_and_notify_postgres(
+        db,
+        late_tolerance_minutes=once_late_tolerance_minutes,
+    )
+    if failure_count:
+        raise RuntimeError(
+            f"Low-quantity notification cycle failed for {failure_count} claim(s)"
+        )
 
 
 if __name__ == "__main__":

@@ -265,19 +265,6 @@ def create_services(route: str, sa_path: str) -> List[Service]:
         )
     )
     
-    # Low-quantity notification daemon
-    services.append(
-        Service(
-            name="Low-Qty Notification Daemon",
-            cmd=[
-                python,
-                str(SCRIPTS_DIR / 'low_qty_notification_daemon.py'),
-                '--serviceAccount', sa_path,
-            ],
-            log_file=LOG_DIR / 'low_qty_notifications.log',
-        )
-    )
-    
     # Web Portal API (FastAPI)
     # Runs on 127.0.0.1:8000 - use Cloudflare Tunnel for external access
     services.append(
@@ -438,7 +425,6 @@ def cmd_status(args):
         ('Forecast Generation Worker', 'forecast_generation_worker.py'),
         ('Delivery Manifest', 'delivery_manifest_listener.py'),
         ('Promo Email', 'promo_email_listener.py'),
-        ('Low-Qty Notifications', 'low_qty_notification_daemon.py'),
         ('Web Portal API', 'api.main:app'),
         ('PCF OCR Listener', 'pcf_core.runner'),
     ]

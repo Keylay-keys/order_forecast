@@ -546,6 +546,8 @@ def get_items_for_order_date(
     db,
     route_number: str,
     order_date: str,
+    *,
+    resolved_timezone: Optional[str] = None,
 ) -> List[LowQuantityItem]:
     """Get low quantity items that should be ordered on a specific date.
 
@@ -561,8 +563,9 @@ def get_items_for_order_date(
     # Normalize order date
     order_date_normalized = normalize_delivery_date(order_date)
 
-    # Get user's timezone for accurate date calculations
-    user_timezone = get_user_timezone(db, route_number)
+    # Notification callers pass their already-resolved scheduling authority.
+    # Forecast/API/CLI callers retain the existing Firebase fallback.
+    user_timezone = resolved_timezone or get_user_timezone(db, route_number)
     today = get_current_datetime(user_timezone)
 
     # Load PCF items

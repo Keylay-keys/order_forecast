@@ -1127,8 +1127,130 @@ def _create_notification_tables(cur) -> None:
             UNIQUE(route_number, user_id, order_by_date, saps_hash)
         )
     """)
+
+    _create_low_qty_notification_tables(cur)
     
     print("  ✓ Notification tables created")
+
+
+def _create_low_qty_notification_tables(cur) -> None:
+    """Create the recipient preference and durable execution-ledger tables."""
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS low_qty_notification_preferences (
+            route_number TEXT PRIMARY KEY,
+            owner_uid TEXT,
+            enabled BOOLEAN NOT NULL DEFAULT FALSE,
+            reminder_minute_local SMALLINT,
+            timezone TEXT,
+            next_due_at TIMESTAMPTZ,
+            preference_version BIGINT NOT NULL DEFAULT 1,
+            disabled_reason TEXT,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+            CONSTRAINT low_qty_preferences_route_number_valid
+                CHECK (route_number ~ '^[0-9]{1,10}$'),
+            CONSTRAINT low_qty_preferences_minute_valid
+                CHECK (reminder_minute_local IS NULL OR reminder_minute_local BETWEEN 0 AND 1439),
+            CONSTRAINT low_qty_preferences_version_positive
+                CHECK (preference_version > 0),
+            CONSTRAINT low_qty_preferences_enabled_complete
+                CHECK (
+                    NOT enabled OR (
+                        owner_uid IS NOT NULL
+                        AND btrim(owner_uid) <> ''
+                        AND reminder_minute_local IS NOT NULL
+                        AND timezone IS NOT NULL
+                        AND btrim(timezone) <> ''
+                        AND next_due_at IS NOT NULL
+                    )
+                ),
+            CONSTRAINT low_qty_preferences_disabled_reason_consistent
+                CHECK (
+                    (enabled AND disabled_reason IS NULL)
+                    OR (NOT enabled AND disabled_reason IS NOT NULL AND btrim(disabled_reason) <> '')
+                )
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS low_qty_notification_executions (
+            route_number TEXT NOT NULL,
+            scheduled_local_date DATE NOT NULL,
+            scheduled_for_utc TIMESTAMPTZ NOT NULL,
+            claimed_preference_version BIGINT NOT NULL,
+            owner_uid TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'processing',
+            claim_token TEXT NOT NULL,
+            claimed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            lease_expires_at TIMESTAMPTZ NOT NULL,
+            attempt_count SMALLINT NOT NULL DEFAULT 1,
+            computed_payload JSONB,
+            computed_saps JSONB,
+            dispatch_started_at TIMESTAMPTZ,
+            accepted_expo_ticket_ids JSONB NOT NULL DEFAULT '[]'::jsonb,
+            completion_reason TEXT,
+            last_error TEXT,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            completed_at TIMESTAMPTZ,
+
+            PRIMARY KEY (route_number, scheduled_local_date),
+            CONSTRAINT low_qty_executions_route_number_valid
+                CHECK (route_number ~ '^[0-9]{1,10}$'),
+            CONSTRAINT low_qty_executions_owner_uid_present
+                CHECK (btrim(owner_uid) <> ''),
+            CONSTRAINT low_qty_executions_preference_version_positive
+                CHECK (claimed_preference_version > 0),
+            CONSTRAINT low_qty_executions_status_valid
+                CHECK (status IN ('processing', 'retryable', 'dispatching', 'sent', 'closed')),
+            CONSTRAINT low_qty_executions_claim_token_present
+                CHECK (btrim(claim_token) <> ''),
+            CONSTRAINT low_qty_executions_attempt_positive
+                CHECK (attempt_count > 0),
+            CONSTRAINT low_qty_executions_lease_after_claim
+                CHECK (lease_expires_at > claimed_at),
+            CONSTRAINT low_qty_executions_payload_object
+                CHECK (computed_payload IS NULL OR jsonb_typeof(computed_payload) = 'object'),
+            CONSTRAINT low_qty_executions_saps_array
+                CHECK (computed_saps IS NULL OR jsonb_typeof(computed_saps) = 'array'),
+            CONSTRAINT low_qty_executions_tickets_array
+                CHECK (jsonb_typeof(accepted_expo_ticket_ids) = 'array'),
+            CONSTRAINT low_qty_executions_dispatch_timestamp_consistent
+                CHECK (status NOT IN ('dispatching', 'sent') OR dispatch_started_at IS NOT NULL),
+            CONSTRAINT low_qty_executions_completion_consistent
+                CHECK (
+                    (
+                        status IN ('sent', 'closed')
+                        AND completed_at IS NOT NULL
+                        AND completion_reason IS NOT NULL
+                        AND btrim(completion_reason) <> ''
+                    )
+                    OR (
+                        status NOT IN ('sent', 'closed')
+                        AND completed_at IS NULL
+                        AND completion_reason IS NULL
+                    )
+                )
+        )
+    """)
+
+    cur.execute("""
+        CREATE INDEX IF NOT EXISTS idx_low_qty_preferences_due
+        ON low_qty_notification_preferences(next_due_at, route_number)
+        WHERE enabled = TRUE
+    """)
+    cur.execute("""
+        CREATE INDEX IF NOT EXISTS idx_low_qty_executions_predispatch_lease
+        ON low_qty_notification_executions(lease_expires_at, route_number, scheduled_local_date)
+        WHERE status IN ('processing', 'retryable')
+    """)
+    cur.execute("""
+        CREATE INDEX IF NOT EXISTS idx_low_qty_executions_dispatching_lease
+        ON low_qty_notification_executions(lease_expires_at, route_number, scheduled_local_date)
+        WHERE status = 'dispatching'
+    """)
 
 
 # =============================================================================

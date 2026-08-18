@@ -11,7 +11,6 @@ Services managed:
 - Archive Purge Worker
 - Retrain Daemon
 - Delivery Manifest Listener
-- Low-Qty Notification Daemon
 - Config Sync Listener
 - Promo Sync Listener
 
@@ -242,16 +241,6 @@ def create_services() -> List[Service]:
         ),
         # NOTE: Promo Email Listener disabled - feature not in use.
         # File kept at order_forecast/scripts/promo_email_listener.py for future use.
-        # Low-quantity notification daemon
-        Service(
-            name="Low-Qty Notification Daemon",
-            cmd=[
-                python,
-                str(SCRIPTS_DIR / 'low_qty_notification_daemon.py'),
-                '--serviceAccount', SA_PATH,
-            ],
-            log_file=LOG_DIR / 'low_qty_notifications.log',
-        ),
         # Config sync listener - real-time sync for stores/products/schedules
         Service(
             name="Config Sync Listener",
@@ -413,7 +402,6 @@ def cmd_status(args):
         ('Retrain Daemon', 'retrain_daemon.py'),
         ('Delivery Manifest', 'delivery_manifest_listener.py'),
         ('Promo Email', 'promo_email_listener.py'),
-        ('Low-Qty Notifications', 'low_qty_notification_daemon.py'),
         ('Config Sync', 'config_sync_listener.py'),
         ('Promo Sync', 'promo_sync_listener.py'),
         ('Route Transfers', 'route_transfer_sync_listener.py'),

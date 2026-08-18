@@ -171,12 +171,6 @@ def make_specs(python: str) -> Dict[str, List[ServiceSpec]]:
                 cmd=[python, str(WORKERS_DIR / "archive" / "pos_archive_worker.py"), "--serviceAccount", SA_PATH],
                 log_name="pos_archive_worker.log",
             ),
-            ServiceSpec(
-                key="low_qty_notifications",
-                name="Low-Qty Notification Daemon",
-                cmd=[python, str(SCRIPTS_DIR / "low_qty_notification_daemon.py"), "--serviceAccount", SA_PATH],
-                log_name="low_qty_notifications.log",
-            ),
         ],
     }
 
