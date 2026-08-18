@@ -752,6 +752,37 @@ class ConfigSyncManager:
             print(f"  [LowQty] Preference listener unavailable; existing config listeners continue: {exc}")
             return False
 
+    def sync_low_qty_preferences_once(self) -> Dict[str, int]:
+        """Reconcile one complete enabled-user snapshot without opening watches."""
+        if not self._low_qty_sync_enabled():
+            raise RuntimeError("LOW_QTY_PREFERENCE_SYNC_ENABLED must be explicitly true")
+        if not low_qty_schema_ready():
+            raise RuntimeError("low-quantity preference schema is not ready")
+
+        query = self.fb_client.collection("users").where(
+            filter=FieldFilter(
+                "userSettings.notifications.orderReminders.enabled",
+                "==",
+                True,
+            )
+        )
+        snapshots = list(query.stream())
+        preferences = self._build_low_qty_preferences(
+            snapshots,
+            datetime.now(timezone.utc),
+        )
+        result = reconcile_complete_enabled_snapshot(preferences)
+        self._low_qty_metrics["snapshots_received"] += 1
+        self._low_qty_metrics["snapshots_committed"] += 1
+        self._low_qty_metrics["enabled_preferences"] = result["enabled"]
+        self._low_qty_metrics["disabled_preferences"] += result["disabled"]
+        print(
+            "  [LowQty] One-shot preference snapshot committed: "
+            f"enabled={result['enabled']} disabled={result['disabled']}"
+        )
+        self._emit_low_qty_metrics("one_shot_snapshot_committed")
+        return result
+
     def _schedule_forecast_refresh(self, route_number: str, reason: str) -> None:
         previous = self._refresh_timers.pop(route_number, None)
         if previous:
@@ -1022,7 +1053,7 @@ class ConfigSyncManager:
 # Main Entry Point
 # =============================================================================
 
-def main(sa_path: str):
+def main(sa_path: str, *, once_low_qty_preferences: bool = False):
     """Main entry point for config sync listener."""
     print(f"\n{'='*60}")
     print("Config Sync Listener (Firestore -> PostgreSQL)")
@@ -1051,6 +1082,14 @@ def main(sa_path: str):
 
     # Create sync manager and start listeners
     manager = ConfigSyncManager(fb_client)
+
+    if once_low_qty_preferences:
+        try:
+            manager.sync_low_qty_preferences_once()
+            return 0
+        except Exception as exc:
+            print(f"  [LowQty] One-shot preference reconciliation failed: {exc}")
+            return 2
 
     # Low-quantity preference mirroring is independently gated and failure-isolated.
     manager.start_low_qty_preference_listener()
@@ -1111,7 +1150,15 @@ if __name__ == "__main__":
         description="Config sync listener - real-time Firestore to PostgreSQL sync",
     )
     parser.add_argument('--serviceAccount', required=True, help='Path to Firebase service account JSON')
+    parser.add_argument(
+        '--once-low-qty-preferences',
+        action='store_true',
+        help='Reconcile the complete enabled low-quantity preference snapshot and exit',
+    )
 
     args = parser.parse_args()
 
-    exit(main(args.serviceAccount))
+    exit(main(
+        args.serviceAccount,
+        once_low_qty_preferences=args.once_low_qty_preferences,
+    ))

@@ -225,7 +225,7 @@ class LowQtyNotificationReliabilityTests(unittest.TestCase):
         self.assertIn("activeDeadlineSeconds: 240", cronjob)
         self.assertIn("suspend: true", schema_job)
         self.assertIn('LOW_QTY_NOTIFICATION_DRY_RUN: "false"', config)
-        self.assertIn('LOW_QTY_RECIPIENT_SOURCE: "firebase"', config)
+        self.assertIn('LOW_QTY_RECIPIENT_SOURCE: "postgres"', config)
         self.assertIn('LOW_QTY_CLAIM_LEASE_SECONDS: "300"', config)
 
     def test_scheduled_worker_rejects_dry_run_before_firestore(self):

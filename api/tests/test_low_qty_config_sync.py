@@ -133,6 +133,33 @@ class LowQtyConfigSyncTests(unittest.TestCase):
 
         self.assertEqual(reconcile.call_args.args[0], [])
 
+    def test_one_shot_reconciliation_streams_complete_snapshot_without_watches(self):
+        fb_client = MagicMock()
+        query = fb_client.collection.return_value.where.return_value
+        query.stream.return_value = [_user_snapshot("owner-989262", "989262")]
+        manager = listener.ConfigSyncManager(fb_client)
+
+        with patch.dict(os.environ, {"LOW_QTY_PREFERENCE_SYNC_ENABLED": "true"}), patch.object(
+            listener,
+            "low_qty_schema_ready",
+            return_value=True,
+        ), patch.object(
+            listener,
+            "resolve_authoritative_route_owner",
+            return_value="owner-989262",
+        ), patch.object(
+            listener,
+            "reconcile_complete_enabled_snapshot",
+            return_value={"enabled": 1, "disabled": 0},
+        ) as reconcile:
+            result = manager.sync_low_qty_preferences_once()
+
+        self.assertEqual(result, {"enabled": 1, "disabled": 0})
+        self.assertEqual(len(reconcile.call_args.args[0]), 1)
+        query.stream.assert_called_once_with()
+        query.on_snapshot.assert_not_called()
+        self.assertEqual(manager._low_qty_owner_watchers, {})
+
     def test_owner_resolution_error_does_not_run_disable_sweep(self):
         fb_client = MagicMock()
         query = MagicMock()
