@@ -268,7 +268,9 @@ class StoreReallocationResponse(BaseModel):
 class FullOrderAdjustmentConfirmRequest(BaseModel):
     adjustmentId: str = Field(..., min_length=8, max_length=128, pattern=r"^[A-Za-z0-9_-]+$")
     sentBatchId: str = Field(..., min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_-]+$")
-    baseOrderRevision: int = Field(..., ge=0)
+    # Legacy clients may still send this audit hint. Confirmation authority comes
+    # from the immutable sent batch, never from a mutable client order snapshot.
+    baseOrderRevision: Optional[int] = Field(default=None, ge=0)
     acceptedSaps: List[str] = Field(default_factory=list, max_length=250)
     notes: Optional[str] = Field(default=None, max_length=2000)
 

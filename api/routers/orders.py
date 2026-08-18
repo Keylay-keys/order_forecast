@@ -238,6 +238,96 @@ def _order_revision(order_data: Dict[str, Any]) -> int:
     return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else 0
 
 
+def _batch_base_order_revision(batch: Dict[str, Any]) -> int:
+    explicit = batch.get("baseOrderRevision")
+    if isinstance(explicit, int) and not isinstance(explicit, bool) and explicit >= 0:
+        return explicit
+    working = batch.get("workingCopySnapshot") or {}
+    return _order_revision(working)
+
+
+def _prove_intervening_reallocations(
+    transaction,
+    *,
+    order_id: str,
+    base_revision: int,
+    current_revision: int,
+    order_audit_ref,
+    route_adjustments_ref,
+) -> set[str]:
+    """Return affected SAPs only when every intervening revision is a verified reallocation."""
+    if current_revision == base_revision:
+        return set()
+    if current_revision < base_revision:
+        raise StructuredApiError(
+            409,
+            "The sent adjustment revision is newer than the finalized order.",
+            "ADJUSTMENT_REBASE_UNSAFE",
+            {"baseOrderRevision": base_revision, "currentOrderRevision": current_revision},
+        )
+
+    by_applied_revision: Dict[int, List[Dict[str, Any]]] = {}
+    for audit_doc in order_audit_ref.stream(transaction=transaction):
+        audit = audit_doc.to_dict() or {}
+        meta = audit.get("meta") or {}
+        applied_revision = meta.get("appliedOrderRevision")
+        if (
+            audit.get("action") == "order_store_reallocated"
+            and isinstance(applied_revision, int)
+            and not isinstance(applied_revision, bool)
+            and base_revision < applied_revision <= current_revision
+        ):
+            by_applied_revision.setdefault(applied_revision, []).append(audit)
+
+    affected_saps: set[str] = set()
+    for applied_revision in range(base_revision + 1, current_revision + 1):
+        candidates = by_applied_revision.get(applied_revision) or []
+        if len(candidates) != 1:
+            raise StructuredApiError(
+                409,
+                "The finalized order history cannot be safely rebased.",
+                "ADJUSTMENT_REBASE_UNSAFE",
+                {"baseOrderRevision": base_revision, "currentOrderRevision": current_revision},
+            )
+        meta = candidates[0].get("meta") or {}
+        reallocation_id = str(meta.get("reallocationId") or "")
+        if meta.get("baseOrderRevision") != applied_revision - 1 or not reallocation_id:
+            raise StructuredApiError(
+                409,
+                "The finalized order history cannot be safely rebased.",
+                "ADJUSTMENT_REBASE_UNSAFE",
+                {"baseOrderRevision": base_revision, "currentOrderRevision": current_revision},
+            )
+
+        mutation_doc = route_adjustments_ref.document(reallocation_id).get(transaction=transaction)
+        mutation = mutation_doc.to_dict() if mutation_doc.exists else {}
+        receipt = (mutation or {}).get("storeReallocation") or {}
+        moves = receipt.get("moves") or []
+        if (
+            (mutation or {}).get("mode") != "store_reallocation"
+            or str((mutation or {}).get("sourceOrderId") or "") != order_id
+            or receipt.get("baseOrderRevision") != applied_revision - 1
+            or receipt.get("appliedOrderRevision") != applied_revision
+            or not moves
+        ):
+            raise StructuredApiError(
+                409,
+                "The finalized order history cannot be safely rebased.",
+                "ADJUSTMENT_REBASE_UNSAFE",
+                {"baseOrderRevision": base_revision, "currentOrderRevision": current_revision},
+            )
+        move_saps = {str(move.get("sap") or "").strip() for move in moves}
+        if "" in move_saps:
+            raise StructuredApiError(
+                409,
+                "The finalized order history cannot be safely rebased.",
+                "ADJUSTMENT_REBASE_UNSAFE",
+                {"baseOrderRevision": base_revision, "currentOrderRevision": current_revision},
+            )
+        affected_saps.update(move_saps)
+    return affected_saps
+
+
 def _validate_adjusted_store_allocations(
     order_data: Dict[str, Any],
     route_stores: Dict[str, Dict[str, Any]],
@@ -295,6 +385,8 @@ def _confirm_full_order_adjustment_document(
     adjustment_ref,
     batch_ref,
     audit_ref,
+    order_audit_ref,
+    route_adjustments_ref,
     stores_ref,
     route_number: str,
     payload: FullOrderAdjustmentConfirmRequest,
@@ -354,17 +446,22 @@ def _confirm_full_order_adjustment_document(
         raise StructuredApiError(409, "Only finalized orders can be adjusted.", "ADJUSTMENT_ORDER_NOT_FINALIZED")
 
     current_revision = _order_revision(order_data)
-    if current_revision != payload.baseOrderRevision:
-        raise StructuredApiError(
-            409,
-            "The finalized order changed. Refresh and rebuild the adjustment.",
-            "ADJUSTMENT_STALE_ORDER",
-            {"currentOrderRevision": current_revision},
+    batch_base_revision = _batch_base_order_revision(batch)
+    intervening_reallocation_saps = set()
+    if batch.get("schemaVersion") != 2:
+        intervening_reallocation_saps = _prove_intervening_reallocations(
+            transaction,
+            order_id=str(order_ref.id),
+            base_revision=batch_base_revision,
+            current_revision=current_revision,
+            order_audit_ref=order_audit_ref,
+            route_adjustments_ref=route_adjustments_ref,
         )
     merged = validate_and_merge_full_adjustment(
         current_order=order_data,
         batch=batch,
         accepted_saps=payload.acceptedSaps,
+        intervening_reallocation_saps=intervening_reallocation_saps,
     )
     store_docs = list(stores_ref.stream(transaction=transaction))
     route_stores = {str(doc.id): (doc.to_dict() or {}) for doc in store_docs}
@@ -383,7 +480,7 @@ def _confirm_full_order_adjustment_document(
             )
 
     applied_at_ms = int(now.timestamp() * 1000)
-    changed = bool(payload.acceptedSaps)
+    changed = (merged.get("stores") or []) != (order_data.get("stores") or [])
     applied_revision = current_revision + 1 if changed else current_revision
     if changed:
         transaction.update(order_ref, {
@@ -416,6 +513,9 @@ def _confirm_full_order_adjustment_document(
         "notes": payload.notes,
         "appliedOrderRevision": applied_revision,
         "changed": changed,
+        "baseOrderRevision": batch_base_revision,
+        "rebasedFromOrderRevision": batch_base_revision if batch_base_revision != current_revision else None,
+        "interveningReallocationSaps": sorted(intervening_reallocation_saps),
     }
     adjustment_update: Dict[str, Any] = {
         "status": "confirmed",
@@ -444,8 +544,10 @@ def _confirm_full_order_adjustment_document(
             "sentBatchId": payload.sentBatchId,
             "acceptedSaps": payload.acceptedSaps,
             "baseOrderRevision": current_revision,
+            "sentBatchBaseOrderRevision": batch_base_revision,
             "appliedOrderRevision": applied_revision,
             "changed": changed,
+            "interveningReallocationSaps": sorted(intervening_reallocation_saps),
         },
         "createdAt": now,
     })
@@ -1450,6 +1552,8 @@ async def confirm_full_order_adjustment(
         adjustment_ref=adjustment_ref,
         batch_ref=batch_ref,
         audit_ref=audit_ref,
+        order_audit_ref=order_ref.collection("audit"),
+        route_adjustments_ref=route_ref.collection("orderAdjustments"),
         stores_ref=route_ref.collection("stores"),
         route_number=route,
         payload=payload,
