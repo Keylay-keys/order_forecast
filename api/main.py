@@ -23,13 +23,14 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from .dependencies import get_firebase_app, get_pg_pool, get_firestore
 from .errors import install_api_error_handlers
-from .routers import auth, history, health, orders, forecast, reference, stores, catalog, low_quantity, settings, schedule, credits, pos, deliveries, transfers, team, team_tasks, billing, archive_exports, dashboard, usage
+from .routers import auth, history, health, orders, forecast, reference, stores, catalog, low_quantity, settings, schedule, credits, pos, deliveries, transfers, team, team_tasks, billing, archive_exports, dashboard, usage, pcf_internal
 from .middleware.rate_limit import setup_rate_limiting
 from .middleware.honeypots import setup_honeypots
 from .middleware.brute_force import setup_brute_force_protection
 from .middleware.code_protection import setup_code_protection
 from .middleware.request_context import setup_request_context
 from .middleware.usage_analytics import setup_usage_analytics
+from .middleware.internal_machine_auth import setup_internal_machine_auth
 from .utils.security_store import flush_security_events, security_store, start_security_maintenance
 
 # =============================================================================
@@ -138,7 +139,13 @@ app.add_middleware(
     allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "DELETE"],
-    allow_headers=["Authorization", "Content-Type"],
+    allow_headers=[
+        "Authorization",
+        "Content-Type",
+        "X-RouteSpark-App-Version",
+        "X-RouteSpark-Build-Number",
+        "X-RouteSpark-Platform",
+    ],
     expose_headers=["X-Request-ID"],
     max_age=3600,
 )
@@ -175,6 +182,10 @@ async def add_security_headers(request: Request, call_next):
 
 setup_request_context(app, logger)
 setup_usage_analytics(app, logger)
+# Last-added middleware is outermost in Starlette. Keep this after CORS and all
+# shared request middleware so disabled/invalid internal requests are rejected
+# before CORS, analytics, Firebase auth, or request-body parsing.
+setup_internal_machine_auth(app)
 
 
 # =============================================================================
@@ -209,6 +220,7 @@ app.include_router(billing.router, prefix="/api", tags=["Billing"])
 app.include_router(archive_exports.router, prefix="/api", tags=["Archive Exports"])
 app.include_router(dashboard.router, prefix="/api", tags=["Dashboard"])
 app.include_router(usage.router, prefix="/api", tags=["Usage Analytics"])
+app.include_router(pcf_internal.router, tags=["Internal PCF"])
 
 
 # =============================================================================

@@ -1,0 +1,71 @@
+{
+  "contractVersion": "pcf-production-fences-v1",
+  "state": "frozen_not_executed",
+  "observedAt": "2026-08-21T03:17:00Z",
+  "scope": {
+    "project": "routespark-1f47d",
+    "location": "us-central1"
+  },
+  "schedulerJobs": [
+    {"id": "firebase-schedule-checkExpiringItems-us-central1", "state": "ENABLED", "schedule": "0 6,18 * * *", "timeZone": "UTC"},
+    {"id": "firebase-schedule-cleanupOldAlerts-us-central1", "state": "ENABLED", "schedule": "0 2 * * *", "timeZone": "UTC"},
+    {"id": "firebase-schedule-cleanupOldNotifications-us-central1", "state": "ENABLED", "schedule": "0 0 * * *", "timeZone": "UTC"},
+    {"id": "firebase-schedule-cleanupOldOrders-us-central1", "state": "PAUSED", "schedule": "0 3 * * 0", "timeZone": "America/Denver"},
+    {"id": "firebase-schedule-deliverScheduledNotifications-us-central1", "state": "ENABLED", "schedule": "*/30 * * * *", "timeZone": "UTC"},
+    {"id": "firebase-schedule-monitorGraceCaptureBucketPolicy-us-central1", "state": "ENABLED", "schedule": "every 24 hours", "timeZone": "America/Los_Angeles"},
+    {"id": "firebase-schedule-monitorStaleUploads-us-central1", "state": "ENABLED", "schedule": "every 15 minutes", "timeZone": "America/Los_Angeles"},
+    {"id": "firebase-schedule-processPendingCampaigns-us-central1", "state": "ENABLED", "schedule": "every 2 hours", "timeZone": "UTC"},
+    {"id": "firebase-schedule-processTrialExpirationNotifications-us-central1", "state": "ENABLED", "schedule": "every 60 minutes", "timeZone": "UTC"},
+    {"id": "firebase-schedule-reconcileGraceCaptureHolds-us-central1", "state": "ENABLED", "schedule": "every 15 minutes", "timeZone": "America/Los_Angeles"},
+    {"id": "firebase-schedule-scheduledPCFCleanup-us-central1", "state": "ENABLED", "schedule": "every day 02:00", "timeZone": "America/Denver"}
+  ],
+  "commandTemplates": {
+    "inventory": "gcloud scheduler jobs list --project routespark-1f47d --location us-central1 --format=json",
+    "describe": "gcloud scheduler jobs describe <exact-job-id> --project routespark-1f47d --location us-central1 --format=json",
+    "pause": "gcloud scheduler jobs pause <exact-job-id> --project routespark-1f47d --location us-central1",
+    "resume": "gcloud scheduler jobs resume <exact-job-id> --project routespark-1f47d --location us-central1"
+  },
+  "phaseFences": {
+    "P5": {
+      "pauseAndDrain": [
+        "firebase-schedule-checkExpiringItems-us-central1",
+        "firebase-schedule-cleanupOldNotifications-us-central1",
+        "firebase-schedule-deliverScheduledNotifications-us-central1"
+      ],
+      "mustRemainEnabled": ["firebase-schedule-processPendingCampaigns-us-central1"],
+      "callableSink": "testNotification"
+    },
+    "P6": {
+      "pauseAndDrain": ["firebase-schedule-scheduledPCFCleanup-us-central1"],
+      "callableSink": "updatePCFContainerCounts"
+    }
+  },
+  "callableFences": {
+    "testNotification": {
+      "functionVersion": "25",
+      "observedFunctionIam": "no function-level roles/cloudfunctions.invoker binding",
+      "observedProjectAllUsersInvoker": false,
+      "deny": "no mutation while the observed function and project policies remain non-public; preflight must abort if allUsers invoker appears",
+      "negativeTest": "POST an unauthenticated callable envelope to the exact HTTPS URL and require HTTP 403 before any body handler log or Expo effect",
+      "rollback": "restore the exact preflight IAM policy, which currently has no public invoker binding"
+    },
+    "updatePCFContainerCounts": {
+      "functionVersion": "41",
+      "observedFunctionIam": "allUsers has roles/cloudfunctions.invoker",
+      "observedProjectAllUsersInvoker": false,
+      "denyCommand": "gcloud functions remove-iam-policy-binding updatePCFContainerCounts --project routespark-1f47d --region us-central1 --member allUsers --role roles/cloudfunctions.invoker --quiet",
+      "readBackCommand": "gcloud functions get-iam-policy updatePCFContainerCounts --project routespark-1f47d --region us-central1 --format=json",
+      "negativeTest": "POST an unauthenticated callable envelope to the exact HTTPS URL and require HTTP 403 before any body handler log or Firestore/Storage effect",
+      "rollbackCommand": "gcloud functions add-iam-policy-binding updatePCFContainerCounts --project routespark-1f47d --region us-central1 --member allUsers --role roles/cloudfunctions.invoker --quiet"
+    }
+  },
+  "executionRules": [
+    "re-census all scheduler jobs and both callable IAM policies immediately before any fence",
+    "record exact pre-state and etag before mutation",
+    "pause or deny only the named exact target; never use a wildcard or bulk command",
+    "wait the deployed timeout plus transport margin and prove no in-flight work before final delta",
+    "perform the negative test only inside the signed rollout window",
+    "restore from the captured pre-state and independently read it back on abort"
+  ],
+  "productionMutationPerformedInP1": false
+}

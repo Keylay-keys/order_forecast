@@ -187,6 +187,11 @@ def _skip_initial_snapshot() -> bool:
     return os.environ.get('ROUTESPARK_SKIP_INITIAL_ORDER_SNAPSHOT', '0').lower() in ('1', 'true', 'yes')
 
 
+def _order_event_key(document: Any) -> str:
+    """Keep route-scoped orders distinct even when document IDs collide."""
+    return str(document.reference.path)
+
+
 def get_firestore_client(sa_path: str) -> firestore.Client:
     return firestore.Client.from_service_account_json(sa_path)
 
@@ -1125,7 +1130,7 @@ def watch_all_orders(sa_path: str):
         pending_adjustments = adjustments_col.where('projection.status', '==', 'pending')
     
     # Track seen orders to avoid reprocessing
-    seen_orders = set()
+    seen_order_paths = set()
     initial_snapshot_seen = False
     
     def on_snapshot(col_snapshot, changes, read_time):
@@ -1141,7 +1146,7 @@ def watch_all_orders(sa_path: str):
                     path_parts = doc.reference.path.split('/')
                     if len(path_parts) != 4 or path_parts[0] != 'routes' or path_parts[2] != 'orders':
                         continue
-                    seen_orders.add(doc.id)
+                    seen_order_paths.add(_order_event_key(doc))
                     primed += 1
                 print(f"   Initial snapshot skipped; primed {primed} existing order(s)")
                 return
@@ -1149,6 +1154,7 @@ def watch_all_orders(sa_path: str):
         for change in changes:
             doc = change.document
             order_id = doc.id
+            order_event_key = _order_event_key(doc)
             data = doc.to_dict() or {}
 
             # Guard: only process route-scoped orders
@@ -1159,8 +1165,8 @@ def watch_all_orders(sa_path: str):
             status = data.get('status', '')
             
             if change.type.name == 'ADDED':
-                if order_id not in seen_orders:
-                    seen_orders.add(order_id)
+                if order_event_key not in seen_order_paths:
+                    seen_order_paths.add(order_event_key)
                     handle_new_order(fb_client, order_id, data)
                     
                     # If it was already finalized, sync it
@@ -1170,8 +1176,8 @@ def watch_all_orders(sa_path: str):
             elif change.type.name == 'MODIFIED':
                 # Check if status changed to finalized
                 if status == 'finalized':
-                    if order_id not in seen_orders:
-                        seen_orders.add(order_id)
+                    if order_event_key not in seen_order_paths:
+                        seen_order_paths.add(order_event_key)
                     handle_finalized_order(fb_client, order_id, data)
 
     def on_adjustment_snapshot(col_snapshot, changes, read_time):

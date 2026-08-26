@@ -19,8 +19,10 @@ from google.cloud import firestore  # type: ignore
 # Import pg_utils for direct PostgreSQL access
 try:
     from .pg_utils import get_archived_dates, get_order_by_date, get_order_by_id
+    from .request_listener_query import pending_request_query
 except ImportError:
     from pg_utils import get_archived_dates, get_order_by_date, get_order_by_id
+    from request_listener_query import pending_request_query
 
 # Worker ID for this instance
 WORKER_ID = f"archive-{socket.gethostname()}-{__import__('os').getpid()}"
@@ -229,11 +231,11 @@ def watch_requests(sa_path: str):
     print(f"\n🎧 Order Archive Listener")
     print(f"   Worker ID: {WORKER_ID}")
     print(f"   Using: Direct PostgreSQL (pg_utils)")
-    print(f"   Watching: orderRequests/*")
+    print(f"   Watching: orderRequests where status == pending")
     print(f"\n   Press Ctrl+C to stop\n")
 
     fb_client = get_firestore_client(sa_path)
-    requests_col = fb_client.collection("orderRequests")
+    requests_query = pending_request_query(fb_client, "orderRequests")
     initial_snapshot_seen = False
     
     def on_snapshot(col_snapshot, changes, read_time):
@@ -265,7 +267,7 @@ def watch_requests(sa_path: str):
                 print(f"     ❌ Unexpected error: {e}")
     
     # Start real-time listener
-    watcher = requests_col.on_snapshot(on_snapshot)
+    watcher = requests_query.on_snapshot(on_snapshot)
     
     try:
         while True:

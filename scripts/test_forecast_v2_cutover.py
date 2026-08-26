@@ -1,4 +1,5 @@
 import unittest
+from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 
 import forecast_v2_cutover as cutover
@@ -28,17 +29,25 @@ class ForecastV2CutoverTests(unittest.TestCase):
         db = MagicMock()
         query = _Query([{
             "status": "draft",
-            "expectedDeliveryDate": "2026-08-13",
+            "expectedDeliveryDate": "2026-08-23",
             "scheduleKey": "tuesday",
         }])
         db.collection.return_value.document.return_value.collection.return_value = query
-        with patch.object(cutover, "derive_upcoming_generation_targets", return_value=[{
-            "delivery_date": "2026-08-17",
-            "schedule_key": "friday",
-        }]):
+        with patch.object(
+            cutover,
+            "datetime",
+        ) as clock, patch.object(
+            cutover,
+            "derive_upcoming_generation_targets",
+            return_value=[{
+                "delivery_date": "2026-08-27",
+                "schedule_key": "friday",
+            }],
+        ):
+            clock.now.return_value = datetime(2026, 8, 22, tzinfo=timezone.utc)
             self.assertEqual(cutover.active_targets(db, "988200"), [
-                ("2026-08-13", "tuesday"),
-                ("2026-08-17", "friday"),
+                ("2026-08-23", "tuesday"),
+                ("2026-08-27", "friday"),
             ])
 
     def test_inspect_never_relabels_sparse_v1_and_reports_unverified(self):

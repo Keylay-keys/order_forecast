@@ -1,0 +1,72 @@
+{
+  "contractVersion": "pcf-d5-deadline-v1",
+  "selectedAt": "2026-08-20T17:24:35.341541Z",
+  "evidence": {
+    "rawPath": "/Volumes/Extreme SSD/routespark_offload/pcf-migration/phase0/legacy-attempt-timings.jsonl",
+    "rawPrefixLineCount": 88,
+    "rawPrefixSha256": "9195cfdc7f3df0923bb4da873b2fd59044247df4d46496839a8dfa45556e75f9",
+    "summaryPath": "/Volumes/Extreme SSD/routespark_offload/pcf-migration/phase0/legacy-attempt-timings-2026-08-20-summary.json",
+    "summarySha256": "e17004704a40587a8560116e83d82beb6ff2542fa23b1d6cfc887b9b8028a364",
+    "summaryGeneratedAt": "2026-08-20T17:24:35.341541Z",
+    "firstObservedDate": "2026-08-11",
+    "throughDate": "2026-08-20",
+    "collectionDays": 10,
+    "attemptCount": 88,
+    "successfulAttemptCount": 56,
+    "successfulDeliveryCount": 49,
+    "requiredCollectionDays": 7,
+    "requiredSuccessfulDeliveries": 30,
+    "evidenceReady": true,
+    "percentileMethod": "nearest-rank"
+  },
+  "effectiveClaimToTerminalP99Seconds": {
+    "1": {
+      "value": 14.411811,
+      "method": "band_p99",
+      "successCount": 12
+    },
+    "2": {
+      "value": 44.77015,
+      "method": "sparse_max_global_or_next_larger",
+      "successCount": 7
+    },
+    "3-4": {
+      "value": 44.77015,
+      "method": "sparse_max_global_or_next_larger",
+      "successCount": 5
+    },
+    "5-8": {
+      "value": 38.720931,
+      "method": "band_p99",
+      "successCount": 18
+    },
+    "9+": {
+      "value": 44.77015,
+      "method": "band_p99",
+      "successCount": 14
+    }
+  },
+  "selectionRule": "ceil(max(600 seconds, 1.5 * effective claim-to-terminal p99))",
+  "hardDeadlineSeconds": {
+    "1": 600,
+    "2": 600,
+    "3-4": 600,
+    "5-8": 600,
+    "9+": 600
+  },
+  "lease": {
+    "heartbeatSeconds": 30,
+    "renewableLeaseSeconds": 120,
+    "signedUrlMinimumLifetimeAfterClaimSeconds": 900
+  },
+  "queueAge": {
+    "normalClaimableTransitionToClaimSloSeconds": 15,
+    "measurementStatus": "target selected for P3 shadow validation; legacy timing does not measure enqueue-to-claim",
+    "recoveryPath": "separate 15-minute detector plus 10-minute quiet threshold; expected bound is approximately 10-25 minutes after last activity",
+    "ordinaryClaimToTerminalSloSeconds": 600
+  },
+  "review": {
+    "deadlineAboveSeconds": 2700,
+    "required": false
+  }
+}

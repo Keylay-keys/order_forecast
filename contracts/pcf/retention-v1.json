@@ -1,0 +1,63 @@
+{
+  "contractVersion": "pcf-retention-v1",
+  "decision": "R14",
+  "selectedAt": "2026-08-20",
+  "governingWindowsDays": {
+    "managedTransportReplay": 31,
+    "maximumNotificationLateness": 30,
+    "rollbackProof": 31,
+    "verifiedOffboxRpoMaximum": 1
+  },
+  "itemsCurrent": {
+    "activeRetention": "while authoritative item remains active",
+    "tombstoneMinimumDays": 45,
+    "tombstonesLeaveActiveIndexesImmediately": true,
+    "pruneRequires": [
+      "deleted_at is at least 45 days old",
+      "route source watermark and reconciliation checkpoint are strictly newer than the tombstone generation",
+      "no active or retained due_work row references the item identity",
+      "no nonterminal PCF work references the item identity",
+      "a verified off-box backup covers the tombstone",
+      "the current release rollback proof is older than the tombstone"
+    ]
+  },
+  "dueWork": {
+    "terminalMinimumDays": 90,
+    "terminalsLeaveClaimIndexesImmediately": true,
+    "fullUniqueKey": ["kind", "semantic_key"],
+    "neverPruneStatuses": ["scheduled", "retryable", "blocked", "dispatching", "outcome_ambiguous", "dead_letter"],
+    "terminalPruneRequires": [
+      "terminal_at is at least 90 days old",
+      "retain_until is not null and is in the past",
+      "due instant plus the kind-specific lateness deadline is in the past",
+      "planner rejects the same old due instant before insert",
+      "source and planner checkpoints are newer than the decision watermark",
+      "no active item or work row references the semantic key",
+      "a verified off-box backup covers the terminal decision",
+      "legacy suppression horizon and rollback margin have elapsed"
+    ],
+    "latenessContract": "R12 may select at most 30 days; a longer value reopens R14 before schema freeze"
+  },
+  "indexes": {
+    "itemsActive": "partial index over serving keys where deleted_at is null",
+    "itemsTombstonePrune": "partial index over deleted_at and route where deleted_at is not null",
+    "dueReady": "partial index over kind, next_attempt_at, priority, created_at for claimable nonterminal statuses",
+    "dueTerminalPrune": "partial index over retain_until and id for compact terminal statuses",
+    "partitioning": "none initially; reconsider only at measured partition-scale volume or maintenance pressure"
+  },
+  "pruner": {
+    "cadence": "daily",
+    "batchSize": 500,
+    "selection": "FOR UPDATE SKIP LOCKED",
+    "transaction": "one bounded batch per transaction",
+    "deleteAllOrTruncate": false,
+    "analyzeAfterBackfill": true,
+    "monitor": ["n_live_tup", "n_dead_tup", "last_autovacuum", "last_autoanalyze", "index size"]
+  },
+  "scope": {
+    "pcfWorkItemsPrunedByThisContract": false,
+    "pcfWorkEventsPrunedByThisContract": false,
+    "firestoreQueueTtlChangedByThisContract": false,
+    "notificationHistoryPrunedByThisContract": false
+  }
+}

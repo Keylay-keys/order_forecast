@@ -1,4 +1,5 @@
 import inspect
+import re
 import unittest
 from datetime import datetime, time
 from zoneinfo import ZoneInfo
@@ -50,9 +51,34 @@ class _FakeCollection:
     def limit(self, limit_value):
         return _FakeQuery(self, limit_value)
 
+    def where(self, *, filter):
+        if self.path != ("users",):
+            raise AssertionError(f"Unexpected filtered collection: {self.path}")
+        route_match = re.search(r"routeAssignments\.`(\d+)`\.role", filter.field_path)
+        if not route_match or filter.op_string != "==":
+            raise AssertionError(f"Unexpected filter: {filter.field_path}")
+        route = route_match.group(1)
+        rows = [
+            _FakeSnapshot(doc_id, data)
+            for doc_id, data in self.db.collection_data(self.path).items()
+            if (data.get("routeAssignments") or {}).get(route, {}).get("role") == filter.value
+        ]
+        return _FakeQueryRows(rows)
+
     def stream(self):
         data = self.db.collection_data(self.path)
         return [_FakeSnapshot(doc_id, doc_data) for doc_id, doc_data in data.items()]
+
+    def get(self):
+        return self.stream()
+
+
+class _FakeQueryRows:
+    def __init__(self, rows):
+        self.rows = rows
+
+    def stream(self):
+        return list(self.rows)
 
     def get(self):
         return self.stream()

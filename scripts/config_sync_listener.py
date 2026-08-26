@@ -559,6 +559,7 @@ class ConfigSyncManager:
         self._refresh_timers: Dict[str, threading.Timer] = {}
         self._low_qty_watch = None
         self._low_qty_owner_watchers: Dict[str, Any] = {}
+        self._low_qty_owner_ids: Dict[str, Optional[str]] = {}
         self._low_qty_user_snapshots: List[Any] = []
         self._low_qty_lock = threading.RLock()
         self._low_qty_sync_ready = False
@@ -597,10 +598,32 @@ class ConfigSyncManager:
             )
         )
 
+    def _resolve_low_qty_owner_ids(
+        self,
+        user_snapshots: List[Any],
+    ) -> Dict[str, Optional[str]]:
+        """Resolve each enabled route once for one complete user snapshot."""
+        route_numbers: Set[str] = set()
+        for snapshot in user_snapshots:
+            if not snapshot.exists:
+                continue
+            data = snapshot.to_dict() or {}
+            if self._order_reminder_settings(data).get("enabled") is not True:
+                continue
+            profile = data.get("profile", {}) if isinstance(data.get("profile"), dict) else {}
+            route_number = str(profile.get("currentRoute") or profile.get("routeNumber") or "").strip()
+            if route_number:
+                route_numbers.add(route_number)
+        return {
+            route_number: resolve_authoritative_route_owner(self.fb_client, route_number)
+            for route_number in sorted(route_numbers)
+        }
+
     def _build_low_qty_preferences(
         self,
         user_snapshots: List[Any],
         read_time: Any,
+        owner_ids: Dict[str, Optional[str]],
     ) -> List[EnabledPreference]:
         if isinstance(read_time, datetime) and read_time.tzinfo is not None:
             schedule_after = read_time.astimezone(timezone.utc)
@@ -623,7 +646,7 @@ class ConfigSyncManager:
                 print(f"  [LowQty] Invalid enabled reminder for user {snapshot.id}: missing_route")
                 continue
 
-            owner_uid = resolve_authoritative_route_owner(self.fb_client, route_number)
+            owner_uid = owner_ids.get(route_number)
             if not owner_uid:
                 self._low_qty_metrics["invalid_settings"] += 1
                 print(f"  [LowQty] Invalid enabled reminder for route {route_number}: unresolved_owner")
@@ -655,15 +678,31 @@ class ConfigSyncManager:
                 print(f"  [LowQty] Invalid enabled reminder for route {route_number}: {exc}")
         return preferences
 
-    def _sync_low_qty_snapshot(self, user_snapshots: List[Any], read_time: Any) -> None:
+    def _sync_low_qty_snapshot(
+        self,
+        user_snapshots: List[Any],
+        read_time: Any,
+        *,
+        owner_ids: Optional[Dict[str, Optional[str]]] = None,
+    ) -> None:
         """Resolve Firebase state completely before opening the SQL transaction."""
         with self._low_qty_lock:
             self._low_qty_metrics["snapshots_received"] += 1
-            preferences = self._build_low_qty_preferences(user_snapshots, read_time)
+            resolved_owner_ids = (
+                self._resolve_low_qty_owner_ids(user_snapshots)
+                if owner_ids is None
+                else dict(owner_ids)
+            )
+            preferences = self._build_low_qty_preferences(
+                user_snapshots,
+                read_time,
+                resolved_owner_ids,
+            )
             # Retain only a completely resolved query snapshot. If PostgreSQL is
             # temporarily unavailable, an owner event can retry this current
             # snapshot instead of replaying older user settings.
             self._low_qty_user_snapshots = list(user_snapshots)
+            self._low_qty_owner_ids = resolved_owner_ids
             result = reconcile_complete_enabled_snapshot(preferences)
             self._low_qty_metrics["snapshots_committed"] += 1
             self._low_qty_metrics["enabled_preferences"] = result["enabled"]
@@ -694,8 +733,39 @@ class ConfigSyncManager:
                 try:
                     with self._low_qty_lock:
                         current_snapshots = list(self._low_qty_user_snapshots)
-                    if current_snapshots:
-                        self._sync_low_qty_snapshot(current_snapshots, owner_read_time)
+                        current_owner_ids = dict(self._low_qty_owner_ids)
+                        if current_snapshots:
+                            owner_uid = None
+                            snapshots = (
+                                list(doc_snapshots)
+                                if isinstance(doc_snapshots, (list, tuple))
+                                else [doc_snapshots]
+                            )
+                            route_snapshot = next(
+                                (snapshot for snapshot in snapshots if snapshot is not None),
+                                None,
+                            )
+                            if route_snapshot is not None and route_snapshot.exists:
+                                route_data = route_snapshot.to_dict() or {}
+                                for owner_field in ("ownerUid", "userId"):
+                                    value = route_data.get(owner_field)
+                                    if isinstance(value, str) and value.strip():
+                                        owner_uid = value.strip()
+                                        break
+                            if not owner_uid:
+                                owner_uid = resolve_authoritative_route_owner(
+                                    self.fb_client,
+                                    route,
+                                )
+                            current_owner_ids[route] = owner_uid
+                            # Keep the snapshot and owner-map revision under the
+                            # same lock so an older owner callback cannot overwrite
+                            # a newer enabled-user query snapshot.
+                            self._sync_low_qty_snapshot(
+                                current_snapshots,
+                                owner_read_time,
+                                owner_ids=current_owner_ids,
+                            )
                 except Exception as exc:
                     self._low_qty_metrics["owner_watch_errors"] += 1
                     self._emit_low_qty_metrics("owner_watch_error")
@@ -770,6 +840,7 @@ class ConfigSyncManager:
         preferences = self._build_low_qty_preferences(
             snapshots,
             datetime.now(timezone.utc),
+            self._resolve_low_qty_owner_ids(snapshots),
         )
         result = reconcile_complete_enabled_snapshot(preferences)
         self._low_qty_metrics["snapshots_received"] += 1
@@ -1042,6 +1113,7 @@ class ConfigSyncManager:
                 except Exception:
                     pass
         self._low_qty_owner_watchers.clear()
+        self._low_qty_owner_ids.clear()
         for timer in self._refresh_timers.values():
             timer.cancel()
         self._refresh_timers.clear()

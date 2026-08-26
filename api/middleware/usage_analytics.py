@@ -10,7 +10,9 @@ from starlette.routing import Match
 from ..usage_analytics import (
     ApiUsageRequest,
     enqueue_api_request,
+    emit_client_release,
     extract_route_hint,
+    classify_api_feature,
     normalize_endpoint_path,
 )
 
@@ -45,6 +47,15 @@ def setup_usage_analytics(app: FastAPI, app_logger: logging.Logger) -> None:
         try:
             uid = str(getattr(request.state, "usage_uid", "") or "").strip()
             if uid and request_method != "OPTIONS":
+                feature_key = classify_api_feature(request_path)
+                if feature_key is not None:
+                    emit_client_release(
+                        app_version=request.headers.get("x-routespark-app-version", ""),
+                        build_number=request.headers.get("x-routespark-build-number", ""),
+                        platform=request.headers.get("x-routespark-platform", ""),
+                        feature_key=feature_key,
+                        status_code=response.status_code,
+                    )
                 route_template = ""
                 if response.status_code >= 400:
                     route_template = _resolve_route_template(

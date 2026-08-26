@@ -1,0 +1,64 @@
+{
+  "contractVersion": "pcf-runtime-controls-v1",
+  "state": "selected_not_deployed",
+  "authoritativeOwner": {
+    "system": "Kubernetes API",
+    "namespace": "routespark-edge",
+    "kind": "ConfigMap",
+    "name": "pcf-runtime-controls",
+    "key": "control.json",
+    "releaseAuthority": "named release operator",
+    "mutationRule": "replace the one ConfigMap object using its current resourceVersion; never patch individual control keys"
+  },
+  "revisionContract": {
+    "revision": "lowercase 64-character SHA-256 of the canonical proposed control document excluding signatures",
+    "previousRevision": "the exact currently observed revision, required on every transition",
+    "updatedAt": "RFC 3339 UTC",
+    "approvedBy": "named release owner",
+    "goDecisionEvidence": "absolute external-volume path to the signed phase bundle",
+    "atomicity": "all three controls and their revision change in one Kubernetes object replace",
+    "consumerAck": "each enforcing process reports the exact observed revision; a gate closes only when all required consumers agree"
+  },
+  "controls": {
+    "PCF_FIRESTORE_DISCOVERY_MODE": {
+      "initial": "legacy",
+      "allowedValues": ["legacy", "bounded", "disabled"],
+      "forwardOrder": ["legacy", "bounded", "disabled"],
+      "rollback": "disabled may roll back only to bounded under a signed retention incident; no automatic transition and no return to legacy",
+      "invalidOrUnavailable": "disabled"
+    },
+    "PCF_CLUSTER_STAGE": {
+      "initial": "off",
+      "allowedValues": ["off", "ingress", "shadow", "claims", "projection"],
+      "forwardOrder": ["off", "ingress", "shadow", "claims", "projection"],
+      "transition": "same value or one adjacent step per signed revision; rollback decrements by one step",
+      "invalidOrUnavailable": "off"
+    },
+    "PCF_FIREBASE_WRITE_AUTHORITY": {
+      "initial": "legacy_mac",
+      "allowedValues": ["legacy_mac", "cluster"],
+      "transition": "cluster requires independent proof that every broad Mac Firebase credential owner is drained or credential-free; rollback to legacy_mac requires explicit sealed-credential restoration and a signed incident",
+      "invalidOrUnavailable": "none; reject both legacy and cluster Firebase effects"
+    }
+  },
+  "crossControlInvariants": [
+    "PCF_CLUSTER_STAGE=projection requires PCF_FIREBASE_WRITE_AUTHORITY=cluster",
+    "PCF_CLUSTER_STAGE=projection requires PCF_FIRESTORE_DISCOVERY_MODE=disabled",
+    "PCF_FIREBASE_WRITE_AUTHORITY=cluster requires zero effective broad Mac Firebase credentials",
+    "unknown, missing, stale, or malformed control state grants no claim or Firebase effect authority"
+  ],
+  "distribution": {
+    "cluster": "web-api reads the mounted ConfigMap and is the sole admission authority for ingress, claims, and cluster effects",
+    "mac": "authenticated Mac worker reads the revision through the internal API; a cached revision is usable only for its signed max age and never grants direct Firebase writes",
+    "legacyDiscovery": "legacy Mac discovery receives only the validated discovery value; on invalid or expired state it disables discovery",
+    "maxObservedRevisionAgeSeconds": 300
+  },
+  "rollout": {
+    "implementationPhase": "P2",
+    "preflight": "read current object and resourceVersion; validate current and proposed documents; require previousRevision match and signed phase evidence",
+    "apply": "kubectl --namespace routespark-edge replace --filename <reviewed-pcf-runtime-controls.yaml>",
+    "readBack": "kubectl --namespace routespark-edge get configmap pcf-runtime-controls --output json",
+    "rollback": "replace the whole object with the immediately prior signed document using the newly observed resourceVersion",
+    "productionMutationPerformedInP1": false
+  }
+}

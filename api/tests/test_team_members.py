@@ -1,4 +1,5 @@
 import inspect
+import re
 import unittest
 from unittest.mock import patch
 
@@ -33,6 +34,18 @@ class _Collection:
 
     def stream(self):
         return [_Snapshot(doc_id, data) for doc_id, data in self.data.items()]
+
+    def where(self, *, filter):
+        route_match = re.search(r"routeAssignments\.`(\d+)`\.role", filter.field_path)
+        if not route_match or filter.op_string != "==":
+            raise AssertionError(f"Unexpected filter: {filter.field_path}")
+        route = route_match.group(1)
+        rows = {
+            doc_id: data
+            for doc_id, data in self.data.items()
+            if (data.get("routeAssignments") or {}).get(route, {}).get("role") == filter.value
+        }
+        return _Collection(rows)
 
 
 class _DB:

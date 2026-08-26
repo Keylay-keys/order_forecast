@@ -25,6 +25,7 @@ from ..dependencies import (
 )
 from ..middleware.rate_limit import rate_limit_history, rate_limit_write
 from ..models import ErrorResponse
+from ..route_membership import query_team_member_documents
 from .team import _send_expo_push
 
 router = APIRouter()
@@ -461,9 +462,7 @@ async def get_team_task_capabilities(
 
 
 def _owner_has_team_members(db: firestore.Client, route_number: str) -> bool:
-    # Team member data currently lives on user docs; scan is consistent with
-    # /team/members and avoids a new index requirement for this low-frequency call.
-    for doc in db.collection("users").stream():
+    for doc in query_team_member_documents(db, route_number):
         if _is_approved_team_member(doc.to_dict() or {}, route_number):
             return True
     return False

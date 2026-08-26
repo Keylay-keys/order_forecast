@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, time as datetime_time, timedelta, timezone
 import hashlib
 import hmac
+import json
 import logging
 import os
 from queue import Empty, Full, Queue
@@ -17,6 +18,7 @@ from uuid import UUID
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from psycopg2.extras import RealDictCursor
+from .firestore_read_telemetry import emit_firestore_read_tax
 
 
 logger = logging.getLogger("api.usage_analytics")
@@ -26,6 +28,8 @@ _ROUTE_PATH_PATTERN = re.compile(r"/routes/(\d{1,10})(?:/|$)")
 _SAFE_ENDPOINT_PATTERN = re.compile(r"^/api/[A-Za-z0-9_./{}:*-]{0,195}$")
 _SAFE_ERROR_CODE_PATTERN = re.compile(r"^[A-Z0-9_.:-]{1,64}$")
 _SAFE_METHODS = {"DELETE", "GET", "HEAD", "PATCH", "POST", "PUT"}
+_RELEASE_IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z0-9._+-]{1,32}$")
+_CLIENT_PLATFORMS = {"android", "ios", "web"}
 _IDENTITY_CACHE_TTL_SECONDS = 600
 _REQUEST_QUEUE: Queue["ApiUsageRequest"] = Queue(maxsize=2000)
 _WORKER_LOCK = Lock()
@@ -41,6 +45,9 @@ _FEATURE_PREFIXES: Tuple[Tuple[str, str], ...] = (
     ("/api/orders", "orders"),
     ("/api/history", "history"),
     ("/api/stores", "stores"),
+    # This retained route-catalog endpoint is not nested below /api/catalog.
+    # Keep it explicit so its Firestore reads cannot disappear from attribution.
+    ("/api/products", "catalog"),
     ("/api/catalog", "catalog"),
     ("/api/low-quantity", "low_quantity"),
     ("/api/pos", "pos"),
@@ -62,6 +69,7 @@ _FEATURE_PREFIXES: Tuple[Tuple[str, str], ...] = (
     ("/api/transfers", "transfer_history_read"),
     ("/api/auth", "auth"),
 )
+_FEATURE_KEYS = frozenset(value for _prefix, value in _FEATURE_PREFIXES)
 
 
 @dataclass(frozen=True)
@@ -174,6 +182,42 @@ def normalize_request_id(value: str) -> Optional[str]:
         return None
 
 
+def normalize_release_identifier(value: str) -> str:
+    candidate = str(value or "").strip()
+    return candidate if _RELEASE_IDENTIFIER_PATTERN.fullmatch(candidate) else "unknown"
+
+
+def emit_client_release(
+    *,
+    app_version: str,
+    build_number: str,
+    platform: str,
+    feature_key: str,
+    status_code: int,
+) -> None:
+    """Emit request-volume release metadata without user or route identity."""
+
+    try:
+        if feature_key not in _FEATURE_KEYS:
+            safe_feature = "unknown"
+        else:
+            safe_feature = feature_key
+        safe_platform = platform if platform in _CLIENT_PLATFORMS else "unknown"
+        safe_status = int(status_code)
+        status_family = f"{safe_status // 100}xx" if 100 <= safe_status <= 599 else "unknown"
+        event = {
+            "appVersion": normalize_release_identifier(app_version),
+            "buildNumber": normalize_release_identifier(build_number),
+            "event": "api_client_release_volume",
+            "featureKey": safe_feature,
+            "platform": safe_platform,
+            "statusFamily": status_family,
+        }
+        logger.info(json.dumps(event, sort_keys=True, separators=(",", ":")))
+    except Exception:
+        logger.exception("Failed to emit privacy-safe client release telemetry")
+
+
 def record_api_request(
     conn,
     *,
@@ -277,15 +321,38 @@ def _resolve_actor_context(uid: str, route_hint: str) -> Optional[ActorContext]:
     cached = _IDENTITY_CACHE.get(cache_key)
     now = time.monotonic()
     if cached and cached[0] > now:
+        emit_firestore_read_tax(
+            source="usage_identity",
+            outcome="cache_hit",
+            document_get_calls=0,
+        )
         return cached[1]
 
     db = get_firestore()
-    snapshot = db.collection("users").document(uid).get()
+    try:
+        snapshot = db.collection("users").document(uid).get()
+    except Exception:
+        emit_firestore_read_tax(
+            source="usage_identity",
+            outcome="read_error",
+            document_get_calls=1,
+        )
+        raise
     if not snapshot.exists:
+        emit_firestore_read_tax(
+            source="usage_identity",
+            outcome="cache_miss_user_not_found",
+            document_get_calls=1,
+        )
         return None
     user_data = snapshot.to_dict() or {}
     route_number = route_hint if route_hint and has_access_to_route(user_data, route_hint) else _active_route_for_user(user_data)
     if not route_number:
+        emit_firestore_read_tax(
+            source="usage_identity",
+            outcome="cache_miss_no_route",
+            document_get_calls=1,
+        )
         return None
 
     context = ActorContext(
@@ -294,7 +361,63 @@ def _resolve_actor_context(uid: str, route_hint: str) -> Optional[ActorContext]:
         actor_role="owner" if _is_owner_for_route(user_data, route_number) else "team_member",
     )
     _IDENTITY_CACHE[cache_key] = (now + _IDENTITY_CACHE_TTL_SECONDS, context)
+    emit_firestore_read_tax(
+        source="usage_identity",
+        outcome="cache_miss_context",
+        document_get_calls=1,
+    )
     return context
+
+
+def seed_actor_context_from_authorized_user(
+    *,
+    uid: str,
+    authorized_route: str,
+    user_data: Dict[str, Any],
+) -> bool:
+    """Seed analytics-only identity entries from fresh authorization state.
+
+    The authorization decision never consults this cache. This only prevents
+    the background analytics worker from re-reading the same user document
+    immediately after ``require_route_access`` already fetched and accepted it.
+    Only the pseudonymous aggregate context is retained; raw user data is not.
+    """
+
+    from .dependencies import _active_route_for_user, _is_owner_for_route
+
+    try:
+        normalized_uid = str(uid or "").strip()
+        normalized_route = str(authorized_route or "").strip()
+        if not normalized_uid or not _ROUTE_PATTERN.fullmatch(normalized_route):
+            return False
+        hash_key = os.environ.get("USAGE_ANALYTICS_HASH_KEY", "")
+        if len(hash_key) < 32:
+            return False
+        expires_at = time.monotonic() + _IDENTITY_CACHE_TTL_SECONDS
+        actor_hash = build_actor_hash(normalized_uid, hash_key)
+
+        def context_for(route_number: str) -> ActorContext:
+            return ActorContext(
+                actor_hash=actor_hash,
+                route_number=route_number,
+                actor_role="owner" if _is_owner_for_route(user_data, route_number) else "team_member",
+            )
+
+        _IDENTITY_CACHE[(normalized_uid, normalized_route)] = (
+            expires_at,
+            context_for(normalized_route),
+        )
+        active_route = _active_route_for_user(user_data)
+        if active_route:
+            _IDENTITY_CACHE[(normalized_uid, "")] = (
+                expires_at,
+                context_for(active_route),
+            )
+        return True
+    except Exception:
+        # Usage accounting is subordinate to authorization and product work.
+        logger.exception("Could not seed analytics identity from authorized user")
+        return False
 
 
 def _record_queued_request(item: ApiUsageRequest) -> None:

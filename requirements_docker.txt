@@ -20,6 +20,10 @@ fastapi>=0.109
 uvicorn[standard]>=0.27
 slowapi>=0.1.9
 pydantic>=2.0
+# Explicit runtime dependency for internal Ed25519 JWT verification and the
+# existing Apple server API signer; do not rely on a transitive install.
+PyJWT[crypto]>=2.8,<3
+CacheControl>=0.14,<1
 
 # Email parsing (promo listener)
 imapclient>=2.3.1

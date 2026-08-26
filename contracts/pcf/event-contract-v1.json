@@ -1,0 +1,219 @@
+{
+  "contractVersion": "pcf-event-contract-v1",
+  "selectedAt": "2026-08-20",
+  "amendedAt": "2026-08-25",
+  "scope": {
+    "productionResourcesExist": false,
+    "effectsDefaultEnabled": false,
+    "projectionSchema": "projection-event-v1.schema.json",
+    "pcfUploadSchema": "pcf-upload-settled-v1.schema.json",
+    "pcfUploadEvent": "pcf.upload.settled remains the top-level envelope owned by PCF_CLUSTER_FIRST_PROCESSING_ARCHITECTURE_PLAN.md",
+    "sideEventCollection": false,
+    "transportDelivery": "at_least_once"
+  },
+  "envelope": {
+    "schemaVersion": 1,
+    "required": [
+      "schemaVersion",
+      "sourceEventId",
+      "eventType",
+      "mutationKind",
+      "occurredAt",
+      "sourcePath",
+      "sourceRevision",
+      "entity",
+      "automationExcluded",
+      "fixture",
+      "payload"
+    ],
+    "additionalProperties": false,
+    "maximumTransportBodyBytes": 65536,
+    "payloadSource": "owning Firestore trigger before/after snapshot plus only the named exact-path enrichment for that event type",
+    "forbiddenPayload": [
+      "raw push tokens",
+      "full user documents",
+      "signed URLs",
+      "credentials",
+      "local filesystem paths"
+    ]
+  },
+  "sourceRevision": {
+    "scheme": "fsut1|<Z-normalized updateTime with 9 fractional digits>|<operation-rank>",
+    "upsertRank": 0,
+    "deleteRank": 1,
+    "upsertInput": "after snapshot updateTime",
+    "deleteInput": "before snapshot updateTime",
+    "ordering": "compare normalized updateTime, then operation rank",
+    "reason": "Firestore delivery is unordered and at-least-once. Delete oldValue has the last document updateTime, so delete rank wins that prior upsert; Firestore createTime/updateTime increases after delete/recreate, so the recreated upsert wins the tombstone.",
+    "wallClockOrCloudEventIdIsOrderingAuthority": false,
+    "cloudEventTimePurpose": "audit only"
+  },
+  "eventTypes": {
+    "projection.pcf_container.changed": {
+      "sourcePath": "routes/{route}/pcfs/{delivery}/containers/{container}",
+      "entityKeys": ["route", "delivery", "container"],
+      "upsertPayloadKeys": ["active", "loadingDate", "pageNumbers", "items"],
+      "pageNumbersRule": "sorted unique source page numbers, including pages with zero recognized items, so active image/detail serving does not lose empty pages",
+      "itemKeys": [
+        "pageNumber",
+        "itemPosition",
+        "product",
+        "description",
+        "expiryDate",
+        "visibleOnList",
+        "isLowQuantity",
+        "isShortCoded",
+        "guaranteed"
+      ],
+      "guaranteedRule": "null or exact {isGuaranteed:true, guaranteeExpiresAt:<Google RFC3339 timestamp>}; guarantee state is user-visible serving data and participates in the business hash",
+      "stableItemIdentity": ["route", "delivery", "container", "pageNumber", "itemPosition"],
+      "namedExactPathEnrichment": "parent routes/{route}/pcfs/{delivery} only when loadingDate/active state is absent from the trigger snapshots",
+      "maximumExactFirestoreReads": 1
+    },
+    "projection.pcf_delivery.changed": {
+      "sourcePath": "routes/{route}/pcfs/{delivery}",
+      "entityKeys": ["route", "delivery"],
+      "upsertPayloadKeys": ["active", "loadingDate", "status"],
+      "namedExactPathEnrichment": null,
+      "maximumExactFirestoreReads": 0
+    },
+    "projection.notification_recipient.changed": {
+      "sourcePath": "users/{userId}",
+      "entityKeys": ["userId"],
+      "upsertPayloadKeys": [
+        "enabled",
+        "expirationAlertDays",
+        "deliveryMinuteLocal",
+        "timezone",
+        "routeNumbers",
+        "hasPushToken",
+        "tokenSetHash"
+      ],
+      "routeNumbersSource": "the same primary profile.routeNumber plus profile.additionalRoutes plus routeAssignments key union used by the current access resolver",
+      "deliveryMinuteLocalRule": "integer 0 through 1439 in the named IANA zone; producer converts the existing 12-hour setting before enqueue",
+      "tokenRule": "only presence plus a domain-separated token-set hash may cross ingress; dispatch still performs one exact current-user read",
+      "ignoredBeforeEnqueue": [
+        "login timestamps",
+        "UI state",
+        "unrelated user settings",
+        "profile noise outside the notification/access fingerprint"
+      ],
+      "namedExactPathEnrichment": null,
+      "maximumExactFirestoreReads": 0
+    },
+    "projection.route_entitlement.changed": {
+      "sourcePath": "routeEntitlements/{route}",
+      "entityKeys": ["route"],
+      "upsertPayloadKeys": ["active", "ownerUserId", "entitlementFingerprint"],
+      "stripeFieldsOrSecrets": false,
+      "namedExactPathEnrichment": null,
+      "maximumExactFirestoreReads": 0
+    }
+  },
+  "businessHash": {
+    "version": "items-current-business-v2",
+    "algorithm": "SHA-256 over UTF-8 compact JSON with sorted object keys, domain-separated by version",
+    "floatsAllowed": false,
+    "arrayOrdering": "event-type normalizer sorts set-like arrays and preserves ordered item identity",
+    "computedBy": "cluster after schema/path/identity validation",
+    "included": [
+      "normalized entity identity",
+      "normalized upsert payload or explicit tombstone marker"
+    ],
+    "excluded": [
+      "sourceEventId",
+      "sourceRevision",
+      "occurredAt",
+      "Firestore updateTime/createTime/readTime",
+      "lastModified/lastUpdated/updatedAt/generatedAt",
+      "derived total/expired/expiring counts",
+      "daysLeft",
+      "signed URLs",
+      "raw push tokens",
+      "UI metadata",
+      "effect IDs and effect-owned fields"
+    ]
+  },
+  "pcfWorkInputHash": {
+    "version": "pcf-work-input-v1",
+    "computedBy": "cluster only after manifest validation",
+    "algorithm": "SHA-256 over UTF-8 Python JSON with sorted keys and compact separators",
+    "payloadKeys": ["route", "delivery", "coverageScope", "objects"],
+    "objectKeys": [
+      "containerCode",
+      "uploadPageNumber",
+      "objectPath",
+      "generation",
+      "size",
+      "md5Hash"
+    ],
+    "objectOrder": ["objectPath", "numeric generation"],
+    "uniqueIdentity": ["route", "delivery", "input_hash_version", "input_hash"],
+    "generationParticipates": true,
+    "timestampsOrUrlsParticipate": false,
+    "maximumObjectBytes": 20000000,
+    "sizeEvidence": {
+      "root": "/Volumes/Extreme SSD/routespark_offload/ocr-agent-review",
+      "measuredAt": "2026-08-20",
+      "retainedImageCount": 1186,
+      "maximumObservedBytes": 4853371,
+      "selectedLimitMargin": 4.121
+    }
+  },
+  "tombstones": {
+    "payload": null,
+    "businessPayload": ["entity", "tombstone=true"],
+    "retention": "pcf-retention-v1 itemsCurrent rules",
+    "activeIndexes": false,
+    "repair": "daily route checksum/watermark reconciliation uses the same exact fixture predicate and emits a newer source revision; updatedAt-only discovery is forbidden"
+  },
+  "semanticKeys": {
+    "databaseUnique": ["kind", "semantic_key"],
+    "expiring": {
+      "fields": ["userId", "expiryDate", "alertDays"],
+      "encoding": "compact sorted-key JSON with expiryDate YYYY-MM-DD",
+      "scheduleGenerationParticipates": false,
+      "alertDaysRange": [0, 365]
+    },
+    "lifecycle": {
+      "fields": [
+        "route",
+        "delivery",
+        "container",
+        "transitionKind",
+        "effectiveBusinessDate",
+        "sourceRevision"
+      ],
+      "encoding": "compact sorted-key JSON with effectiveBusinessDate YYYY-MM-DD",
+      "businessHashParticipates": false,
+      "sourceRevisionParticipates": true
+    }
+  },
+  "idempotency": {
+    "duplicateSourceEventId": "return the committed accepted/rejected identity without another projection or work write",
+    "olderEntityRevision": "stale_noop",
+    "equalRevisionSameMutationAndHash": "duplicate_noop",
+    "equalRevisionDifferentMutationOrHash": "persist bounded revision_conflict rejection and alert",
+    "newerUpsertSameBusinessHash": "advance entity/route watermark only; create no due work and perform no Firebase effect",
+    "newerChangedBusinessOrTombstone": "apply projection transaction and deterministically upsert affected due work",
+    "unknownSchemaOrEventType": "persist bounded deterministic rejection, alert, acknowledge transport, and do not block later route events",
+    "commitUnknownOrDependencyFailure": "return transient failure so Cloud Tasks retries"
+  },
+  "fixtures": {
+    "productionSuppressionBeforeProjection": true,
+    "excludedBy": [
+      "authoritative automationExcluded metadata plus exact fixture identity/generation",
+      "signed immutable exact fixture registry"
+    ],
+    "routeWideExclusion": false,
+    "route988200": "real entities remain production data; only signed exact fixture keys are excluded",
+    "route900000": "normal production/app-review data and observe-only for rollout, never a fixture or route exclusion",
+    "productionOutputsForbidden": ["items_current", "route checksum", "serving view", "due_work"],
+    "sandboxConsumerCanOverrideProductionSuppression": false
+  },
+  "evidence": {
+    "firestoreTriggerGuarantee": "https://firebase.google.com/docs/functions/firestore-events",
+    "firestoreDocumentTimestamps": "https://cloud.google.com/firestore/docs/reference/rest/v1/projects.databases.documents",
+    "googleFirestoreCloudEventSchema": "https://googleapis.github.io/google-cloudevents/jsonschema/google/events/cloud/firestore/v1/DocumentEventData.json"
+  }
+}

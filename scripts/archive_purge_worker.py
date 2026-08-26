@@ -34,6 +34,7 @@ EXPORT_COLLECTION = "archiveExports"
 EXPORT_LOCK_COLLECTION = "archiveExportLocks"
 PURGE_EVENT_COLLECTION = "archivePurgeEvents"
 PURGE_CHECKPOINT_COLLECTION = "archivePurgeCheckpoints"
+PURGE_CHECKPOINT_POLICY = "reprocess_current_source"
 
 POLL_SECONDS = int(os.environ.get("ARCHIVE_PURGE_POLL_SECONDS", "300"))
 MAX_DELIVERIES_PER_ROUTE_PER_CYCLE = int(os.environ.get("ARCHIVE_PURGE_ROUTE_BATCH_LIMIT", "50"))
@@ -41,8 +42,46 @@ DEFAULT_RETENTION_DAYS = int(os.environ.get("ARCHIVE_PURGE_RETENTION_DAYS_DEFAUL
 ARCHIVE_PURGE_ENABLED = os.environ.get("ARCHIVE_PURGE_ENABLED", "false").lower() == "true"
 HDD_ARCHIVE_BASE = Path(os.environ.get("PCF_ARCHIVE_PATH", "/mnt/archive/pcf/pcf_archive"))
 ARCHIVE_RUN_DIR_RE = re.compile(r"^\d{8}_\d{6}$")
+ROUTE_NUMBER_RE = re.compile(r"^\d{1,10}$")
+DELIVERY_NUMBER_RE = re.compile(r"^\d{1,20}$")
 
 logger = logging.getLogger("archive_purge_worker")
+
+
+def _validate_route_number(route_number: str) -> str:
+    value = str(route_number or "").strip()
+    if not ROUTE_NUMBER_RE.fullmatch(value):
+        raise ValueError("Invalid route identity")
+    return value
+
+
+def _validate_delivery_number(delivery_number: str) -> str:
+    value = str(delivery_number or "").strip()
+    if not DELIVERY_NUMBER_RE.fullmatch(value):
+        raise ValueError("Invalid delivery identity")
+    return value
+
+
+def _validated_delivery_identity(route_number: str, delivery_number: str) -> tuple[str, str]:
+    return _validate_route_number(route_number), _validate_delivery_number(delivery_number)
+
+
+def _hdd_route_path(route_number: str) -> Path:
+    route = _validate_route_number(route_number)
+    archive_root = HDD_ARCHIVE_BASE.resolve()
+    route_root = (archive_root / route).resolve()
+    if route_root.parent != archive_root:
+        raise ValueError("Archive route path escapes configured root")
+    return route_root
+
+
+def _hdd_delivery_path(route_number: str, delivery_number: str) -> Path:
+    route, delivery = _validated_delivery_identity(route_number, delivery_number)
+    route_root = _hdd_route_path(route)
+    delivery_path = (route_root / delivery).resolve()
+    if delivery_path.parent != route_root:
+        raise ValueError("Archive delivery path escapes configured root")
+    return delivery_path
 
 
 def configure_logging() -> None:
@@ -159,7 +198,7 @@ def _canonical_manifest_date(delivery_dir: Path) -> Optional[date]:
 
 
 def _latest_hdd_run_date(route_number: str, delivery_number: str) -> Optional[date]:
-    delivery_dir = HDD_ARCHIVE_BASE / route_number / delivery_number
+    delivery_dir = _hdd_delivery_path(route_number, delivery_number)
     if not delivery_dir.exists() or not delivery_dir.is_dir():
         return None
     runs = [
@@ -253,6 +292,7 @@ def _archive_anchor_date_for_firestore_doc(data: Dict[str, Any]) -> Optional[dat
 
 
 def _delete_firestore_delivery(db: admin_firestore.client, route_number: str, delivery_number: str) -> Dict[str, int]:
+    route_number, delivery_number = _validated_delivery_identity(route_number, delivery_number)
     delivery_ref = (
         db.collection("routes")
         .document(route_number)
@@ -273,8 +313,10 @@ def _delete_firestore_delivery(db: admin_firestore.client, route_number: str, de
 
 
 def _delete_storage_prefix(route_number: str, delivery_number: str) -> int:
+    route_number, delivery_number = _validated_delivery_identity(route_number, delivery_number)
     prefix = f"routes/{route_number}/archivedPCFs/{delivery_number}/"
     deleted = 0
+    failed = 0
     bucket = _bucket()
     for blob in bucket.list_blobs(prefix=prefix):
         try:
@@ -282,11 +324,16 @@ def _delete_storage_prefix(route_number: str, delivery_number: str) -> int:
             deleted += 1
         except Exception as exc:
             logger.warning("Failed deleting blob %s: %s", blob.name, exc)
+            failed += 1
+    if failed:
+        raise RuntimeError(
+            f"Failed deleting {failed} archived Storage object(s) for exact delivery"
+        )
     return deleted
 
 
 def _delete_hdd_delivery(route_number: str, delivery_number: str) -> bool:
-    path = HDD_ARCHIVE_BASE / route_number / delivery_number
+    path = _hdd_delivery_path(route_number, delivery_number)
     if not path.exists():
         return False
     shutil.rmtree(path, ignore_errors=False)
@@ -294,16 +341,8 @@ def _delete_hdd_delivery(route_number: str, delivery_number: str) -> bool:
 
 
 def _checkpoint_doc_id(route_number: str, delivery_number: str) -> str:
+    route_number, delivery_number = _validated_delivery_identity(route_number, delivery_number)
     return f"{route_number}_{delivery_number}"
-
-
-def _already_purged_checkpoint(db: admin_firestore.client, route_number: str, delivery_number: str) -> bool:
-    ref = db.collection(PURGE_CHECKPOINT_COLLECTION).document(_checkpoint_doc_id(route_number, delivery_number))
-    doc = ref.get()
-    if not doc.exists:
-        return False
-    data = doc.to_dict() or {}
-    return str(data.get("status") or "").strip().lower() == "completed"
 
 
 def _mark_checkpoint(
@@ -321,12 +360,17 @@ def _mark_checkpoint(
         "deliveryNumber": delivery_number,
         "status": status,
         "eventId": event_id,
+        "checkpointPolicy": PURGE_CHECKPOINT_POLICY,
         "updatedAt": admin_firestore.SERVER_TIMESTAMP,
         "workerId": WORKER_ID,
         "details": details,
     }
     if status == "completed":
         payload["purgedAt"] = admin_firestore.SERVER_TIMESTAMP
+    else:
+        # A reappeared source may be retried after an older completed checkpoint.
+        # Do not leave the old completion timestamp attached to a failed retry.
+        payload["purgedAt"] = None
     ref.set(payload, merge=True)
 
 
@@ -400,6 +444,10 @@ def _cleanup_expired_export_artifacts(db: admin_firestore.client) -> Dict[str, i
 
 
 def _process_route_purge(db: admin_firestore.client, route_number: str, route_data: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        route_number = _validate_route_number(route_number)
+    except ValueError:
+        return {"route": "invalid", "skipped": True, "reason": "invalid_route_identity"}
     if _is_route_locked(db, route_number):
         return {"route": route_number, "skipped": True, "reason": "route_locked"}
 
@@ -408,11 +456,18 @@ def _process_route_purge(db: admin_firestore.client, route_number: str, route_da
     active_ids = _active_delivery_ids(db, route_number)
 
     candidates: Dict[str, Dict[str, Any]] = {}
+    invalid_identity_count = 0
 
     # Firestore archived deliveries.
     arch_docs = db.collection("routes").document(route_number).collection("archivedPCFs").stream()
     for doc in arch_docs:
-        if doc.id in active_ids:
+        try:
+            delivery_number = _validate_delivery_number(doc.id)
+        except ValueError:
+            invalid_identity_count += 1
+            logger.warning("Skipping archived PCF with invalid delivery identity")
+            continue
+        if delivery_number in active_ids:
             continue
         data = doc.to_dict() or {}
         anchor_date = _archive_anchor_date_for_firestore_doc(data)
@@ -421,19 +476,24 @@ def _process_route_purge(db: admin_firestore.client, route_number: str, route_da
         if anchor_date > cutoff_date:
             continue
         row = candidates.setdefault(
-            doc.id,
-            {"deliveryNumber": doc.id, "sources": set(), "retentionAnchorDates": []},
+            delivery_number,
+            {"deliveryNumber": delivery_number, "sources": set(), "retentionAnchorDates": []},
         )
         row["sources"].add("firestore")
         row["retentionAnchorDates"].append(anchor_date.isoformat())
 
     # HDD archived deliveries.
-    route_dir = HDD_ARCHIVE_BASE / route_number
+    route_dir = _hdd_route_path(route_number)
     if route_dir.exists() and route_dir.is_dir():
         for item in route_dir.iterdir():
             if not item.is_dir():
                 continue
-            delivery_number = item.name
+            try:
+                delivery_number = _validate_delivery_number(item.name)
+            except ValueError:
+                invalid_identity_count += 1
+                logger.warning("Skipping archive directory with invalid delivery identity")
+                continue
             if delivery_number in active_ids:
                 continue
             latest_run_date = _latest_hdd_run_date(route_number, delivery_number)
@@ -461,6 +521,7 @@ def _process_route_purge(db: admin_firestore.client, route_number: str, route_da
             "cutoffDate": cutoff_date.isoformat(),
             "skipped": True,
             "reason": "no_candidates",
+            "invalidIdentityCount": invalid_identity_count,
         }
 
     delivery_rows = sorted(
@@ -481,6 +542,8 @@ def _process_route_purge(db: admin_firestore.client, route_number: str, route_da
             "status": "processing",
             "startedAt": admin_firestore.SERVER_TIMESTAMP,
             "candidateCount": len(delivery_rows),
+            "invalidIdentityCount": invalid_identity_count,
+            "checkpointPolicy": PURGE_CHECKPOINT_POLICY,
             "successCount": 0,
             "failureCount": 0,
         }
@@ -488,21 +551,18 @@ def _process_route_purge(db: admin_firestore.client, route_number: str, route_da
 
     success_count = 0
     failure_count = 0
-    skipped_checkpoint = 0
-
     for row in delivery_rows:
         delivery_number = row["deliveryNumber"]
         sources = set(row.get("sources") or set())
-
-        if _already_purged_checkpoint(db, route_number, delivery_number):
-            skipped_checkpoint += 1
-            continue
+        retention_anchor_dates = sorted(set(row.get("retentionAnchorDates") or []))
 
         delivery_event_ref = event_ref.collection("deliveries").document(delivery_number)
         delivery_event_ref.set(
             {
                 "deliveryNumber": delivery_number,
                 "sources": sorted(sources),
+                "retentionAnchorDates": retention_anchor_dates,
+                "checkpointPolicy": PURGE_CHECKPOINT_POLICY,
                 "status": "processing",
                 "startedAt": admin_firestore.SERVER_TIMESTAMP,
             }
@@ -516,13 +576,15 @@ def _process_route_purge(db: admin_firestore.client, route_number: str, route_da
                 "hddDeleted": False,
             }
 
+            # Storage goes first. If any exact-object deletion fails, keep the
+            # Firestore/HDD source present so the next cycle can rediscover and
+            # retry this delivery rather than stranding a Storage-only orphan.
+            stats["storageBlobsDeleted"] = _delete_storage_prefix(route_number, delivery_number)
+
             if "firestore" in sources:
                 fs_stats = _delete_firestore_delivery(db, route_number, delivery_number)
                 stats["firestoreDocsDeleted"] = fs_stats["firestoreDocsDeleted"]
                 stats["containerDocsDeleted"] = fs_stats["containerDocsDeleted"]
-
-            # Delete storage prefix regardless; it is idempotent and cleans orphaned blobs.
-            stats["storageBlobsDeleted"] = _delete_storage_prefix(route_number, delivery_number)
 
             if "hdd" in sources:
                 stats["hddDeleted"] = _delete_hdd_delivery(route_number, delivery_number)
@@ -533,7 +595,11 @@ def _process_route_purge(db: admin_firestore.client, route_number: str, route_da
                 delivery_number=delivery_number,
                 status="completed",
                 event_id=event_id,
-                details=stats,
+                details={
+                    **stats,
+                    "sources": sorted(sources),
+                    "retentionAnchorDates": retention_anchor_dates,
+                },
             )
 
             delivery_event_ref.update(
@@ -553,7 +619,11 @@ def _process_route_purge(db: admin_firestore.client, route_number: str, route_da
                 delivery_number=delivery_number,
                 status="failed",
                 event_id=event_id,
-                details={"error": message},
+                details={
+                    "error": message,
+                    "sources": sorted(sources),
+                    "retentionAnchorDates": retention_anchor_dates,
+                },
             )
             delivery_event_ref.update(
                 {
@@ -571,7 +641,8 @@ def _process_route_purge(db: admin_firestore.client, route_number: str, route_da
             "status": status,
             "successCount": success_count,
             "failureCount": failure_count,
-            "skippedCheckpointCount": skipped_checkpoint,
+            "skippedCheckpointCount": 0,
+            "checkpointPolicy": PURGE_CHECKPOINT_POLICY,
             "completedAt": admin_firestore.SERVER_TIMESTAMP,
         }
     )
@@ -583,7 +654,9 @@ def _process_route_purge(db: admin_firestore.client, route_number: str, route_da
         "status": status,
         "successCount": success_count,
         "failureCount": failure_count,
-        "skippedCheckpointCount": skipped_checkpoint,
+        "skippedCheckpointCount": 0,
+        "checkpointPolicy": PURGE_CHECKPOINT_POLICY,
+        "invalidIdentityCount": invalid_identity_count,
     }
 
 

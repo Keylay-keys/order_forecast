@@ -22,6 +22,7 @@ from pydantic import BaseModel, Field
 from ..dependencies import verify_firebase_token, require_route_access, get_firestore
 from ..middleware.rate_limit import rate_limit_history, rate_limit_write
 from ..models import ErrorResponse
+from ..route_membership import query_team_member_documents
 
 router = APIRouter()
 logger = logging.getLogger("api.team")
@@ -289,10 +290,10 @@ async def list_team_members_for_route(
     owner_routes = _owner_route_numbers(owner_data)
     owner_routes.add(route)
 
-    # Keep the route-assignment fallback during roster migration, but use the
-    # persistent owner roster as the primary source so zero-route members stay
-    # manageable. The existing scan also avoids one Firestore read per member.
-    user_docs = list(db.collection("users").stream())
+    # Keep the route-assignment fallback during roster migration, but query only
+    # the requested route. Roster-only users receive exact point reads so
+    # inactive members remain manageable without scanning every user.
+    user_docs = query_team_member_documents(db, route)
     users_by_uid = {doc.id: (doc.to_dict() or {}) for doc in user_docs}
     candidate_uids = list(roster.keys())
     for doc in user_docs:
@@ -309,6 +310,13 @@ async def list_team_members_for_route(
             continue
         if doc.id not in roster:
             candidate_uids.append(doc.id)
+
+    for uid in roster:
+        if uid in users_by_uid:
+            continue
+        roster_doc = db.collection("users").document(uid).get()
+        if roster_doc.exists:
+            users_by_uid[uid] = roster_doc.to_dict() or {}
 
     members: List[Dict[str, Any]] = []
     for uid in candidate_uids:

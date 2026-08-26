@@ -8,15 +8,18 @@ Firebase summary watermark.
 from __future__ import annotations
 
 import logging
+from copy import deepcopy
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
+from zoneinfo import ZoneInfo
 
 from psycopg2.extras import Json, RealDictCursor
 
 logger = logging.getLogger(__name__)
 
 DASHBOARD_SUMMARY_TABLE = "route_dashboard_summaries"
+BUSINESS_TIMEZONE = ZoneInfo("America/Denver")
 
 
 @dataclass(frozen=True)
@@ -151,6 +154,79 @@ def _normalize_container_row(raw: Dict[str, Any], fallback_id: str) -> Dict[str,
         "allItemsExpired": bool(raw.get("allItemsExpired")),
         "items": expiring_items,
     }
+
+
+def _parse_expiry_date(value: Any) -> Optional[date]:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    formats = ("%Y-%m-%d", "%m/%d/%Y")
+    for date_format in formats:
+        try:
+            return datetime.strptime(text, date_format).date()
+        except ValueError:
+            continue
+    return None
+
+
+def refresh_date_derived_fields(
+    payload: Dict[str, Any],
+    *,
+    today: Optional[date] = None,
+) -> Dict[str, Any]:
+    """Refresh calendar-derived fields without mutating persisted summaries.
+
+    Cleanup eligibility remains based on the raw expiry dates. This response
+    projection prevents user-visible ``daysLeft`` values from depending on a
+    write to every source container each night.
+    """
+    result = deepcopy(payload or {})
+    effective_today = today or datetime.now(BUSINESS_TIMEZONE).date()
+
+    def refresh_item(item: Any) -> None:
+        if not isinstance(item, dict):
+            return
+        expiry = _parse_expiry_date(item.get("expiryDate"))
+        if expiry is not None:
+            item["daysLeft"] = (expiry - effective_today).days
+
+    active_pcfs = result.get("activePcfs")
+    rows_have_complete_item_lists = isinstance(active_pcfs, list) and bool(active_pcfs)
+    if isinstance(active_pcfs, list):
+        for row in active_pcfs:
+            if not isinstance(row, dict):
+                rows_have_complete_item_lists = False
+                continue
+            items = row.get("items")
+            if not isinstance(items, list):
+                rows_have_complete_item_lists = False
+                continue
+            for item in items:
+                refresh_item(item)
+            valid_days = [
+                int(item["daysLeft"])
+                for item in items
+                if (
+                    isinstance(item, dict)
+                    and _parse_expiry_date(item.get("expiryDate")) is not None
+                    and isinstance(item.get("daysLeft"), int)
+                )
+            ]
+            row["expiredCount"] = sum(days <= 0 for days in valid_days)
+            row["expiringCount"] = sum(0 < days <= 7 for days in valid_days)
+            item_count = int(row.get("itemCount") or 0)
+            row["allItemsExpired"] = (
+                item_count > 0 and row["expiredCount"] >= item_count
+            )
+
+    top_level_items = result.get("expiringItems")
+    if isinstance(top_level_items, list):
+        for item in top_level_items:
+            refresh_item(item)
+
+    if rows_have_complete_item_lists:
+        result["counts"] = _build_counts(active_pcfs)
+    return result
 
 
 def _build_counts(active_pcfs: List[Dict[str, Any]]) -> Dict[str, int]:
@@ -296,7 +372,7 @@ def upsert_mirror(
 
 
 def _fresh_response(record: MirrorRecord, source_watermark: SourceWatermark, source: str) -> Dict[str, Any]:
-    payload = dict(record.payload or {})
+    payload = refresh_date_derived_fields(record.payload or {})
     generated_at = _utc_now().isoformat()
     payload["freshness"] = {
         "source": source,
@@ -317,7 +393,7 @@ def _stale_response(
     stale_reason: str,
     route_number: str,
 ) -> Dict[str, Any]:
-    payload = dict(record.payload or {}) if record else {}
+    payload = refresh_date_derived_fields(record.payload or {}) if record else {}
     generated_at = _utc_now().isoformat()
     payload.setdefault("routeNumber", record.route_number if record else route_number)
     payload.setdefault("activePcfs", [])

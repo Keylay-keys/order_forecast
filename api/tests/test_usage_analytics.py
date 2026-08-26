@@ -1,4 +1,5 @@
 import os
+import json
 import unittest
 from datetime import datetime, timezone
 from unittest.mock import patch
@@ -7,6 +8,7 @@ from fastapi import APIRouter, FastAPI, Request
 from fastapi.testclient import TestClient
 
 from order_forecast.api import usage_analytics
+from order_forecast.api import firestore_read_telemetry
 from order_forecast.api.errors import StructuredApiError, install_api_error_handlers
 from order_forecast.api.middleware.request_context import setup_request_context
 from order_forecast.api.middleware.usage_analytics import _resolve_route_template, setup_usage_analytics
@@ -117,6 +119,7 @@ class UsageAnalyticsTests(unittest.TestCase):
             "/api/catalog/starter/images/31032.png": "reference_catalog",
             "/api/orders": "orders",
             "/api/stores/123": "stores",
+            "/api/products": "catalog",
             "/api/low-quantity": "low_quantity",
             "/api/team-tasks": "team_tasks",
             "/api/transfers": "transfer_history_read",
@@ -169,6 +172,42 @@ class UsageAnalyticsTests(unittest.TestCase):
             "HTTP_422",
         )
 
+    def test_release_event_is_bounded_and_identity_free(self):
+        with patch.object(usage_analytics.logger, "info") as metric:
+            usage_analytics.emit_client_release(
+                app_version="1.2.3",
+                build_number="456",
+                platform="ios",
+                feature_key="orders",
+                status_code=200,
+            )
+            usage_analytics.emit_client_release(
+                app_version="unsafe route 989262",
+                build_number="unsafe/owner",
+                platform="private-device",
+                feature_key="private-feature",
+                status_code=999,
+            )
+
+        self.assertEqual(json.loads(metric.call_args_list[0].args[0]), {
+            "appVersion": "1.2.3",
+            "buildNumber": "456",
+            "event": "api_client_release_volume",
+            "featureKey": "orders",
+            "platform": "ios",
+            "statusFamily": "2xx",
+        })
+        self.assertEqual(json.loads(metric.call_args_list[1].args[0]), {
+            "appVersion": "unknown",
+            "buildNumber": "unknown",
+            "event": "api_client_release_volume",
+            "featureKey": "unknown",
+            "platform": "unknown",
+            "statusFamily": "unknown",
+        })
+        self.assertNotIn("989262", str(metric.call_args_list))
+        self.assertNotIn("owner", str(metric.call_args_list))
+
     def test_resolves_owner_and_team_member_from_server_data(self):
         db = _FirestoreDB(
             {
@@ -189,6 +228,89 @@ class UsageAnalyticsTests(unittest.TestCase):
         self.assertEqual(owner.actor_role, "owner")
         self.assertEqual(member.actor_role, "team_member")
         self.assertNotEqual(owner.actor_hash, member.actor_hash)
+
+    def test_identity_cache_emits_only_hit_miss_and_read_counts(self):
+        db = _FirestoreDB({
+            "owner": {"profile": {"role": "owner", "routeNumber": "989262"}},
+        })
+        with patch("order_forecast.api.dependencies.get_firestore", return_value=db), patch.dict(
+            os.environ, {"USAGE_ANALYTICS_HASH_KEY": "x" * 32}, clear=False
+        ), patch.object(firestore_read_telemetry.logger, "info") as metric:
+            first = usage_analytics._resolve_actor_context("owner", "989262")
+            second = usage_analytics._resolve_actor_context("owner", "989262")
+
+        self.assertEqual(first, second)
+        self.assertEqual(json.loads(metric.call_args_list[0].args[0]), {
+            "event": "api_firestore_shared_read_tax",
+            "source": "usage_identity",
+            "outcome": "cache_miss_context",
+            "documentGetCalls": 1,
+        })
+        self.assertEqual(json.loads(metric.call_args_list[1].args[0]), {
+            "event": "api_firestore_shared_read_tax",
+            "source": "usage_identity",
+            "outcome": "cache_hit",
+            "documentGetCalls": 0,
+        })
+        self.assertNotIn("owner", str(metric.call_args_list))
+        self.assertNotIn("989262", str(metric.call_args_list))
+
+    def test_authorized_user_seed_prevents_duplicate_analytics_user_read(self):
+        user_data = {
+            "profile": {"role": "owner", "routeNumber": "989262"},
+        }
+        with patch.dict(
+            os.environ, {"USAGE_ANALYTICS_HASH_KEY": "x" * 32}, clear=False
+        ), patch("order_forecast.api.dependencies.get_firestore") as get_firestore, patch.object(
+            firestore_read_telemetry.logger, "info"
+        ) as metric:
+            self.assertTrue(usage_analytics.seed_actor_context_from_authorized_user(
+                uid="owner",
+                authorized_route="989262",
+                user_data=user_data,
+            ))
+            exact = usage_analytics._resolve_actor_context("owner", "989262")
+            active = usage_analytics._resolve_actor_context("owner", "")
+
+        self.assertEqual(exact.route_number, "989262")
+        self.assertEqual(active.route_number, "989262")
+        self.assertEqual(exact.actor_role, "owner")
+        get_firestore.assert_not_called()
+        self.assertEqual([json.loads(call.args[0]) for call in metric.call_args_list], [
+            {
+                "event": "api_firestore_shared_read_tax",
+                "source": "usage_identity",
+                "outcome": "cache_hit",
+                "documentGetCalls": 0,
+            },
+            {
+                "event": "api_firestore_shared_read_tax",
+                "source": "usage_identity",
+                "outcome": "cache_hit",
+                "documentGetCalls": 0,
+            },
+        ])
+
+    def test_authorized_user_seed_keeps_exact_and_active_routes_distinct(self):
+        user_data = {
+            "profile": {
+                "role": "owner",
+                "routeNumber": "111111",
+                "currentRoute": "111111",
+                "additionalRoutes": ["989262"],
+            },
+        }
+        with patch.dict(os.environ, {"USAGE_ANALYTICS_HASH_KEY": "x" * 32}, clear=False):
+            self.assertTrue(usage_analytics.seed_actor_context_from_authorized_user(
+                uid="owner",
+                authorized_route="989262",
+                user_data=user_data,
+            ))
+            exact = usage_analytics._resolve_actor_context("owner", "989262")
+            active = usage_analytics._resolve_actor_context("owner", "")
+
+        self.assertEqual(exact.route_number, "989262")
+        self.assertEqual(active.route_number, "111111")
 
     def test_records_request_and_error_counts(self):
         connection = _FakeConnection()
@@ -278,9 +400,18 @@ class UsageAnalyticsTests(unittest.TestCase):
         setup_usage_analytics(app, usage_analytics.logger)
         install_api_error_handlers(app, debug_mode=False, app_logger=usage_analytics.logger)
 
-        with patch("order_forecast.api.middleware.usage_analytics.enqueue_api_request") as enqueue:
+        with patch("order_forecast.api.middleware.usage_analytics.enqueue_api_request") as enqueue, patch.object(
+            usage_analytics.logger, "info"
+        ) as release_metric:
             with TestClient(app, raise_server_exceptions=False) as client:
-                response = client.get("/api/orders/customer-order-123")
+                response = client.get(
+                    "/api/orders/customer-order-123",
+                    headers={
+                        "X-RouteSpark-App-Version": "1.2.3",
+                        "X-RouteSpark-Build-Number": "456",
+                        "X-RouteSpark-Platform": "ios",
+                    },
+                )
 
         self.assertEqual(response.status_code, 409)
         item = enqueue.call_args.args[0]
@@ -289,6 +420,14 @@ class UsageAnalyticsTests(unittest.TestCase):
         self.assertEqual(item.method, "GET")
         self.assertEqual(item.request_id, response.headers["x-request-id"])
         self.assertNotIn("customer-order-123", item.endpoint)
+        self.assertEqual(json.loads(release_metric.call_args.args[0]), {
+            "appVersion": "1.2.3",
+            "buildNumber": "456",
+            "event": "api_client_release_volume",
+            "featureKey": "orders",
+            "platform": "ios",
+            "statusFamily": "4xx",
+        })
 
     def test_route_template_fallback_matches_without_scope_route(self):
         app = FastAPI()

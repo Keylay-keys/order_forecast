@@ -12,9 +12,10 @@ from __future__ import annotations
 import os
 import time
 import logging
+from dataclasses import dataclass, field
 from pathlib import Path
 from datetime import datetime, timezone
-from typing import Optional, Dict, Any, List, Literal
+from typing import Optional, Dict, Any, List, Literal, Tuple
 from functools import lru_cache
 
 from fastapi import HTTPException, Request, Depends
@@ -22,6 +23,11 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
 import firebase_admin
 from firebase_admin import auth, credentials, firestore
+from .firestore_read_telemetry import (
+    count_firestore_document_gets,
+    emit_firestore_read_tax,
+    metered_document_get,
+)
 from .utils.client_ip import get_client_ip
 
 # =============================================================================
@@ -426,13 +432,31 @@ async def require_route_access(
     
     # Validate route_number format (prevent injection)
     if not route_number.isdigit() or len(route_number) > 10:
+        emit_firestore_read_tax(
+            source="route_access",
+            outcome="invalid_route",
+            document_get_calls=0,
+        )
         raise HTTPException(400, "Invalid route number format")
     
     # Fetch user document from Firestore (source of truth)
     user_ref = db.collection('users').document(uid)
-    user_doc = user_ref.get()
+    try:
+        user_doc = user_ref.get()
+    except Exception:
+        emit_firestore_read_tax(
+            source="route_access",
+            outcome="read_error",
+            document_get_calls=1,
+        )
+        raise
     
     if not user_doc.exists:
+        emit_firestore_read_tax(
+            source="route_access",
+            outcome="user_not_found",
+            document_get_calls=1,
+        )
         _log_access_failure(uid, route_number, "user_not_found")
         raise HTTPException(403, "Access denied")
     
@@ -440,9 +464,32 @@ async def require_route_access(
     
     # Check access (same logic as Firestore rules)
     if not has_access_to_route(user_data, route_number):
+        emit_firestore_read_tax(
+            source="route_access",
+            outcome="access_denied",
+            document_get_calls=1,
+        )
         _log_access_failure(uid, route_number, "no_route_access")
         raise HTTPException(403, "Access denied")
+
+    # Analytics is best-effort and must not perform a second user-document read
+    # after this request already fetched fresh authoritative access state.
+    try:
+        from .usage_analytics import seed_actor_context_from_authorized_user
+
+        seed_actor_context_from_authorized_user(
+            uid=uid,
+            authorized_route=route_number,
+            user_data=user_data,
+        )
+    except Exception:
+        logger.exception("Could not hand authorized identity to usage analytics")
     
+    emit_firestore_read_tax(
+        source="route_access",
+        outcome="route_access_granted",
+        document_get_calls=1,
+    )
     return user_data
 
 
@@ -521,26 +568,76 @@ def _is_owner_for_route(user_data: Dict[str, Any], route_number: str) -> bool:
     return isinstance(assignment, dict) and str(assignment.get("role") or "").strip() == "owner"
 
 
+@dataclass
+class _RequestAuthoritySnapshot:
+    """Reuse authoritative Firestore snapshots only within one API request.
+
+    A new instance is created after the requester's user document has been read
+    and authorized. It is never shared across requests, so revocation and
+    entitlement changes remain visible on the next request while one decision
+    cannot observe contradictory versions of the same authority document.
+    """
+
+    db: firestore.Client
+    documents: Dict[Tuple[str, str], Any] = field(default_factory=dict)
+
+    def get_document(self, collection: str, document_id: str) -> Any:
+        key = (collection, document_id)
+        if key not in self.documents:
+            self.documents[key] = metered_document_get(self.db, collection, document_id)
+        return self.documents[key]
+
+
+def _authority_document_get(
+    *,
+    db: firestore.Client,
+    collection: str,
+    document_id: str,
+    authority_snapshot: Optional[_RequestAuthoritySnapshot],
+) -> Any:
+    if authority_snapshot is None:
+        return metered_document_get(db, collection, document_id)
+    if authority_snapshot.db is not db:
+        raise RuntimeError("authority snapshot belongs to a different Firestore client")
+    return authority_snapshot.get_document(collection, document_id)
+
+
 def _resolve_owner_uid_for_route(
     *,
     db: firestore.Client,
     route_number: str,
     requester_uid: str,
     requester_data: Dict[str, Any],
+    authority_snapshot: Optional[_RequestAuthoritySnapshot] = None,
 ) -> str:
-    route_doc = db.collection("routes").document(route_number).get()
+    route_doc = _authority_document_get(
+        db=db,
+        collection="routes",
+        document_id=route_number,
+        authority_snapshot=authority_snapshot,
+    )
     if route_doc.exists:
         route_data = route_doc.to_dict() or {}
         owner_uid = str(route_data.get("ownerUid") or route_data.get("userId") or "").strip()
         if owner_uid:
             return owner_uid
-    ent_doc = db.collection("routeEntitlements").document(route_number).get()
+    ent_doc = _authority_document_get(
+        db=db,
+        collection="routeEntitlements",
+        document_id=route_number,
+        authority_snapshot=authority_snapshot,
+    )
     if ent_doc.exists:
         ent_data = ent_doc.to_dict() or {}
         owner_uid = str(ent_data.get("ownerUid") or "").strip()
         if owner_uid:
             return owner_uid
-    route_number_doc = db.collection("routeNumbers").document(route_number).get()
+    route_number_doc = _authority_document_get(
+        db=db,
+        collection="routeNumbers",
+        document_id=route_number,
+        authority_snapshot=authority_snapshot,
+    )
     if route_number_doc.exists:
         route_number_data = route_number_doc.to_dict() or {}
         owner_uid = str(
@@ -567,8 +664,14 @@ def _has_route_entitlement_feature(
     db: firestore.Client,
     route_number: str,
     feature_key: str,
+    authority_snapshot: Optional[_RequestAuthoritySnapshot] = None,
 ) -> bool:
-    ent_doc = db.collection("routeEntitlements").document(route_number).get()
+    ent_doc = _authority_document_get(
+        db=db,
+        collection="routeEntitlements",
+        document_id=route_number,
+        authority_snapshot=authority_snapshot,
+    )
     if not ent_doc.exists:
         return False
     data = ent_doc.to_dict() or {}
@@ -682,9 +785,16 @@ def _has_route_feature_entitlement(
     feature_key: str,
     requester_uid: str,
     requester_data: Dict[str, Any],
+    authority_snapshot: Optional[_RequestAuthoritySnapshot] = None,
 ) -> bool:
+    request_authority = authority_snapshot or _RequestAuthoritySnapshot(db=db)
     # Priority chain: routeEntitlements -> legacy subscription -> trial.
-    if _has_route_entitlement_feature(db=db, route_number=route_number, feature_key=feature_key):
+    if _has_route_entitlement_feature(
+        db=db,
+        route_number=route_number,
+        feature_key=feature_key,
+        authority_snapshot=request_authority,
+    ):
         return True
     if _has_requester_direct_feature_grant(
         route_number=route_number,
@@ -698,10 +808,13 @@ def _has_route_feature_entitlement(
         route_number=route_number,
         requester_uid=requester_uid,
         requester_data=requester_data,
+        authority_snapshot=request_authority,
     )
     owner_data: Dict[str, Any] = {}
-    if owner_uid:
-        owner_doc = db.collection("users").document(owner_uid).get()
+    if owner_uid == requester_uid:
+        owner_data = requester_data
+    elif owner_uid:
+        owner_doc = request_authority.get_document("users", owner_uid)
         if owner_doc.exists:
             owner_data = owner_doc.to_dict() or {}
     if not owner_data:
@@ -729,19 +842,24 @@ def _is_non_primary_route_locked_by_plan_tier(
     requester_uid: str,
     requester_data: Dict[str, Any],
     feature_key: str,
+    authority_snapshot: Optional[_RequestAuthoritySnapshot] = None,
 ) -> bool:
     if feature_key not in ("ordering", "forecasting", "pcfEmailImport"):
         return False
 
+    request_authority = authority_snapshot or _RequestAuthoritySnapshot(db=db)
     owner_uid = _resolve_owner_uid_for_route(
         db=db,
         route_number=route_number,
         requester_uid=requester_uid,
         requester_data=requester_data,
+        authority_snapshot=request_authority,
     )
     owner_data: Dict[str, Any] = {}
-    if owner_uid:
-        owner_doc = db.collection("users").document(owner_uid).get()
+    if owner_uid == requester_uid:
+        owner_data = requester_data
+    elif owner_uid:
+        owner_doc = request_authority.get_document("users", owner_uid)
         if owner_doc.exists:
             owner_data = owner_doc.to_dict() or {}
     if not owner_data:
@@ -752,7 +870,12 @@ def _is_non_primary_route_locked_by_plan_tier(
         return False
 
     primary_has_base_access = (
-        _has_route_entitlement_feature(db=db, route_number=primary_route, feature_key=feature_key) or
+        _has_route_entitlement_feature(
+            db=db,
+            route_number=primary_route,
+            feature_key=feature_key,
+            authority_snapshot=request_authority,
+        ) or
         _has_legacy_subscription_feature(route_number=primary_route, owner_data=owner_data, feature_key=feature_key) or
         _has_trial_feature(route_number=primary_route, owner_data=owner_data, feature_key=feature_key)
     )
@@ -760,7 +883,12 @@ def _is_non_primary_route_locked_by_plan_tier(
         return False
 
     primary_has_multi_route = (
-        _has_route_entitlement_feature(db=db, route_number=primary_route, feature_key="multiRoute") or
+        _has_route_entitlement_feature(
+            db=db,
+            route_number=primary_route,
+            feature_key="multiRoute",
+            authority_snapshot=request_authority,
+        ) or
         _has_legacy_subscription_feature(route_number=primary_route, owner_data=owner_data, feature_key="multiRoute") or
         _has_trial_feature(route_number=primary_route, owner_data=owner_data, feature_key="multiRoute")
     )
@@ -782,28 +910,49 @@ async def require_route_feature_access(
     # Safe rollout guard for beta/live compatibility.
     # Keep legacy behavior until this flag is explicitly enabled in production.
     if not ENFORCE_ROUTE_ENTITLEMENTS:
+        emit_firestore_read_tax(
+            source="feature_access",
+            outcome="enforcement_disabled",
+            document_get_calls=0,
+            feature_key=feature_key,
+        )
         return user_data
 
-    if not _has_route_feature_entitlement(
-        db=db,
-        route_number=route_number,
-        feature_key=feature_key,
-        requester_uid=decoded_token["uid"],
-        requester_data=user_data,
-    ):
-        if _is_non_primary_route_locked_by_plan_tier(
-            db=db,
-            route_number=route_number,
-            requester_uid=decoded_token["uid"],
-            requester_data=user_data,
-            feature_key=feature_key,
-        ):
-            _log_access_failure(decoded_token["uid"], route_number, "plan_downgraded_route_locked")
-            raise HTTPException(403, "plan_downgraded_route_locked")
-        _log_access_failure(decoded_token["uid"], route_number, f"missing_feature_{feature_key}")
-        raise HTTPException(403, f"{feature_key}_entitlement_required")
-
-    return user_data
+    outcome = "read_error"
+    with count_firestore_document_gets() as meter:
+        request_authority = _RequestAuthoritySnapshot(db=db)
+        try:
+            if _has_route_feature_entitlement(
+                db=db,
+                route_number=route_number,
+                feature_key=feature_key,
+                requester_uid=decoded_token["uid"],
+                requester_data=user_data,
+                authority_snapshot=request_authority,
+            ):
+                outcome = "entitlement_granted"
+                return user_data
+            if _is_non_primary_route_locked_by_plan_tier(
+                db=db,
+                route_number=route_number,
+                requester_uid=decoded_token["uid"],
+                requester_data=user_data,
+                feature_key=feature_key,
+                authority_snapshot=request_authority,
+            ):
+                outcome = "plan_downgraded_route_locked"
+                _log_access_failure(decoded_token["uid"], route_number, outcome)
+                raise HTTPException(403, outcome)
+            outcome = "entitlement_required"
+            _log_access_failure(decoded_token["uid"], route_number, f"missing_feature_{feature_key}")
+            raise HTTPException(403, f"{feature_key}_entitlement_required")
+        finally:
+            emit_firestore_read_tax(
+                source="feature_access",
+                outcome=outcome,
+                document_get_calls=meter.document_get_calls,
+                feature_key=feature_key,
+            )
 
 
 def _log_access_failure(uid: str, route_number: str, reason: str):
@@ -813,7 +962,7 @@ def _log_access_failure(uid: str, route_number: str, reason: str):
         "uid": uid,
         "route_number": route_number,
         "reason": reason,
-        "timestamp": datetime.utcnow().isoformat()
+        "timestamp": datetime.now(timezone.utc).isoformat()
     })
 
 

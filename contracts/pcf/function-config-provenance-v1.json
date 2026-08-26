@@ -1,0 +1,113 @@
+{
+  "contractVersion": "function-config-provenance-v1",
+  "selectedAt": "2026-08-20",
+  "evidence": {
+    "path": "/Volumes/Extreme SSD/routespark_offload/pcf-migration/firestore-read-redesign/P1/global/p1-low-qty-runtime-20260821T012338Z/evidence/configuration-census.json",
+    "sha256": "621405845342ace49d6e6cc45b93d36ac9975f68268ce739c9cc81074bc3be47",
+    "functionCount": 47,
+    "valuesRetained": false
+  },
+  "observedStripeDistribution": {
+    "functionsWithPlaintextApiKey": 47,
+    "functionsWithPlaintextWebhookSecret": 47,
+    "functionsWithSecretManagerApiKey": ["stripeWebhook"],
+    "functionsWithSecretManagerWebhookSecret": ["stripeWebhook"],
+    "finding": "every inventoried Function receives both plaintext Stripe values; only stripeWebhook also declares the two Secret Manager bindings"
+  },
+  "intendedStripeMatrix": {
+    "stripeWebhook": {
+      "secretManagerKeyNames": ["STRIPE_SECRET_KEY", "STRIPE_WEBHOOK_SECRET"],
+      "plaintextKeyNames": [],
+      "apiOperations": ["subscriptions.retrieve"],
+      "localCryptographicOperation": ["webhooks.constructEvent"],
+      "credentialBoundary": "API key and endpoint signing secret remain separate credentials"
+    },
+    "accountDeletionVerification": {
+      "functionNames": ["deleteAccountPreflight", "requestAccountDeletion", "processAccountDeletionRequest"],
+      "secretManagerKeyNames": ["STRIPE_SECRET_KEY"],
+      "plaintextKeyNames": [],
+      "apiOperations": ["subscriptions.retrieve"],
+      "restrictedKeyFeasibility": "select a subscriptions-read-only restricted key if Stripe Dashboard permissions express it; otherwise record the narrowest available permission"
+    },
+    "getAccountDeletionStatus": {
+      "secretManagerKeyNames": [],
+      "plaintextKeyNames": [],
+      "apiOperations": []
+    },
+    "allOtherFunctions": {
+      "secretManagerKeyNames": [],
+      "plaintextKeyNames": [],
+      "apiOperations": []
+    },
+    "clusterWebApi": {
+      "kubernetesSecret": "routespark-edge/web-api-stripe-secrets",
+      "keyNames": ["STRIPE_SECRET_KEY"],
+      "apiOperations": ["subscriptions.retrieve", "checkout.sessions.create", "billing_portal.sessions.create"],
+      "restrictedKeyFeasibility": "separate restricted key from Functions if these permissions can be expressed",
+      "existingIntegrationShape": "Stripe Checkout Sessions plus Billing Portal; preserve"
+    }
+  },
+  "graceConfig": {
+    "values": {
+      "ENABLE_GRACE_CAPTURE_EXPIRATION": "false",
+      "ENABLE_GRACE_CAPTURE_LIFECYCLE": "true",
+      "ENABLE_PCF_GRACE_CAPTURE": "true",
+      "ENABLE_POS_GRACE_CAPTURE": "true",
+      "GRACE_CAPTURE_TTL_DAYS": "30"
+    },
+    "artifacts": [
+      ["cleanupOldAlerts", "2026-08-19T15:39:48.253Z"],
+      ["completePCFUpload", "2026-08-14T02:01:34.157Z"],
+      ["monitorGraceCaptureBucketPolicy", "2026-08-09T19:07:41.473183741Z"],
+      ["monitorOcrFailures", "2026-08-11T02:47:13.816Z"],
+      ["monitorPcfUploads", "2026-08-14T18:25:31.247834480Z"],
+      ["monitorStaleUploads", "2026-08-14T02:14:55.247Z"],
+      ["normalizeContainerDoc", "2026-08-13T23:33:20.299Z"],
+      ["normalizeRouteContainers", "2026-08-13T23:33:37.143Z"],
+      ["notifyPcfUpload", "2026-08-14T18:25:27.740779865Z"],
+      ["notifyPromotedOcrFailure", "2026-08-11T02:46:43.544584038Z"],
+      ["onImageUploaded", "2026-08-14T02:14:54.004Z"],
+      ["onPCFQueueCompletionSignal", "2026-08-14T02:14:55.124Z"],
+      ["onPosInvoicePageUploaded", "2026-08-09T18:43:33.418Z"],
+      ["reconcileGraceCaptureHolds", "2026-08-14T01:26:02.349Z"],
+      ["releaseGraceCapturesOnEntitlementWrite", "2026-08-14T01:26:01.598Z"],
+      ["stampAdminAlertRetention", "2026-08-19T15:39:25.332427315Z"]
+    ],
+    "authority": "deployed artifact metadata, not source defaults or local .env"
+  },
+  "p1_5Runbook": {
+    "authorizedNow": false,
+    "preconditions": [
+      "deployable rollback artifact or approved keep-deployed exception for every Function being changed",
+      "fresh key-name-only fleet census",
+      "new Secret Manager versions stored without transcript/source exposure",
+      "consumer-specific restricted-key feasibility recorded",
+      "named release and rollback operators",
+      "explicit user rollout confirmation"
+    ],
+    "order": [
+      "declare only consumer-specific Secret Manager bindings in source",
+      "deploy and smoke-test consumer Functions one boundary at a time",
+      "explicitly delete plaintext Stripe keys from every nonconsumer Function",
+      "prove fleet-wide absence by key name and prove expected consumer bindings",
+      "create and distribute replacement API keys with the shortest possible overlap",
+      "review Stripe request logs for unexpected operations or source addresses",
+      "expire the old API key after every consumer passes",
+      "roll the webhook endpoint signing secret separately with dual-secret verification, then expire the old signing secret"
+    ],
+    "credentialRollbackAllowed": false,
+    "codeAndConfigRollbackMayRestoreOldCredential": false,
+    "webhookAndApiKeyRotatedAsOneCredential": false
+  },
+  "productionMutation": {
+    "functionsDeployed": 0,
+    "secretVersionsCreated": 0,
+    "stripeKeysRotated": 0,
+    "kubernetesSecretsChanged": 0
+  },
+  "references": [
+    "https://docs.stripe.com/keys-best-practices",
+    "https://docs.stripe.com/keys",
+    "https://docs.stripe.com/webhooks?lang=node"
+  ]
+}

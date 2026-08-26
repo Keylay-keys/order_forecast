@@ -1,0 +1,126 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://routespark.local/contracts/pcf/pcf-upload-settled-v1.schema.json",
+  "title": "RouteSpark PCF upload settled event v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "eventId",
+    "eventType",
+    "schemaVersion",
+    "route",
+    "delivery",
+    "occurredAt",
+    "sourceRevision",
+    "quietPeriodElapsed",
+    "coverageScope",
+    "manifest",
+    "sourceQueuePath",
+    "automationExcluded",
+    "fixture"
+  ],
+  "properties": {
+    "eventId": {
+      "type": "string",
+      "minLength": 8,
+      "maxLength": 256,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/+\\-]{7,255}$"
+    },
+    "eventType": { "const": "pcf.upload.settled" },
+    "schemaVersion": { "const": 1 },
+    "route": { "$ref": "#/definitions/route" },
+    "delivery": { "$ref": "#/definitions/delivery" },
+    "occurredAt": { "$ref": "#/definitions/googleTimestamp" },
+    "sourceRevision": { "$ref": "#/definitions/upsertRevision" },
+    "quietPeriodElapsed": { "const": true },
+    "coverageScope": { "const": "uploaded_manifest" },
+    "manifest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["containerCount", "pageCount", "objects"],
+      "properties": {
+        "containerCount": { "type": "integer", "minimum": 1, "maximum": 100 },
+        "pageCount": { "type": "integer", "minimum": 1, "maximum": 100 },
+        "objects": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 100,
+          "items": { "$ref": "#/definitions/manifestObject" }
+        }
+      }
+    },
+    "sourceQueuePath": {
+      "type": "string",
+      "pattern": "^pcf_processing_queue/[0-9]{1,10}/queue/[0-9]{1,20}$"
+    },
+    "automationExcluded": { "type": "boolean" },
+    "fixture": {
+      "oneOf": [
+        { "type": "null" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["identity", "generation"],
+          "properties": {
+            "identity": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._:\\-]{0,127}$"
+            },
+            "generation": { "type": "string", "minLength": 1, "maxLength": 128 }
+          }
+        }
+      ]
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "automationExcluded": { "const": true } } },
+      "then": { "properties": { "fixture": { "type": "object" } } },
+      "else": { "properties": { "fixture": { "type": "null" } } }
+    }
+  ],
+  "definitions": {
+    "route": { "type": "string", "pattern": "^[0-9]{1,10}$" },
+    "delivery": { "type": "string", "pattern": "^[0-9]{1,20}$" },
+    "googleTimestamp": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]{3}|\\.[0-9]{6}|\\.[0-9]{9})?Z$"
+    },
+    "upsertRevision": {
+      "type": "string",
+      "pattern": "^fsut1\\|[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\\.[0-9]{9}Z\\|0$"
+    },
+    "manifestObject": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "containerCode",
+        "uploadPageNumber",
+        "objectPath",
+        "generation",
+        "size",
+        "md5Hash"
+      ],
+      "properties": {
+        "containerCode": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:\\-]{0,127}$"
+        },
+        "uploadPageNumber": { "type": "integer", "minimum": 1, "maximum": 1000 },
+        "objectPath": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024,
+          "pattern": "^routes/[0-9]{1,10}/unprocessed/[0-9]{1,20}_[^/]{1,128}_page_[0-9]{1,4}\\.(?:jpg|jpeg|png)$"
+        },
+        "generation": { "type": "string", "pattern": "^[1-9][0-9]{0,19}$" },
+        "size": { "type": "integer", "minimum": 1, "maximum": 20000000 },
+        "md5Hash": { "type": "string", "pattern": "^[A-Za-z0-9+/]{22}==$" }
+      }
+    }
+  }
+}

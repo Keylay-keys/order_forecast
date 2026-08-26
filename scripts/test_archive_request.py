@@ -12,6 +12,11 @@ import uuid
 from google.cloud import firestore
 
 
+# Operator integration command, not a pytest module. Its functions require an
+# explicitly constructed production/test client from main().
+__test__ = False
+
+
 def test_list_dates(db, route_number: str = "989262"):
     """Test listing archived dates."""
     print("\n📋 Test: list_dates")
@@ -158,4 +163,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

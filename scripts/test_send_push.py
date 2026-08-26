@@ -1,81 +1,98 @@
 #!/usr/bin/env python3
-"""Send a test push notification to route 989262 owner.
+"""Explicit operator-only Expo push check.
 
-Bypasses time check and low-qty check - just tests Expo Push API.
-
-Usage:
-    python scripts/test_send_push.py
+This module is safe to import. A real push requires both ``--send-real-push``
+and ``ROUTESPARK_ALLOW_REAL_PUSH_TEST=1``. It must never be collected or used
+as part of an automated test suite.
 """
 
-import requests
-from google.cloud import firestore
+from __future__ import annotations
 
-SA_PATH = '/Users/kylemacmini/Desktop/dev/firebase-tools/routespark-1f47d-firebase-adminsdk-tnv5k-b259331cbc.json'
-TEST_ROUTE = '989262'
+import argparse
+import os
+from pathlib import Path
+from typing import Any
+
+
+__test__ = False
 EXPO_PUSH_URL = "https://exp.host/--/api/v2/push/send"
+REAL_PUSH_ENV = "ROUTESPARK_ALLOW_REAL_PUSH_TEST"
 
-print("=" * 50)
-print("Test Push Notification")
-print("=" * 50)
 
-# Connect to Firebase
-db = firestore.Client.from_service_account_json(SA_PATH)
+def _payload(token: str, route: str) -> dict[str, Any]:
+    return {
+        "to": token,
+        "title": "🧪 Test: Low Stock Alert",
+        "body": "This is a test notification from the daemon",
+        "data": {
+            "type": "low_quantity",
+            "routeNumber": route,
+            "orderDate": "2026-01-16",
+            "saps": ["TEST-SAP-001"],
+        },
+        "sound": "default",
+        "priority": "high",
+    }
 
-# Get route owner
-route_doc = db.collection("routes").document(TEST_ROUTE).get()
-owner_id = route_doc.to_dict().get("ownerUid")
-print(f"Route owner: {owner_id}")
 
-# Get FCM tokens (just use the last one - most recent device)
-user_doc = db.collection("users").document(owner_id).get()
-fcm_tokens = user_doc.to_dict().get("fcmTokens", [])
-print(f"Found {len(fcm_tokens)} tokens")
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Send one explicitly authorized real Expo test push"
+    )
+    parser.add_argument("--service-account", required=True)
+    parser.add_argument("--route", required=True)
+    parser.add_argument(
+        "--send-real-push",
+        action="store_true",
+        help="Required acknowledgement that this contacts a real device",
+    )
+    return parser.parse_args()
 
-# Use only the last token (most recent)
-if fcm_tokens:
-    token = fcm_tokens[-1]
-    print(f"Using token: {token[:40]}...")
-else:
-    print("No tokens found!")
-    exit(1)
 
-# Build test notification
-payload = {
-    "to": token,
-    "title": "🧪 Test: Low Stock Alert",
-    "body": "This is a test notification from the daemon",
-    "data": {
-        "type": "low_quantity",
-        "routeNumber": TEST_ROUTE,
-        "orderDate": "2026-01-16",
-        "saps": ["TEST-SAP-001"],
-    },
-    "sound": "default",
-    "priority": "high",
-}
+def main() -> int:
+    args = _parse_args()
+    if not args.send_real_push or os.environ.get(REAL_PUSH_ENV) != "1":
+        raise RuntimeError(
+            "real push denied: require --send-real-push and "
+            f"{REAL_PUSH_ENV}=1"
+        )
+    if not str(args.route).isdigit() or len(str(args.route)) > 10:
+        raise RuntimeError("invalid route")
 
-print(f"\nSending notification...")
-print(f"  Title: {payload['title']}")
-print(f"  Body: {payload['body']}")
+    service_account = Path(args.service_account).expanduser().resolve(strict=True)
 
-# Send
-response = requests.post(
-    EXPO_PUSH_URL,
-    json=[payload],
-    headers={"Content-Type": "application/json"},
-    timeout=10,
-)
+    # Network-capable imports and clients are deliberately inside the gated
+    # main path so pytest/import discovery cannot contact Firebase or Expo.
+    import requests
+    from google.cloud import firestore
 
-result = response.json()
-print(f"\nResponse: {response.status_code}")
-print(f"Result: {result}")
+    db = firestore.Client.from_service_account_json(str(service_account))
+    route_doc = db.collection("routes").document(str(args.route)).get()
+    if not route_doc.exists:
+        raise RuntimeError("route not found")
+    owner_id = str((route_doc.to_dict() or {}).get("ownerUid") or "").strip()
+    if not owner_id:
+        raise RuntimeError("route owner not found")
 
-if "data" in result and result["data"]:
-    status = result["data"][0].get("status")
-    if status == "ok":
-        print("\n✅ Push notification sent successfully!")
-        print("   Check your device for the notification.")
-    else:
-        print(f"\n❌ Push failed: {result['data'][0]}")
-else:
-    print(f"\n⚠️ Unexpected response: {result}")
+    user_doc = db.collection("users").document(owner_id).get()
+    tokens = list((user_doc.to_dict() or {}).get("fcmTokens") or [])
+    if not tokens:
+        raise RuntimeError("route owner has no push token")
+
+    response = requests.post(
+        EXPO_PUSH_URL,
+        json=[_payload(str(tokens[-1]), str(args.route))],
+        headers={"Content-Type": "application/json"},
+        timeout=10,
+    )
+    response.raise_for_status()
+    result = response.json()
+    receipt = result.get("data") if isinstance(result, dict) else None
+    if not isinstance(receipt, list) or not receipt or receipt[0].get("status") != "ok":
+        raise RuntimeError("Expo did not accept the test push")
+    print("Real test push accepted by Expo")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

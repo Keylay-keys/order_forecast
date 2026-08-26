@@ -18,6 +18,17 @@ class _FakeAdjustmentRef:
 
 
 class TestReallocationListenerRouting(unittest.TestCase):
+    def test_seen_key_is_full_route_scoped_path_not_bare_order_id(self):
+        first = mock.Mock()
+        first.reference.path = "routes/988200/orders/order-shared"
+        second = mock.Mock()
+        second.reference.path = "routes/989262/orders/order-shared"
+
+        self.assertNotEqual(
+            listener._order_event_key(first),
+            listener._order_event_key(second),
+        )
+
     def test_route_988200_order_modified_event_never_replays_finalization(self):
         order = {
             "routeNumber": ROUTE_NUMBER,

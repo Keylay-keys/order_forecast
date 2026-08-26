@@ -1,0 +1,114 @@
+{
+  "contractVersion": "pcf-fixture-v1",
+  "selectedAt": "2026-08-21",
+  "productionProject": "routespark-1f47d",
+  "execution": {
+    "mode": "dedicated_firebase_test_project_selected",
+    "dedicatedProjectId": "routespark-pcf-test-20260820",
+    "dedicatedProjectNumber": "901720710978",
+    "firestoreLocation": "nam5",
+    "firestoreDeleteProtection": true,
+    "billingEnabled": false,
+    "billingMutationAuthorized": false,
+    "billingInstructionRecordedAt": "2026-08-21",
+    "billingInstruction": "Do not link, unlink, transfer, or otherwise alter billing for any project as part of this implementation.",
+    "cloudFunctionsDeployRollbackProof": "blocked_pending_separate_billing_authority",
+    "fixtureWritesAllowed": true,
+    "fixtureWritesAllowedOnlyWhenRuntimeProjectIdMatchesDedicatedProjectId": true,
+    "enablementRequiresOperatorApproval": false,
+    "operatorApprovalRecordedAt": "2026-08-21",
+    "productionRoute988200FixtureWritesAllowed": false,
+    "productionRoute989262FixtureWritesAllowed": false,
+    "route900000Use": "never_fixture_or_canary_observe_only"
+  },
+  "identity": {
+    "automationMarkerPaths": ["automationExcluded", "metadata.automationExcluded"],
+    "fixtureMarkerPaths": ["fixture", "metadata.fixture"],
+    "fixtureMarkerExactKeys": ["identity", "generation"],
+    "rule": "exactly one or two identical fixture markers plus at least one true automation marker; registry path, identity, and generation must all match",
+    "booleanFixtureMarkersAccepted": false,
+    "automationMarkerWithoutExactIdentityAccepted": false,
+    "conflictingTopLevelAndNestedMarkersAccepted": false,
+    "routeWideExclusionAllowed": false
+  },
+  "reservedFixture": {
+    "identity": "pcf-p2-988200-20260820-01",
+    "generation": "1",
+    "route": "988200",
+    "delivery": "990000000001",
+    "container": "FX-P2-01",
+    "paths": [
+      "routes/988200/pcfs/990000000001",
+      "routes/988200/pcfs/990000000001/containers/FX-P2-01",
+      "pcf_processing_queue/988200/queue/990000000001",
+      "routes/988200/unprocessed/990000000001_FX-P2-01_page_1.jpg"
+    ],
+    "reservationMeaning": "names only; no Firebase or Storage object exists or is claimed to exist",
+    "createPolicy": "create-only in routespark-pcf-test-20260820 after runtime project-number read-back; refuse if any exact destination exists"
+  },
+  "testVectors": [
+    {
+      "name": "canonical_top_level",
+      "document": {
+        "automationExcluded": true,
+        "fixture": {"identity": "pcf-p2-988200-20260820-01", "generation": "1"}
+      },
+      "expected": "valid_fixture"
+    },
+    {
+      "name": "canonical_nested",
+      "document": {
+        "metadata": {
+          "automationExcluded": true,
+          "fixture": {"identity": "pcf-p2-988200-20260820-01", "generation": "1"}
+        }
+      },
+      "expected": "valid_fixture"
+    },
+    {
+      "name": "matching_top_level_and_nested",
+      "document": {
+        "automationExcluded": true,
+        "fixture": {"identity": "pcf-p2-988200-20260820-01", "generation": "1"},
+        "metadata": {
+          "automationExcluded": true,
+          "fixture": {"identity": "pcf-p2-988200-20260820-01", "generation": "1"}
+        }
+      },
+      "expected": "valid_fixture"
+    },
+    {
+      "name": "real_same_route_negative_control",
+      "document": {"routeNumber": "988200", "automationExcluded": false},
+      "expected": "ordinary_data"
+    },
+    {
+      "name": "marker_without_identity",
+      "document": {"automationExcluded": true},
+      "expected": "invalid_fixture_marker"
+    },
+    {
+      "name": "legacy_boolean_fixture",
+      "document": {"automationExcluded": true, "fixture": true},
+      "expected": "invalid_fixture_marker"
+    },
+    {
+      "name": "identity_without_exclusion",
+      "document": {
+        "fixture": {"identity": "pcf-p2-988200-20260820-01", "generation": "1"}
+      },
+      "expected": "invalid_fixture_marker"
+    },
+    {
+      "name": "conflicting_nested_generation",
+      "document": {
+        "automationExcluded": true,
+        "fixture": {"identity": "pcf-p2-988200-20260820-01", "generation": "1"},
+        "metadata": {
+          "fixture": {"identity": "pcf-p2-988200-20260820-01", "generation": "2"}
+        }
+      },
+      "expected": "invalid_fixture_marker"
+    }
+  ]
+}

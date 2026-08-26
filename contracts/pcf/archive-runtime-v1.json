@@ -1,0 +1,52 @@
+{
+  "contractVersion": "archive-runtime-v1",
+  "observedAt": "2026-08-20",
+  "authorities": [
+    {
+      "id": "com.routespark.pcf-archive-sync-cluster",
+      "productLabel": "Archive Fresh",
+      "kind": "macOS LaunchAgent cluster archive copier",
+      "liveState": "loaded_interval_job_between_runs",
+      "intervalSeconds": 172800,
+      "lastExitCode": 0,
+      "lastLogSuccess": "2026-08-20T15:14:27-06:00",
+      "target": "cluster archive /mnt/archive/pcf/pcf_archive",
+      "deleteLocal": true,
+      "decision": "retain as the sole loaded Mac PCF archive copier; do not duplicate"
+    },
+    {
+      "id": "com.routespark.pcf-archive-sync",
+      "productLabel": "Dell-target archive copier",
+      "kind": "macOS LaunchAgent Dell archive copier",
+      "liveState": "disabled_and_unloaded",
+      "intervalSeconds": 172800,
+      "target": "Dell archive /mnt/archive/pcf/pcf_archive",
+      "deleteLocal": true,
+      "decision": "keep disabled; do not enable as a backup-posture shortcut because it competes for the same delete-local source"
+    },
+    {
+      "id": "routespark-events/archive-purge",
+      "productLabel": "Archive Purge",
+      "kind": "Kubernetes production retention CronJob",
+      "liveState": "enabled",
+      "scheduleUtc": "17 3 * * *",
+      "concurrencyPolicy": "Forbid",
+      "lastScheduleTime": "2026-08-20T03:17:00Z",
+      "lastSuccessfulTime": "2026-08-20T03:17:34Z",
+      "deleteLocal": true,
+      "decision": "retain as live production retention; recent success proves execution, not candidate/deletion correctness"
+    }
+  ],
+  "separateSystem": {
+    "id": "com.routespark.dell-postgres-daily",
+    "purpose": "verified Postgres backup",
+    "notArchiveFreshOrPurge": true,
+    "dailyPostureDecisionOwnedBy": "backup receipt and <=24-hour TTL gate"
+  },
+  "changeGate": {
+    "recensusAllThreeBeforeChange": true,
+    "twoDeleteLocalCopiersMayRunTogether": false,
+    "recentWidgetDateProvesContentCompleteness": false,
+    "productionMutationPerformedInP1": false
+  }
+}

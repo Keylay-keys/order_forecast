@@ -1,0 +1,76 @@
+{
+  "contractVersion": "notification-sink-v1",
+  "selectedAt": "2026-08-20",
+  "defaultMode": "effect_disabled",
+  "p1RuntimeExpoTransportExists": false,
+  "effectDisabled": {
+    "input": ["redacted_envelope", "scripted_ticket_classification"],
+    "redactedEnvelope": [
+      "semantic_key",
+      "source_revision",
+      "due_at_utc",
+      "attempt_id",
+      "recipient_aggregate_hash",
+      "title",
+      "body",
+      "data",
+      "token_fingerprints",
+      "token_count",
+      "payload_hash"
+    ],
+    "recipientCountMeaning": "total semantic-dispatch audience; not capped by the 100-message provider request batch",
+    "rawTokensAccepted": false,
+    "messageBodiesAccepted": true,
+    "evidenceSerialization": "canonical UTF-8 JSON with lexicographically sorted keys and no insignificant whitespace",
+    "tokenFingerprint": "lowercase HMAC-SHA-256 with an injected key of at least 32 bytes; key and raw token are never returned, logged, or persisted",
+    "outboundCalls": 0,
+    "disposition": "effect_disabled"
+  },
+  "futureExpoAdapter": {
+    "transport": "injected only after P5 gates",
+    "maximumMessagesPerRequest": 100,
+    "maximumReceiptIdsPerRequest": 1000,
+    "requestTimeoutSeconds": 10,
+    "chunkFailure": "the semantic dispatch is terminal-ambiguous; retain all proven accepted ticket IDs and never resend automatically",
+    "acceptedTicketPersistence": "commit ticket IDs against dispatch claim before terminal sent",
+    "receiptLookup": "by ticket ID, never response order",
+    "rawTokenPersistenceOrLogging": false
+  },
+  "ticketDispositions": {
+    "accepted": "at least one status=ok ticket with a non-empty ID; deterministic per-token rejections do not make the healthy acceptance ambiguous",
+    "proven_zero_accepted": "a complete count-matched response contains only well-formed status=error tickets",
+    "request_rejected_zero_accepted": "a complete provider response contains only top-level request errors and no data",
+    "ambiguous": "timeout, connection reset, invalid JSON, count mismatch, unknown ticket shape, status=ok without ID, or accepted-ticket persistence failure"
+  },
+  "receiptDispositions": {
+    "ok": "provider accepted delivery",
+    "missing": "pending; never resend the accepted semantic notification",
+    "error": "failed receipt; never resend the accepted semantic notification",
+    "DeviceNotRegistered": "remove only the mapped invalid token after current-user CAS/read",
+    "malformed": "alert and retain terminal accepted/ambiguous posture; never infer zero acceptance"
+  },
+  "stateMachineBoundary": {
+    "dispatchingBeforeHttp": true,
+    "acceptedTicketMeansTerminalSend": true,
+    "partialAcceptanceMeansTerminalSend": true,
+    "transportAmbiguityAutomaticallyRetries": false,
+    "receiptFailureAutomaticallyRetries": false,
+    "zeroAcceptanceRetryDeadlineOwnedBy": "R12"
+  },
+  "fixtureProvenance": {
+    "path": "notification-sink-provider-fixtures-v1.json",
+    "sourceKind": "official_provider_contract",
+    "provider": "Expo Push Service HTTP/2 API",
+    "providerDocumentationObservedAt": "2026-08-20",
+    "providerDocumentation": "https://docs.expo.dev/push-notifications/sending-notifications/",
+    "checkedInNodeSdk": "expo-server-sdk@4.0.0",
+    "rareProviderShapes": "official documented ticket and receipt examples",
+    "faultShapes": "injected timeout, malformed JSON, count mismatch, and chunk failure tests"
+  },
+  "rollout": {
+    "productionEffectEnabled": false,
+    "route988200": "sink only until P5 exact-key gate",
+    "route989262": "shadow only until P5 exact-key gate",
+    "route900000": "observe existing behavior; never use as notification canary"
+  }
+}

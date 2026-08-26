@@ -1,0 +1,317 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://routespark.local/contracts/pcf/projection-event-v1.schema.json",
+  "title": "RouteSpark normalized projection mutation event v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "sourceEventId",
+    "eventType",
+    "mutationKind",
+    "occurredAt",
+    "sourcePath",
+    "sourceRevision",
+    "entity",
+    "automationExcluded",
+    "fixture",
+    "payload"
+  ],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "sourceEventId": {
+      "type": "string",
+      "minLength": 8,
+      "maxLength": 256,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/+\\-]{7,255}$"
+    },
+    "eventType": {
+      "enum": [
+        "projection.pcf_container.changed",
+        "projection.pcf_delivery.changed",
+        "projection.notification_recipient.changed",
+        "projection.route_entitlement.changed"
+      ]
+    },
+    "mutationKind": { "enum": ["upsert", "delete"] },
+    "occurredAt": { "$ref": "#/definitions/googleTimestamp" },
+    "sourcePath": { "type": "string", "minLength": 3, "maxLength": 512 },
+    "sourceRevision": { "$ref": "#/definitions/sourceRevision" },
+    "entity": { "type": "object" },
+    "automationExcluded": { "type": "boolean" },
+    "fixture": {
+      "oneOf": [
+        { "type": "null" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["identity", "generation"],
+          "properties": {
+            "identity": { "$ref": "#/definitions/entityId" },
+            "generation": { "type": "string", "minLength": 1, "maxLength": 128 }
+          }
+        }
+      ]
+    },
+    "payload": {}
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "mutationKind": { "const": "delete" } } },
+      "then": { "properties": { "payload": { "type": "null" } } },
+      "else": { "properties": { "payload": { "type": "object" } } }
+    },
+    {
+      "if": { "properties": { "automationExcluded": { "const": true } } },
+      "then": { "properties": { "fixture": { "type": "object" } } },
+      "else": { "properties": { "fixture": { "type": "null" } } }
+    },
+    {
+      "oneOf": [
+        {
+          "properties": {
+            "eventType": { "const": "projection.pcf_container.changed" },
+            "sourcePath": {
+              "pattern": "^routes/[0-9]{1,10}/pcfs/[A-Za-z0-9][A-Za-z0-9._:\\-]{0,127}/containers/[A-Za-z0-9][A-Za-z0-9._:\\-]{0,127}$"
+            },
+            "entity": { "$ref": "#/definitions/containerEntity" },
+            "payload": {
+              "oneOf": [
+                { "type": "null" },
+                { "$ref": "#/definitions/containerPayload" }
+              ]
+            }
+          }
+        },
+        {
+          "properties": {
+            "eventType": { "const": "projection.pcf_delivery.changed" },
+            "sourcePath": {
+              "pattern": "^routes/[0-9]{1,10}/pcfs/[A-Za-z0-9][A-Za-z0-9._:\\-]{0,127}$"
+            },
+            "entity": { "$ref": "#/definitions/deliveryEntity" },
+            "payload": {
+              "oneOf": [
+                { "type": "null" },
+                { "$ref": "#/definitions/deliveryPayload" }
+              ]
+            }
+          }
+        },
+        {
+          "properties": {
+            "eventType": { "const": "projection.notification_recipient.changed" },
+            "sourcePath": {
+              "pattern": "^users/[A-Za-z0-9][A-Za-z0-9._:\\-]{0,127}$"
+            },
+            "entity": { "$ref": "#/definitions/userEntity" },
+            "payload": {
+              "oneOf": [
+                { "type": "null" },
+                { "$ref": "#/definitions/recipientPayload" }
+              ]
+            }
+          }
+        },
+        {
+          "properties": {
+            "eventType": { "const": "projection.route_entitlement.changed" },
+            "sourcePath": { "pattern": "^routeEntitlements/[0-9]{1,10}$" },
+            "entity": { "$ref": "#/definitions/routeEntity" },
+            "payload": {
+              "oneOf": [
+                { "type": "null" },
+                { "$ref": "#/definitions/entitlementPayload" }
+              ]
+            }
+          }
+        }
+      ]
+    }
+  ],
+  "definitions": {
+    "route": { "type": "string", "pattern": "^[0-9]{1,10}$" },
+    "entityId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:\\-]{0,127}$"
+    },
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "date": {
+      "oneOf": [
+        { "type": "null" },
+        { "type": "string", "format": "date" }
+      ]
+    },
+    "googleTimestamp": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]{3}|\\.[0-9]{6}|\\.[0-9]{9})?Z$"
+    },
+    "sourceRevision": {
+      "type": "string",
+      "pattern": "^fsut1\\|[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\\.[0-9]{9}Z\\|[01]$"
+    },
+    "containerEntity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["route", "delivery", "container"],
+      "properties": {
+        "route": { "$ref": "#/definitions/route" },
+        "delivery": { "$ref": "#/definitions/entityId" },
+        "container": { "$ref": "#/definitions/entityId" }
+      }
+    },
+    "deliveryEntity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["route", "delivery"],
+      "properties": {
+        "route": { "$ref": "#/definitions/route" },
+        "delivery": { "$ref": "#/definitions/entityId" }
+      }
+    },
+    "userEntity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["userId"],
+      "properties": { "userId": { "$ref": "#/definitions/entityId" } }
+    },
+    "routeEntity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["route"],
+      "properties": { "route": { "$ref": "#/definitions/route" } }
+    },
+    "containerItem": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "pageNumber",
+        "itemPosition",
+        "product",
+        "description",
+        "expiryDate",
+        "visibleOnList",
+        "isLowQuantity",
+        "isShortCoded",
+        "guaranteed"
+      ],
+      "properties": {
+        "pageNumber": { "type": "integer", "minimum": 1, "maximum": 1000 },
+        "itemPosition": { "type": "integer", "minimum": 0, "maximum": 9999 },
+        "product": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "description": { "type": "string", "maxLength": 512 },
+        "expiryDate": { "$ref": "#/definitions/date" },
+        "visibleOnList": { "type": "boolean" },
+        "isLowQuantity": { "type": "boolean" },
+        "isShortCoded": { "type": "boolean" },
+        "guaranteed": {
+          "oneOf": [
+            { "type": "null" },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["isGuaranteed", "guaranteeExpiresAt"],
+              "properties": {
+                "isGuaranteed": { "const": true },
+                "guaranteeExpiresAt": { "$ref": "#/definitions/googleTimestamp" }
+              }
+            }
+          ]
+        }
+      }
+    },
+    "containerPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["active", "loadingDate", "pageNumbers", "items"],
+      "properties": {
+        "active": { "type": "boolean" },
+        "loadingDate": { "$ref": "#/definitions/date" },
+        "pageNumbers": {
+          "type": "array",
+          "uniqueItems": true,
+          "maxItems": 1000,
+          "items": { "type": "integer", "minimum": 1, "maximum": 1000 }
+        },
+        "items": {
+          "type": "array",
+          "maxItems": 5000,
+          "items": { "$ref": "#/definitions/containerItem" }
+        }
+      }
+    },
+    "deliveryPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["active", "loadingDate", "status"],
+      "properties": {
+        "active": { "type": "boolean" },
+        "loadingDate": { "$ref": "#/definitions/date" },
+        "status": {
+          "oneOf": [
+            { "type": "null" },
+            { "type": "string", "minLength": 1, "maxLength": 64 }
+          ]
+        }
+      }
+    },
+    "recipientPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "enabled",
+        "expirationAlertDays",
+        "deliveryMinuteLocal",
+        "timezone",
+        "routeNumbers",
+        "hasPushToken",
+        "tokenSetHash"
+      ],
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "expirationAlertDays": {
+          "oneOf": [
+            { "type": "null" },
+            { "type": "integer", "minimum": 0, "maximum": 365 }
+          ]
+        },
+        "deliveryMinuteLocal": {
+          "oneOf": [
+            { "type": "null" },
+            { "type": "integer", "minimum": 0, "maximum": 1439 }
+          ]
+        },
+        "timezone": { "type": "string", "minLength": 1, "maxLength": 255 },
+        "routeNumbers": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "$ref": "#/definitions/route" }
+        },
+        "hasPushToken": { "type": "boolean" },
+        "tokenSetHash": {
+          "oneOf": [
+            { "type": "null" },
+            { "$ref": "#/definitions/sha256" }
+          ]
+        }
+      }
+    },
+    "entitlementPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["active", "ownerUserId", "entitlementFingerprint"],
+      "properties": {
+        "active": { "type": "boolean" },
+        "ownerUserId": {
+          "oneOf": [
+            { "type": "null" },
+            { "$ref": "#/definitions/entityId" }
+          ]
+        },
+        "entitlementFingerprint": { "$ref": "#/definitions/sha256" }
+      }
+    }
+  }
+}

@@ -1,0 +1,99 @@
+{
+  "contractVersion": "check-expiring-rollback-v35",
+  "observedAt": "2026-08-21T03:01:44Z",
+  "state": "sanitized_deployable_source_captured_restore_drill_pending",
+  "function": {
+    "name": "projects/routespark-1f47d/locations/us-central1/functions/checkExpiringItems",
+    "status": "ACTIVE",
+    "versionId": "35",
+    "buildId": "39858d7d-ca48-4d8f-837a-5b8fb8d5b8ac",
+    "firebaseFunctionsHash": "f028dd932dd398f627bc53a88bce8e829024909a",
+    "runtime": "nodejs22",
+    "entryPoint": "checkExpiringItems",
+    "serviceAccountEmail": "routespark-1f47d@appspot.gserviceaccount.com",
+    "timeout": "60s",
+    "updateTime": "2026-03-14T18:17:57.449Z",
+    "triggerTopic": "projects/routespark-1f47d/topics/firebase-schedule-checkExpiringItems-us-central1",
+    "plaintextEnvironmentKeyNames": ["STRIPE_SECRET_KEY", "STRIPE_WEBHOOK_SECRET"],
+    "plaintextEnvironmentValuesRetained": false
+  },
+  "scheduler": {
+    "name": "projects/routespark-1f47d/locations/us-central1/jobs/firebase-schedule-checkExpiringItems-us-central1",
+    "state": "ENABLED",
+    "schedule": "0 6,18 * * *",
+    "timeZone": "UTC",
+    "topic": "projects/routespark-1f47d/topics/firebase-schedule-checkExpiringItems-us-central1"
+  },
+  "rollbackWhileV35RemainsDeployed": {
+    "pauseCommand": "gcloud scheduler jobs pause firebase-schedule-checkExpiringItems-us-central1 --project routespark-1f47d --location us-central1",
+    "resumeCommand": "gcloud scheduler jobs resume firebase-schedule-checkExpiringItems-us-central1 --project routespark-1f47d --location us-central1",
+    "safeWithoutSourceArchive": true,
+    "condition": "P1.5 and later work must not replace or delete deployed v35"
+  },
+  "sourceArchive": {
+    "objectIdentityRecorded": true,
+    "objectIdentityRetainedOutsideThisContract": false,
+    "operatorDownloadResult": "403 storage.objects.get denied",
+    "firebaseAdminDownloadResult": "403 storage.objects.get denied",
+    "generateDownloadUrlResult": "authorized exact version 35 download succeeded four times; unsafe originals and all failed temporary outputs were deleted",
+    "safeRetentionScan": {
+      "attemptCount": 4,
+      "archiveTooLarge": false,
+      "oversizedMemberCount": 0,
+      "forbiddenMemberNameCount": 1,
+      "forbiddenContentFileCount": 1,
+      "forbiddenContentMarkerClasses": [
+        "stripe_live_secret",
+        "stripe_webhook_secret"
+      ],
+      "secretValuesPrintedOrRetained": false,
+      "signedDownloadUrlPrintedOrRetained": false
+    },
+    "sanitizedArtifact": {
+      "path": "/Volumes/Extreme SSD/routespark_offload/pcf-migration/firestore-read-redesign/P1/global/p1-check-expiring-v35-20260821T030144Z/checkExpiringItems-v35-source-sanitized.zip",
+      "sha256": "dffe13d969f702472b1a2442e54fe976c728f4751124cd8fd0b756f26781667f",
+      "bytes": 400411,
+      "retainedMemberCount": 109,
+      "excludedEnvMemberCount": 1,
+      "independentCrcCheckPassed": true,
+      "independentSafeRetentionRescanPassed": true,
+      "packageJsonPresent": true,
+      "packageLockPresent": true,
+      "tsconfigPresent": true,
+      "sourceAndCompiledEntryPointsPresent": true,
+      "cleanInstallAndTypeScriptBuildPassed": true,
+      "buildNodeVersions": ["23.10.0", "22.23.2"],
+      "declaredAndDeployedNodeMajor": 22,
+      "runtimeMajorEquivalentBuildPassed": true,
+      "runtimeEquivalentRestoreDrillPassed": false,
+      "secretValuesRetained": false
+    },
+    "localImmutableCopyExists": true,
+    "deployableRollbackArtifactExists": true,
+    "iamWasBroadened": false
+  },
+  "p1_5Gate": {
+    "maySanitizeThisFunctionBeforeDeployableRollbackExists": false,
+    "deployableRollbackPreconditionMet": true,
+    "mayMutateProductionBeforeRuntimeEquivalentRestoreDrillAndApproval": false,
+    "allowedClosures": [
+      "prove the captured sanitized source in the dedicated test project on Node 22, including schedule-disabled notification behavior and rollback commands",
+      "exclude this still-deployed legacy Function from sanitation until P5 retirement under an explicitly approved narrow exception",
+      "retain the exact artifact only in an approved secrets-controlled vault and prove an operator can restore it without exposing embedded credentials"
+    ],
+    "julyRepositorySourceAcceptedAsRollback": false,
+    "buildIdAndLabelHashAloneAcceptedAsDeployableSource": false
+  },
+  "securityIncidentAccounting": {
+    "metadataCommandReturnedPlaintextSecretValues": true,
+    "valuesCopiedIntoArtifactOrSource": false,
+    "rotationPerformed": false,
+    "rotationOwnedBy": "controlled P1.5 trust-boundary sanitation; preserve working Stripe integration"
+  },
+  "productionMutation": {
+    "functionChanged": false,
+    "schedulerChanged": false,
+    "iamChanged": false,
+    "stripeChanged": false
+  }
+}

@@ -1,0 +1,91 @@
+{
+  "contractVersion": "pcf-projection-evidence-v1",
+  "decisions": {
+    "D3": "dedicated_cluster_effect_worker_and_identities",
+    "D4": "external_drive_evidence_authority"
+  },
+  "projectionBoundary": {
+    "namespace": "routespark-events",
+    "deployment": "pcf-effect-worker",
+    "firebaseIdentity": "routespark-pcf-projection-fb@routespark-1f47d.iam.gserviceaccount.com",
+    "projectRoles": ["roles/datastore.user"],
+    "firestorePathScopeClaimed": false,
+    "applicationWriteAllowlist": [
+      "pcf_processing_queue/{route}/queue/{delivery}",
+      "routes/{route}/pcf/{delivery}",
+      "routes/{route}/pcf/{delivery}/containers/{container}",
+      "routeDashboardSummaries/{route}",
+      "routeDashboardSummaries/{route}/containers/{container}",
+      "admin_alerts/{deterministicAlertId}"
+    ],
+    "forbidden": [
+      "Firebase Auth administration",
+      "unscoped Firestore discovery",
+      "Cloud Storage create/update",
+      "direct Mac Firebase writes",
+      "effect execution unless PCF_FIREBASE_WRITE_AUTHORITY=cluster",
+      "effect execution unless PCF_CLUSTER_STAGE=projection"
+    ]
+  },
+  "storageBoundaries": {
+    "claimUrlSigner": {
+      "identity": "routespark-pcf-object-signer@routespark-1f47d.iam.gserviceaccount.com",
+      "customRole": "projects/routespark-1f47d/roles/routesparkPcfObjectReader",
+      "permissions": ["storage.objects.get"],
+      "bucketCondition": "resource.name.startsWith('projects/_/buckets/routespark-1f47d.firebasestorage.app/objects/routes/')",
+      "callerBinding": "roles/iam.serviceAccountTokenCreator granted only to routespark-pcf-projection-fb on this service account",
+      "allowedMethod": "GET",
+      "generationRequired": true,
+      "privateKeyFile": false
+    },
+    "exactCleaner": {
+      "identity": "routespark-pcf-object-cleaner@routespark-1f47d.iam.gserviceaccount.com",
+      "customRole": "projects/routespark-1f47d/roles/routesparkPcfObjectCleaner",
+      "permissions": ["storage.objects.get", "storage.objects.delete"],
+      "bucketCondition": "resource.name.startsWith('projects/_/buckets/routespark-1f47d.firebasestorage.app/objects/routes/')",
+      "callerBinding": "roles/iam.serviceAccountTokenCreator granted only to routespark-pcf-projection-fb on this service account",
+      "generationPreconditionRequired": true,
+      "prefixOrBulkDeleteForbidden": true
+    }
+  },
+  "workerBoundary": {
+    "macPrincipal": "pcf-macos-vision-01",
+    "firebaseCredential": false,
+    "postgresCredential": false,
+    "storageCredential": false,
+    "input": "frozen claim plus exact generation-bound signed GET URLs",
+    "output": "structured proposal and external evidence references through authenticated result API"
+  },
+  "evidenceAuthority": {
+    "root": "/Volumes/Extreme SSD/routespark_offload/ocr-agent-review",
+    "owner": "Mac OCR/review workflow",
+    "packageIdentity": ["route", "delivery", "inputHashVersion", "inputHash"],
+    "requiredBeforeProjection": [
+      "exact source-object inventory with Storage generations",
+      "source image bytes copied under evidence/images",
+      "SHA-256 for every copied image",
+      "before payload",
+      "proposed result and confidence evidence",
+      "manifest containing hashes of package artifacts"
+    ],
+    "requiredBeforeCleanup": [
+      "projection write completed",
+      "independent exact Firebase read-back passed",
+      "evidence image hashes re-verified",
+      "exact source generation still matches"
+    ],
+    "failureMode": "block before projection or cleanup",
+    "overwriteExistingPackage": false,
+    "postgresStores": ["package identity", "manifest SHA-256", "relative evidence references"],
+    "postgresIsEvidenceAuthority": false,
+    "clusterStorageIsEvidenceAuthority": false,
+    "automaticEvidenceDeletion": false
+  },
+  "rollout": {
+    "productionResourcesExist": false,
+    "provisionOnlyAfterP1_5": true,
+    "effectsDefaultEnabled": false,
+    "routeOrder": ["988200", "989262", "widen"],
+    "route900000": "observe_only"
+  }
+}

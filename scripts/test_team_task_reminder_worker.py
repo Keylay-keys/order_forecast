@@ -257,6 +257,63 @@ class TeamTaskReminderWorkerTests(unittest.TestCase):
         task = db.root["routes"]["989567"]["_subcollections"]["teamTasks"]["task-a"]
         self.assertEqual(task["reminderStatus"], "failed")
 
+    def test_stale_claim_cannot_overwrite_newer_claim_terminal_state(self):
+        db = _build_db()
+        _add_task(db)
+        doc = next(iter(worker._pending_query(db, 900_000, 10)))
+
+        with patch.object(worker.firestore, "transactional", side_effect=lambda fn: fn):
+            claimed = worker.claim_task_reminder(db, doc, now_ms=900_000)
+            self.assertIsNotNone(claimed)
+            task = db.root["routes"]["989567"]["_subcollections"]["teamTasks"]["task-a"]
+            task.update(
+                {
+                    "reminderStatus": "sending",
+                    "reminderClaimedAtMs": 901_000,
+                    "reminderWorkerId": "replacement-worker",
+                    "reminderAttemptCount": 2,
+                }
+            )
+            accepted = worker.finish_task_reminder(
+                db,
+                claimed["ref"],
+                claim=claimed["task"],
+                now_ms=902_000,
+                sent=True,
+                push_stats={"sent": 1, "failed": 0},
+            )
+
+        self.assertFalse(accepted)
+        self.assertEqual(task["reminderStatus"], "sending")
+        self.assertEqual(task["reminderClaimedAtMs"], 901_000)
+        self.assertEqual(task["reminderWorkerId"], "replacement-worker")
+        self.assertEqual(task["reminderAttemptCount"], 2)
+        self.assertNotIn("reminderSentAtMs", task)
+
+    def test_completed_task_cannot_be_marked_sent_by_old_claim(self):
+        db = _build_db()
+        _add_task(db)
+        doc = next(iter(worker._pending_query(db, 900_000, 10)))
+
+        with patch.object(worker.firestore, "transactional", side_effect=lambda fn: fn):
+            claimed = worker.claim_task_reminder(db, doc, now_ms=900_000)
+            self.assertIsNotNone(claimed)
+            task = db.root["routes"]["989567"]["_subcollections"]["teamTasks"]["task-a"]
+            task["status"] = "completed"
+            accepted = worker.finish_task_reminder(
+                db,
+                claimed["ref"],
+                claim=claimed["task"],
+                now_ms=901_000,
+                sent=True,
+                push_stats={"sent": 1, "failed": 0},
+            )
+
+        self.assertFalse(accepted)
+        self.assertEqual(task["status"], "completed")
+        self.assertEqual(task["reminderStatus"], "sending")
+        self.assertNotIn("reminderSentAtMs", task)
+
 
 if __name__ == "__main__":
     unittest.main()

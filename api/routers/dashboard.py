@@ -12,7 +12,7 @@ from ..dashboard_summary import get_dashboard_summary_payload
 from ..dependencies import (
     get_firestore,
     get_pg_connection,
-    require_route_feature_access,
+    require_route_access,
     return_pg_connection,
     verify_firebase_token,
 )
@@ -43,7 +43,10 @@ async def get_dashboard_summary(
     freshness metadata and must not read Firebase only to verify the mirror.
     """
     _ = request
-    await require_route_feature_access(route_number, "managementDashboard", decoded_token, db)
+    # Dashboard/PCF data is route-visible operational data. Subscription and
+    # trial entitlements protect premium actions, not read access to a route the
+    # caller is already authorized to use.
+    await require_route_access(route_number, decoded_token, db)
 
     conn = None
     try:

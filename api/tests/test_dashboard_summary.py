@@ -1,6 +1,6 @@
 import json
 import unittest
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
 from order_forecast.api import dashboard_summary
 
@@ -168,6 +168,45 @@ def _container_doc():
 
 
 class DashboardSummaryMirrorTests(unittest.TestCase):
+    def test_refreshes_days_left_and_counts_without_source_writes(self):
+        payload = {
+            "routeNumber": "989567",
+            "activePcfs": [
+                {
+                    "itemCount": 3,
+                    "expiredCount": 0,
+                    "expiringCount": 0,
+                    "allItemsExpired": False,
+                    "items": [
+                        {"expiryDate": "08/24/2026", "daysLeft": 99},
+                        {"expiryDate": "2026-08-25", "daysLeft": 99},
+                        {"expiryDate": "2026-08-30", "daysLeft": 99},
+                        {"expiryDate": "not-a-date", "daysLeft": 99},
+                    ],
+                }
+            ],
+            "expiringItems": [
+                {"expiryDate": "2026-08-30", "daysLeft": 99},
+            ],
+            "counts": {"expiredPCFs": 0, "expiringPCFs": 0},
+        }
+
+        result = dashboard_summary.refresh_date_derived_fields(
+            payload,
+            today=date(2026, 8, 25),
+        )
+
+        self.assertEqual(
+            [item["daysLeft"] for item in result["activePcfs"][0]["items"]],
+            [-1, 0, 5, 99],
+        )
+        self.assertEqual(result["activePcfs"][0]["expiredCount"], 2)
+        self.assertEqual(result["activePcfs"][0]["expiringCount"], 1)
+        self.assertFalse(result["activePcfs"][0]["allItemsExpired"])
+        self.assertEqual(result["expiringItems"][0]["daysLeft"], 5)
+        self.assertEqual(result["counts"]["expiringPCFs"], 1)
+        self.assertEqual(payload["activePcfs"][0]["items"][0]["daysLeft"], 99)
+
     def test_fresh_postgres_mirror_returns_without_container_readthrough(self):
         db = _FakeDB({
             "989567": {

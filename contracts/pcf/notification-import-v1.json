@@ -1,0 +1,82 @@
+{
+  "contractVersion": "notification-import-v1",
+  "selectedAt": "2026-08-20",
+  "evidence": {
+    "operatorRunId": "p1-notification-import-20260821T024726Z-retry1",
+    "path": "/Volumes/Extreme SSD/routespark_offload/pcf-migration/firestore-read-redesign/P1/global/p1-notification-import-20260821T024726Z-retry1/notification-import-census.json",
+    "sha256": "99a99c331f8c06317df7535fd3a6739e5feb48bd15f4b639e2c443861306d59e",
+    "privacySafe": true,
+    "documentReadsIncludingFailedFirstCapture": 7014,
+    "writes": 0,
+    "effects": 0
+  },
+  "historyCensus": {
+    "total": 3450,
+    "notificationEntryType": 3446,
+    "missingEntryType": 0,
+    "campaignEntryType": 4,
+    "sent": 2100,
+    "failed": 1343,
+    "cancelled": 3,
+    "missingStatus": 4,
+    "validSentImportCandidates": 2100,
+    "canonicalKeys": 2100,
+    "canonicalCollisionKeys": 0,
+    "mixedCampaignNotificationDocuments": 0
+  },
+  "scheduledCensus": {
+    "total": 57,
+    "missingEntryType": 57,
+    "pending": 17,
+    "sent": 15,
+    "failed": 25,
+    "structurallyValidCanonicalKeys": 57,
+    "canonicalCollisionKeys": 0,
+    "keysOverlappingSentHistory": 15
+  },
+  "historyImportPredicate": {
+    "status": "sent",
+    "entryType": "notification_or_missing",
+    "campaignAlwaysRejects": true,
+    "requiredFields": {
+      "userId": "non-empty string",
+      "expiryDate": "valid M/D/YYYY or YYYY-MM-DD calendar date",
+      "alertDays": "integer"
+    },
+    "canonicalKey": "sorted compact JSON {alertDays,expiryDate ISO,userId}",
+    "mixedCampaignNotificationFields": "reject",
+    "unknownEntryType": "reject",
+    "collision": "block import for the colliding key pending operator disposition"
+  },
+  "rejectionDispositions": [
+    {
+      "category": "campaign",
+      "count": 4,
+      "disposition": "exclude structurally; campaigns remain a separate live product and are never suppression evidence"
+    },
+    {
+      "category": "failed_or_cancelled_notification",
+      "count": 1346,
+      "disposition": "exclude; these rows do not prove irreversible provider acceptance"
+    },
+    {
+      "category": "malformed_required_fields",
+      "countNonExclusive": 7,
+      "disposition": "exclude; all are already within campaign or non-sent categories, so none can become imported suppression evidence"
+    },
+    {
+      "category": "canonical_collision",
+      "count": 0,
+      "disposition": "none present; any later collision blocks final delta and requires exact operator disposition"
+    }
+  ],
+  "cutoverRule": {
+    "importedSentDominatesMatchingShadow": true,
+    "matchingShadowStatusesClearedFromClaimability": ["scheduled", "blocked"],
+    "replacementIsTransactional": true,
+    "dueWorkMayBeTruncatedForImport": false,
+    "campaignJobsRemainLive": true,
+    "cleanupOldNotificationsPausedDuringFinalDelta": true,
+    "freshCensusAndHashRequiredAtP5": true
+  }
+}

@@ -1,0 +1,60 @@
+{
+  "fixtureVersion": "notification-sink-provider-fixtures-v1",
+  "source": {
+    "kind": "official_provider_contract",
+    "provider": "Expo Push Service HTTP/2 API",
+    "url": "https://docs.expo.dev/push-notifications/sending-notifications/",
+    "observedAt": "2026-08-20",
+    "checkedInNodeSdk": "expo-server-sdk@4.0.0",
+    "redaction": "all ticket IDs, messages, and token-like values replaced; no user or route data retained"
+  },
+  "fixtures": {
+    "ticketSuccess": {
+      "expectedCount": 2,
+      "response": {
+        "data": [
+          {"status": "ok", "id": "ticket-redacted-01"},
+          {"status": "ok", "id": "ticket-redacted-02"}
+        ]
+      },
+      "expectedDisposition": "accepted"
+    },
+    "ticketPartialDeviceNotRegistered": {
+      "expectedCount": 2,
+      "response": {
+        "data": [
+          {
+            "status": "error",
+            "message": "redacted provider error",
+            "details": {"error": "DeviceNotRegistered"}
+          },
+          {"status": "ok", "id": "ticket-redacted-03"}
+        ]
+      },
+      "expectedDisposition": "accepted"
+    },
+    "receiptSuccessWithPendingOmission": {
+      "acceptedTicketIds": ["ticket-redacted-01", "ticket-redacted-02"],
+      "response": {
+        "data": {
+          "ticket-redacted-01": {"status": "ok"}
+        }
+      },
+      "expectedDelivered": ["ticket-redacted-01"],
+      "expectedPending": ["ticket-redacted-02"]
+    },
+    "receiptDeviceNotRegistered": {
+      "acceptedTicketIds": ["ticket-redacted-04"],
+      "response": {
+        "data": {
+          "ticket-redacted-04": {
+            "status": "error",
+            "message": "redacted provider error",
+            "details": {"error": "DeviceNotRegistered"}
+          }
+        }
+      },
+      "expectedInvalid": ["ticket-redacted-04"]
+    }
+  }
+}

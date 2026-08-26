@@ -1,0 +1,124 @@
+{
+  "contractVersion": "pcf-ingress-auth-v1",
+  "decisions": {
+    "D1": "existing_fastapi_service",
+    "D6": "cloudflare_tunnel_with_origin_machine_auth",
+    "D2": "cloud_tasks_http_push_oidc"
+  },
+  "network": {
+    "publicHostname": "api.routespark.pro",
+    "originService": "routespark-edge/web-api:8000",
+    "onlyOriginIngressPodLabel": "app.kubernetes.io/name=cloudflared",
+    "cloudflareAccessServiceTokenRequired": false,
+    "reason": "The tunnel and NetworkPolicy make Cloudflare the only network path; origin authentication avoids distributing another long-lived bearer and supports Cloud Tasks OIDC directly."
+  },
+  "transport": {
+    "provider": "google_cloud_tasks",
+    "project": "routespark-1f47d",
+    "location": "us-central1",
+    "queue": "pcf-event-ingress-v1",
+    "target": "https://api.routespark.pro/internal/v1/pcf/events",
+    "method": "POST",
+    "contentType": "application/json",
+    "bodyBytesMax": 65536,
+    "providerTaskBytesMax": 1048576,
+    "taskId": "base32_lower_sha256_source_event_id",
+    "delivery": "at_least_once",
+    "retentionDays": 31,
+    "dispatchDeadlineSeconds": 30,
+    "retry": {
+      "maxAttempts": -1,
+      "maxRetryDuration": "0s",
+      "minBackoff": "10s",
+      "maxBackoff": "3600s",
+      "maxDoublings": 6
+    },
+    "rate": {
+      "maxDispatchesPerSecond": 5,
+      "maxConcurrentDispatches": 10
+    },
+    "ageControls": {
+      "operatingSloSeconds": 300,
+      "warningSeconds": 900,
+      "effectsOffSeconds": 3600,
+      "expiryIncidentSeconds": 1814400
+    },
+    "acknowledgement": {
+      "producer": "Success only after CreateTask returns created or deterministic AlreadyExists for the same source event ID.",
+      "consumer": "2xx only after accepted/duplicate commit or a bounded persisted deterministic rejection; transient dependency and commit uncertainty return non-2xx."
+    }
+  },
+  "identities": [
+    {
+      "path": "POST /internal/v1/pcf/events",
+      "issuer": "https://accounts.google.com",
+      "audience": "https://api.routespark.pro/internal/v1/pcf/events",
+      "principalClaim": "email",
+      "principal": "pcf-task-dispatcher@routespark-1f47d.iam.gserviceaccount.com",
+      "capabilities": ["pcf.event.ingest"],
+      "maxTokenSeconds": 3600,
+      "clockSkewSeconds": 30,
+      "keySource": "Google OIDC certificates",
+      "rotation": "Google-managed; disable the service account and queue on compromise",
+      "revocation": "Disable dispatcher service account, pause queue, set PCF_CLUSTER_STAGE=off"
+    },
+    {
+      "path": "POST /internal/v1/pcf/claims; POST heartbeat; PUT result",
+      "issuer": "https://machine.routespark.internal/pcf",
+      "audience": "https://api.routespark.pro/internal/v1/pcf",
+      "principalClaim": "sub",
+      "principal": "pcf-macos-vision-01",
+      "capabilities": ["pcf.claim", "pcf.heartbeat", "pcf.result"],
+      "maxTokenSeconds": 300,
+      "clockSkewSeconds": 30,
+      "keyId": "pcf-mac-ocr-2026q3-01",
+      "privateKeyStore": "macOS Keychain",
+      "publicTrustStore": "Kubernetes Secret routespark-edge/pcf-machine-auth",
+      "rotationDaysMax": 90,
+      "revocation": "Remove key ID from trust Secret and set PCF_CLUSTER_STAGE=off"
+    },
+    {
+      "path": "POST /internal/v1/pcf/backups/offbox-verifications",
+      "issuer": "https://machine.routespark.internal/pcf",
+      "audience": "https://api.routespark.pro/internal/v1/pcf",
+      "principalClaim": "sub",
+      "principal": "pcf-dell-backup-01",
+      "capabilities": ["pcf.backup.verify"],
+      "maxTokenSeconds": 300,
+      "clockSkewSeconds": 30,
+      "keyId": "pcf-dell-backup-2026q3-01",
+      "privateKeyStore": "macOS Keychain for the installed Dell verification LaunchAgent",
+      "publicTrustStore": "Kubernetes Secret routespark-edge/pcf-machine-auth",
+      "rotationDaysMax": 90,
+      "revocation": "Remove key ID from trust Secret and block PCF TTL until a new verified receipt"
+    },
+    {
+      "path": "operator actions",
+      "issuer": "Kubernetes client certificate/OIDC configured by kubeconfig",
+      "audience": "Kubernetes API",
+      "principalClaim": "Kubernetes authenticated user",
+      "principal": "named release operator",
+      "capabilities": ["phase flag and migration runbook actions only"],
+      "maxTokenSeconds": null,
+      "clockSkewSeconds": null,
+      "keyId": null,
+      "privateKeyStore": "operator Keychain/kubeconfig",
+      "publicTrustStore": "Kubernetes API trust",
+      "rotationDaysMax": null,
+      "revocation": "Remove operator Kubernetes access",
+      "remoteInternalApi": false
+    }
+  ],
+  "failClosed": {
+    "internalApiDefaultEnabled": false,
+    "rejectCookies": true,
+    "rejectFirebaseTokens": true,
+    "authenticateBeforeBody": true,
+    "internalCorsPreflight": false,
+    "unknownPath": 404,
+    "invalidIdentity": 401,
+    "forbiddenCapability": 403,
+    "identityDependencyUnavailable": 503,
+    "capabilitiesFromToken": false
+  }
+}

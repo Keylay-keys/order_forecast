@@ -19,8 +19,10 @@ from google.cloud import firestore
 
 try:
     from .pg_utils import get_delivery_manifest, get_store_delivery, fetch_all
+    from .request_listener_query import pending_request_query
 except ImportError:
     from pg_utils import get_delivery_manifest, get_store_delivery, fetch_all
+    from request_listener_query import pending_request_query
 
 WORKER_ID = f"delivery-{socket.gethostname()}-{__import__('os').getpid()}"
 
@@ -158,11 +160,11 @@ def watch_requests(sa_path: str):
     print(f"\n📦 Delivery Manifest Listener")
     print(f"   Worker ID: {WORKER_ID}")
     print(f"   Using: Direct PostgreSQL (pg_utils)")
-    print(f"   Watching: deliveryRequests/*")
+    print(f"   Watching: deliveryRequests where status == pending")
     print(f"\n   Press Ctrl+C to stop\n")
 
     fb_client = get_firestore_client(sa_path)
-    requests_col = fb_client.collection("deliveryRequests")
+    requests_query = pending_request_query(fb_client, "deliveryRequests")
     initial_snapshot_seen = False
 
     def on_snapshot(col_snapshot, changes, read_time):
@@ -191,7 +193,7 @@ def watch_requests(sa_path: str):
             except Exception as e:
                 print(f"     ❌ Unexpected error: {e}")
     
-    watcher = requests_col.on_snapshot(on_snapshot)
+    watcher = requests_query.on_snapshot(on_snapshot)
     
     try:
         while True:

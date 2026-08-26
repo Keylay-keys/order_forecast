@@ -160,6 +160,120 @@ class LowQtyConfigSyncTests(unittest.TestCase):
         query.on_snapshot.assert_not_called()
         self.assertEqual(manager._low_qty_owner_watchers, {})
 
+    def test_duplicate_enabled_route_resolves_authority_once_per_complete_snapshot(self):
+        manager = listener.ConfigSyncManager(MagicMock())
+        owner = _user_snapshot("owner-989262", "989262")
+        team_member = _user_snapshot("team-989262", "989262")
+        with patch.object(
+            listener,
+            "resolve_authoritative_route_owner",
+            return_value="owner-989262",
+        ) as resolve, patch.object(
+            listener,
+            "reconcile_complete_enabled_snapshot",
+            return_value={"enabled": 1, "disabled": 0},
+        ), patch.object(manager, "_reconcile_low_qty_owner_watchers"):
+            manager._sync_low_qty_snapshot(
+                [owner, team_member],
+                datetime(2026, 8, 18, 13, 0, tzinfo=timezone.utc),
+            )
+
+        resolve.assert_called_once_with(manager.fb_client, "989262")
+        self.assertEqual(manager._low_qty_owner_ids, {"989262": "owner-989262"})
+
+    def test_owner_watch_uses_delivered_route_authority_without_full_reresolution(self):
+        fb_client = MagicMock()
+        route_ref = fb_client.collection.return_value.document.return_value
+        captured = {}
+        route_ref.on_snapshot.side_effect = lambda callback: captured.setdefault("callback", callback) or MagicMock()
+        manager = listener.ConfigSyncManager(fb_client)
+        manager._low_qty_user_snapshots = [
+            _user_snapshot("owner-989262", "989262"),
+            _user_snapshot("owner-988200", "988200"),
+        ]
+        manager._low_qty_owner_ids = {
+            "989262": "owner-989262",
+            "988200": "owner-988200",
+        }
+        route_snapshot = MagicMock()
+        route_snapshot.exists = True
+        route_snapshot.to_dict.return_value = {"ownerUid": "new-owner-989262"}
+
+        with patch.object(
+            listener,
+            "resolve_authoritative_route_owner",
+        ) as resolve, patch.object(manager, "_sync_low_qty_snapshot") as sync:
+            manager._reconcile_low_qty_owner_watchers({"989262"})
+            captured["callback"](
+                [route_snapshot],
+                [],
+                datetime(2026, 8, 18, 13, 5, tzinfo=timezone.utc),
+            )
+
+        resolve.assert_not_called()
+        self.assertEqual(sync.call_count, 1)
+        self.assertEqual(
+            sync.call_args.kwargs["owner_ids"],
+            {"989262": "new-owner-989262", "988200": "owner-988200"},
+        )
+
+    def test_owner_watch_missing_route_authority_resolves_only_changed_route(self):
+        fb_client = MagicMock()
+        route_ref = fb_client.collection.return_value.document.return_value
+        captured = {}
+        route_ref.on_snapshot.side_effect = lambda callback: captured.setdefault("callback", callback) or MagicMock()
+        manager = listener.ConfigSyncManager(fb_client)
+        manager._low_qty_user_snapshots = [_user_snapshot("owner-989262", "989262")]
+        manager._low_qty_owner_ids = {"989262": "owner-989262"}
+        missing_snapshot = MagicMock()
+        missing_snapshot.exists = False
+
+        with patch.object(
+            listener,
+            "resolve_authoritative_route_owner",
+            return_value="fallback-owner",
+        ) as resolve, patch.object(manager, "_sync_low_qty_snapshot") as sync:
+            manager._reconcile_low_qty_owner_watchers({"989262"})
+            captured["callback"](
+                [missing_snapshot],
+                [],
+                datetime(2026, 8, 18, 13, 5, tzinfo=timezone.utc),
+            )
+
+        resolve.assert_called_once_with(fb_client, "989262")
+        self.assertEqual(sync.call_args.kwargs["owner_ids"], {"989262": "fallback-owner"})
+
+    def test_owner_change_fail_closed_disables_the_previous_owner_preference(self):
+        fb_client = MagicMock()
+        route_ref = fb_client.collection.return_value.document.return_value
+        captured = {}
+        route_ref.on_snapshot.side_effect = lambda callback: captured.setdefault("callback", callback) or MagicMock()
+        manager = listener.ConfigSyncManager(fb_client)
+        manager._low_qty_user_snapshots = [_user_snapshot("old-owner", "989262")]
+        manager._low_qty_owner_ids = {"989262": "old-owner"}
+        manager._reconcile_low_qty_owner_watchers({"989262"})
+        route_snapshot = MagicMock()
+        route_snapshot.exists = True
+        route_snapshot.to_dict.return_value = {"ownerUid": "new-owner"}
+
+        with patch.object(
+            listener,
+            "resolve_authoritative_route_owner",
+        ) as resolve, patch.object(
+            listener,
+            "reconcile_complete_enabled_snapshot",
+            return_value={"enabled": 0, "disabled": 1},
+        ) as reconcile, patch.object(manager, "_reconcile_low_qty_owner_watchers"):
+            captured["callback"](
+                [route_snapshot],
+                [],
+                datetime(2026, 8, 18, 13, 5, tzinfo=timezone.utc),
+            )
+
+        resolve.assert_not_called()
+        self.assertEqual(reconcile.call_args.args[0], [])
+        self.assertEqual(manager._low_qty_owner_ids, {"989262": "new-owner"})
+
     def test_owner_resolution_error_does_not_run_disable_sweep(self):
         fb_client = MagicMock()
         query = MagicMock()
