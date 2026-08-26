@@ -25,6 +25,11 @@ import psycopg2
 from psycopg2.extras import execute_values, RealDictCursor
 from google.cloud import firestore  # type: ignore
 
+try:
+    from .promo_feature_gate import promos_enabled
+except ImportError:
+    from promo_feature_gate import promos_enabled
+
 # Worker ID for this instance
 WORKER_ID = f"promo-sync-{socket.gethostname()}-{os.getpid()}"
 
@@ -429,6 +434,10 @@ class PromoSyncManager:
 
 def main(sa_path: str):
     """Main entry point for promo sync listener."""
+    if not promos_enabled():
+        print("[Promo] Sync listener gated: PROMOS_ENABLED is not true")
+        return 0
+
     print(f"\n{'='*60}")
     print("Promo Sync Listener (Firestore -> PostgreSQL)")
     print(f"{'='*60}")

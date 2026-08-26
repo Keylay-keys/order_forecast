@@ -24,6 +24,12 @@ from ..dependencies import (
 from ..errors import StructuredApiError, get_request_id
 from ..middleware.rate_limit import rate_limit_history
 
+try:
+    from ...scripts.promo_feature_gate import promos_enabled
+except ImportError:
+    # The production image runs this package as ``api`` from /app/order_forecast.
+    from scripts.promo_feature_gate import promos_enabled
+
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
@@ -712,6 +718,11 @@ async def get_promos(
     db: firestore.Client = Depends(get_firestore),
 ) -> Dict[str, Any]:
     """Return promos for a route (raw promo docs)."""
+    if not promos_enabled():
+        # Fail before route membership or Promo collection reads. The retained
+        # endpoint is dormant compatibility code, not an alternate enable path.
+        raise HTTPException(status_code=404, detail="Not Found")
+
     await require_route_access(route, decoded_token, db)
 
     from firebase_loader import load_promotions

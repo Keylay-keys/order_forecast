@@ -203,6 +203,7 @@ try:
     from .case_allocator import allocate_cases_across_stores, get_historical_shares, get_item_case_pattern
     from .low_quantity_loader import get_items_for_order_date, get_stores_for_sap, get_saps_to_suppress
     from .pg_utils import fetch_all, fetch_one
+    from .promo_feature_gate import promos_enabled
 except ImportError:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     from models import ForecastItem, ForecastPayload, Product, StoreConfig, PriorOrderContext, ExpiryReplacementInfo
@@ -229,6 +230,7 @@ except ImportError:
     from case_allocator import allocate_cases_across_stores, get_historical_shares, get_item_case_pattern
     from low_quantity_loader import get_items_for_order_date, get_stores_for_sap, get_saps_to_suppress
     from pg_utils import fetch_all, fetch_one
+    from promo_feature_gate import promos_enabled
 
 
 def _parse_promo_date(value) -> Optional[datetime]:
@@ -269,6 +271,9 @@ def _build_active_promo_lookup(
     Returns:
         Dict mapping (store_id, sap) to True if on promo
     """
+    if not promos_enabled():
+        return {}
+
     promos = load_promotions(db, route_number)
     if not promos:
         return {}
@@ -375,6 +380,9 @@ def _get_last_promo_quantities(
     lookback_days: int = 365,
 ) -> Dict[Tuple[str, str], float]:
     """Get last promo order quantity per store+SAP from PostgreSQL."""
+    if not promos_enabled():
+        return {}
+
     try:
         min_date = None
         try:
