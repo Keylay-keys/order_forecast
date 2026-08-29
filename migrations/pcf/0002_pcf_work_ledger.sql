@@ -201,9 +201,9 @@ REVOKE ALL ON FUNCTION pcf_notify_work_available() FROM PUBLIC;
 
 DROP TRIGGER IF EXISTS pcf_work_available_notify ON pcf_work_items;
 CREATE TRIGGER pcf_work_available_notify
-AFTER INSERT OR UPDATE OF status, not_before ON pcf_work_items
+AFTER INSERT OR UPDATE OF status, not_before, effect_not_before ON pcf_work_items
 FOR EACH ROW
-WHEN (NEW.status = 'queued')
+WHEN (NEW.status IN ('queued', 'effects_pending'))
 EXECUTE FUNCTION pcf_notify_work_available();
 
 CREATE TABLE IF NOT EXISTS pcf_work_events (

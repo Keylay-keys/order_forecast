@@ -34,6 +34,7 @@ def run_effect_controller_cycle(
     handlers: Mapping[str, EffectHandler],
     *,
     actor_id: str,
+    admitted_work_ids: tuple[UUID, ...] | None = None,
     now_fn: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
     effect_fn: Callable[..., EffectCycleReport] = run_one_effect,
     ttl_fn: Callable[..., QueueTtlArmCycleReport] = run_queue_ttl_arm_cycle,
@@ -49,6 +50,7 @@ def run_effect_controller_cycle(
         conn,
         handlers,
         actor_id=actor_id,
+        admitted_work_ids=admitted_work_ids,
         now_fn=now_fn,
     )
     if effect.next_step is not None or effect.work_id is None:

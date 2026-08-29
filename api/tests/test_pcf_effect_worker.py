@@ -73,6 +73,24 @@ def handlers(handler):
 
 
 class PcfEffectWorkerTests(unittest.TestCase):
+    def test_empty_admission_is_forwarded_and_cannot_claim(self) -> None:
+        conn = _Connection()
+        observed = []
+
+        def claim_none(*_args, **kwargs):
+            observed.append(kwargs["admitted_work_ids"])
+            return None
+
+        report = run_one_effect(
+            conn,
+            handlers(lambda item: proof(item)),
+            actor_id="pcf-effect-worker-01",
+            admitted_work_ids=(),
+            claim_fn=claim_none,
+        )
+        self.assertEqual(report.disposition, "idle")
+        self.assertEqual(observed, [()])
+
     def test_handler_set_is_exact_and_checked_before_claim(self) -> None:
         for value in (
             {},

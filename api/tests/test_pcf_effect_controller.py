@@ -43,6 +43,24 @@ def test_nonterminal_and_review_work_never_call_ttl():
     assert ttl_calls == []
 
 
+def test_exact_admission_is_forwarded_to_effect_claim():
+    observed = []
+    admitted = (uuid.UUID(WORK_ID),)
+    result = run_effect_controller_cycle(
+        object(),
+        object(),
+        {},
+        actor_id="pcf-effect-worker",
+        admitted_work_ids=admitted,
+        now_fn=lambda: NOW,
+        effect_fn=lambda *_args, **kwargs: (
+            observed.append(kwargs["admitted_work_ids"]) or effect(next_step="verifying")
+        ),
+    )
+    assert result.queue_ttl_disposition == "not_terminal"
+    assert observed == [admitted]
+
+
 def test_complete_work_defers_cleanly_until_covering_backup():
     result = run_effect_controller_cycle(
         object(),

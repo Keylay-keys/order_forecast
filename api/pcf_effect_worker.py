@@ -7,6 +7,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Literal
+from uuid import UUID
 
 from .pcf_effect_runtime import (
     EFFECT_STEPS,
@@ -104,6 +105,7 @@ def run_one_effect(
     actor_id: str,
     visibility_seconds: int = 120,
     unexpected_retry_seconds: int = 60,
+    admitted_work_ids: tuple[UUID, ...] | None = None,
     now_fn: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
     claim_fn: Callable[..., EffectClaim | None] = claim_due_effect,
     advance_fn: Callable[..., EffectAdvance] = advance_effect_step,
@@ -129,6 +131,7 @@ def run_one_effect(
             actor_id=actor_id,
             now=now_fn(),
             visibility_seconds=visibility_seconds,
+            admitted_work_ids=admitted_work_ids,
         )
         # This commits either the visibility claim, an exhausted-attempt dead
         # letter, or the bounded empty lookup before any handler can run.

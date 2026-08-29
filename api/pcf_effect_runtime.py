@@ -7,7 +7,7 @@ import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, Literal
+from typing import Any, Literal, Sequence
 
 from psycopg2.extras import RealDictCursor
 
@@ -238,6 +238,7 @@ def claim_due_effect(
     actor_id: str,
     now: datetime,
     visibility_seconds: int,
+    admitted_work_ids: Sequence[uuid.UUID] | None = None,
 ) -> EffectClaim | None:
     """Claim at most one due effect without holding a lock over external I/O."""
     actor_id = _bounded_actor(actor_id)
@@ -248,21 +249,42 @@ def claim_due_effect(
         maximum=900,
         name="effect visibility",
     )
+    admitted: tuple[uuid.UUID, ...] | None = None
+    if admitted_work_ids is not None:
+        try:
+            admitted = tuple(admitted_work_ids)
+        except TypeError as exc:
+            raise ValueError("invalid PCF effect admission set") from exc
+        if (
+            len(admitted) > 100
+            or len(set(admitted)) != len(admitted)
+            or any(not isinstance(work_id, uuid.UUID) for work_id in admitted)
+        ):
+            raise ValueError("invalid PCF effect admission set")
+        if not admitted:
+            return None
     visible_again_at = now + timedelta(seconds=visibility_seconds)
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        admission_clause = (
+            " AND work_id = ANY(%s::uuid[])" if admitted is not None else ""
+        )
+        params: tuple[Any, ...] = (now,)
+        if admitted is not None:
+            params = (now, [str(work_id) for work_id in admitted])
         cur.execute(
-            """
+            f"""
             SELECT work_id, route_number, delivery_number, source_queue_path,
                    source_revision, input_hash_version, input_hash,
                    effect_step, effect_attempt_count, attempt_count, max_attempts,
                    confidence, manifest, ocr_context, result
             FROM pcf_work_items
             WHERE status = 'effects_pending' AND effect_not_before <= %s
+                  {admission_clause}
             ORDER BY effect_not_before, updated_at, work_id
             FOR UPDATE SKIP LOCKED
             LIMIT 1
             """,
-            (now,),
+            params,
         )
         row = cur.fetchone()
         if row is None:

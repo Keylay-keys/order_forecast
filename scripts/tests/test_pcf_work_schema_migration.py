@@ -29,7 +29,10 @@ class PcfWorkSchemaMigrationTests(unittest.TestCase):
         )
         self.assertIn("ON DELETE RESTRICT", sql)
         self.assertIn("REVOKE ALL ON FUNCTION pcf_notify_work_available() FROM PUBLIC", sql)
-        self.assertIn("AFTER INSERT OR UPDATE OF status, not_before", sql)
+        self.assertIn(
+            "AFTER INSERT OR UPDATE OF status, not_before, effect_not_before", sql
+        )
+        self.assertIn("NEW.status IN ('queued', 'effects_pending')", sql)
         self.assertIn("pg_notify('pcf_work_available'", sql)
 
     def test_schema_has_exact_hot_and_idempotency_indexes(self):
