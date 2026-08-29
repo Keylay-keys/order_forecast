@@ -39,6 +39,34 @@ class PcfIngressContractTests(unittest.TestCase):
         self.assertLess(transport["bodyBytesMax"], transport["providerTaskBytesMax"])
         self.assertEqual(transport["retry"]["maxAttempts"], -1)
         self.assertEqual(transport["retry"]["maxRetryDuration"], "0s")
+        self.assertEqual(
+            transport["producerServiceAccount"],
+            "pcf-event-producer@routespark-1f47d.iam.gserviceaccount.com",
+        )
+        self.assertEqual(
+            transport["iam"],
+            {
+                "producerProjectRoles": [
+                    "roles/datastore.user",
+                    "roles/logging.logWriter",
+                ],
+                "producerQueueRole": "roles/cloudtasks.enqueuer",
+                "dispatcherActAsRole": "roles/iam.serviceAccountUser",
+                "queueScopedEnqueuer": True,
+            },
+        )
+        self.assertEqual(
+            transport["queueOverrides"],
+            {
+                "method": "POST",
+                "scheme": "HTTPS",
+                "host": "api.routespark.pro",
+                "path": "/internal/v1/pcf/events",
+                "contentType": "application/json",
+                "oidcServiceAccount": machine_auth.TASK_DISPATCHER_EMAIL,
+                "oidcAudience": machine_auth.TASK_EVENT_AUDIENCE,
+            },
+        )
         ages = transport["ageControls"]
         self.assertLess(ages["operatingSloSeconds"], ages["warningSeconds"])
         self.assertLess(ages["warningSeconds"], ages["effectsOffSeconds"])
@@ -129,6 +157,44 @@ class PcfProjectionEvidenceContractTests(unittest.TestCase):
         self.assertFalse(evidence["postgresIsEvidenceAuthority"])
         self.assertFalse(evidence["clusterStorageIsEvidenceAuthority"])
         self.assertFalse(evidence["automaticEvidenceDeletion"])
+        mount = evidence["clusterReadMount"]
+        self.assertEqual(mount["root"], "/mnt/routespark-pcf-evidence")
+        self.assertEqual(mount["mode"], "readOnly")
+        self.assertEqual(mount["requiredFor"], ["projecting", "cleaning"])
+        self.assertFalse(mount["writableByCluster"])
+        self.assertEqual(mount["missingBehavior"], "block_current_effect_step")
+
+    def test_canonical_copy_has_a_distinct_generation_fenced_identity(self):
+        storage = self.contract["storageBoundaries"]
+        projector = storage["canonicalProjector"]
+        self.assertEqual(
+            projector["permissions"],
+            ["storage.objects.get", "storage.objects.create", "storage.objects.update"],
+        )
+        self.assertTrue(projector["sourceGenerationPreconditionRequired"])
+        self.assertTrue(projector["destinationGenerationPreconditionRequired"])
+        self.assertTrue(projector["prefixOrBulkWriteForbidden"])
+        self.assertNotEqual(
+            projector["identity"],
+            storage["exactCleaner"]["identity"],
+        )
+        self.assertNotEqual(
+            projector["identity"],
+            storage["claimUrlSigner"]["identity"],
+        )
+
+    def test_projection_allowlist_uses_the_live_plural_pcf_collection(self):
+        allowlist = self.contract["projectionBoundary"]["applicationWriteAllowlist"]
+        self.assertIn("routes/{route}/pcfs/{delivery}", allowlist)
+        self.assertIn(
+            "routes/{route}/pcfs/{delivery}/containers/{container}",
+            allowlist,
+        )
+        self.assertNotIn("routes/{route}/pcf/{delivery}", allowlist)
+        self.assertNotIn(
+            "routes/{route}/pcf/{delivery}/containers/{container}",
+            allowlist,
+        )
 
     def test_rollout_is_effect_disabled_and_does_not_use_review_route_as_canary(self):
         rollout = self.contract["rollout"]

@@ -5,10 +5,9 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict
 
-from fastapi import APIRouter, Depends, Path, Request
+from fastapi import APIRouter, Depends, HTTPException, Path, Request
 from google.cloud import firestore
 
-from ..dashboard_summary import get_dashboard_summary_payload
 from ..dependencies import (
     get_firestore,
     get_pg_connection,
@@ -18,6 +17,11 @@ from ..dependencies import (
 )
 from ..middleware.rate_limit import rate_limit_history
 from ..models import ErrorResponse
+from ..pcf_active_serving import (
+    ProjectionContractError,
+    ProjectionUnavailable,
+    get_dashboard_summary_from_postgres,
+)
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -51,9 +55,19 @@ async def get_dashboard_summary(
     conn = None
     try:
         conn = get_pg_connection()
-        payload = get_dashboard_summary_payload(db=db, conn=conn, route_number=route_number)
-        payload["routeNumber"] = route_number
-        return payload
+        return get_dashboard_summary_from_postgres(conn, route_number)
+    except ProjectionUnavailable as exc:
+        logger.info("dashboard_projection_unavailable reason=%s", exc.reason)
+        raise HTTPException(
+            503,
+            {"code": "projection_unavailable", "reason": exc.reason},
+        ) from exc
+    except ProjectionContractError as exc:
+        logger.exception("dashboard_projection_contract_error")
+        raise HTTPException(
+            503,
+            {"code": "projection_unusable", "reason": "contract_error"},
+        ) from exc
     finally:
         if conn is not None:
             return_pg_connection(conn)

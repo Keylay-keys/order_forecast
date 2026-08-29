@@ -21,6 +21,7 @@ try:
         EventContractError,
         business_hash,
         compare_firestore_revisions,
+        firestore_revision_instant,
         lifecycle_semantic_key,
         projection_decision,
         projection_event_business_hash,
@@ -31,6 +32,7 @@ except ImportError:
         EventContractError,
         business_hash,
         compare_firestore_revisions,
+        firestore_revision_instant,
         lifecycle_semantic_key,
         projection_decision,
         projection_event_business_hash,
@@ -42,6 +44,8 @@ DEFAULT_TIMEZONE = "America/Denver"
 LIFECYCLE_KIND = "lifecycle"
 ARCHIVE_TRANSITION = "archive_delivery"
 TERMINAL_RETENTION_DAYS = 90
+LIFECYCLE_RECOVERY_DAYS = 30
+MAX_ROUTE_REPLAN_DELIVERIES = 500
 CLAIMABLE_STATUSES = ("scheduled", "retryable", "blocked")
 SUPERSEDABLE_STATUSES = ("scheduled", "retryable", "blocked", "dead_letter")
 
@@ -126,6 +130,128 @@ def _require_retention_days(value: int) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 3650:
         raise LifecycleContractError("retention_days must be an integer from 1 through 3650")
     return value
+
+
+def _require_route_number(value: str) -> str:
+    if (
+        not isinstance(value, str)
+        or not value.isdigit()
+        or not 1 <= len(value) <= 10
+    ):
+        raise LifecycleContractError("route_number must contain 1 through 10 digits")
+    return value
+
+
+def lock_lifecycle_route(conn, route_number: str) -> str:
+    """Serialize policy and container planning for one route transaction."""
+    route_number = _require_route_number(route_number)
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+            (f"pcf-lifecycle-route:{route_number}",),
+        )
+    return route_number
+
+
+def apply_route_retention_policy(
+    conn,
+    *,
+    route_number: str,
+    retention_days: int | None,
+    policy_revision: str,
+) -> str:
+    """Store one effective route policy behind monotonic Firestore fencing.
+
+    The policy lives on the existing compact route-control row.  This function
+    neither scans projected deliveries nor creates ``due_work``; the planner
+    owns those actions after the policy and container projection are durable.
+    """
+    route_number = lock_lifecycle_route(conn, route_number)
+    compare_firestore_revisions(policy_revision, policy_revision)
+    active = retention_days is not None
+    if active:
+        retention_days = _require_retention_days(retention_days)
+        if not policy_revision.endswith("|0"):
+            raise LifecycleContractError("active retention policy revision must be an upsert")
+    elif not policy_revision.endswith("|1"):
+        raise LifecycleContractError("inactive retention policy revision must be a delete")
+
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            """
+            SELECT lifecycle_policy_active, lifecycle_retention_days,
+                   lifecycle_policy_revision
+            FROM pcf_projection_routes
+            WHERE route_number = %s
+            FOR UPDATE
+            """,
+            (route_number,),
+        )
+        existing = cur.fetchone()
+        if existing is not None and existing["lifecycle_policy_revision"] is not None:
+            ordering = compare_firestore_revisions(
+                policy_revision, existing["lifecycle_policy_revision"]
+            )
+            if ordering < 0:
+                return "stale_noop"
+            if ordering == 0:
+                if (
+                    bool(existing["lifecycle_policy_active"]) != active
+                    or existing["lifecycle_retention_days"] != retention_days
+                ):
+                    raise LifecycleConflictError(
+                        "equal retention policy revision has different content"
+                    )
+                return "duplicate_noop"
+            watermark_only = (
+                bool(existing["lifecycle_policy_active"]) == active
+                and existing["lifecycle_retention_days"] == retention_days
+            )
+        else:
+            watermark_only = False
+
+        cur.execute(
+            """
+            INSERT INTO pcf_projection_routes (
+                route_number, lifecycle_policy_active, lifecycle_retention_days,
+                lifecycle_policy_revision, lifecycle_policy_synced_at,
+                created_at, updated_at
+            ) VALUES (%s, %s, %s, %s, NOW(), NOW(), NOW())
+            ON CONFLICT (route_number) DO UPDATE
+            SET lifecycle_policy_active = EXCLUDED.lifecycle_policy_active,
+                lifecycle_retention_days = EXCLUDED.lifecycle_retention_days,
+                lifecycle_policy_revision = EXCLUDED.lifecycle_policy_revision,
+                lifecycle_policy_synced_at = EXCLUDED.lifecycle_policy_synced_at,
+                updated_at = NOW()
+            """,
+            (route_number, active, retention_days, policy_revision),
+        )
+    if existing is None:
+        return "inserted"
+    return "advance_watermark_only" if watermark_only else "updated"
+
+
+def load_route_retention_policy(conn, route_number: str) -> tuple[int, str] | None:
+    """Read the projected effective policy, failing closed when it is absent."""
+    route_number = _require_route_number(route_number)
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            """
+            SELECT lifecycle_policy_active, lifecycle_retention_days,
+                   lifecycle_policy_revision
+            FROM pcf_projection_routes
+            WHERE route_number = %s
+            """,
+            (route_number,),
+        )
+        row = cur.fetchone()
+    if (
+        row is None
+        or row["lifecycle_policy_revision"] is None
+        or not row["lifecycle_policy_active"]
+    ):
+        return None
+    return int(row["lifecycle_retention_days"]), str(row["lifecycle_policy_revision"])
 
 
 def _zone(timezone_name: str) -> ZoneInfo:
@@ -240,7 +366,6 @@ def build_cleanup_plan(
         raise LifecycleContractError("all containers must belong to one route and delivery")
     if len({row.container_id for row in current}) != len(current):
         raise LifecycleContractError("container_id values must be unique within a delivery")
-
     expiries: list[tuple[date, str]] = []
     missing_expiry_count = 0
     item_count = 0
@@ -432,7 +557,8 @@ def apply_container_projection(conn, event: Mapping[str, Any]) -> str:
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute(
             """
-            SELECT source_revision, source_business_hash, source_mutation_kind
+            SELECT active, loading_date, page_numbers, items, deleted_at,
+                   source_revision, source_business_hash, source_mutation_kind
             FROM items_current
             WHERE route_number = %s AND delivery_id = %s AND container_id = %s
             FOR UPDATE
@@ -440,6 +566,23 @@ def apply_container_projection(conn, event: Mapping[str, Any]) -> str:
             (entity["route"], entity["delivery"], entity["container"]),
         )
         existing = cur.fetchone()
+        persisted_hash = None
+        if existing is not None:
+            persisted_payload = None
+            if existing["deleted_at"] is None:
+                persisted_payload = {
+                    "active": bool(existing["active"]),
+                    "items": existing["items"],
+                    "loadingDate": (
+                        existing["loading_date"].isoformat()
+                        if isinstance(existing["loading_date"], date)
+                        else existing["loading_date"]
+                    ),
+                    "pageNumbers": existing["page_numbers"],
+                }
+            persisted_hash = business_hash(
+                {"entity": dict(entity), "payload": persisted_payload}
+            )
         decision = projection_decision(
             current_revision=existing["source_revision"] if existing else None,
             current_business_hash=existing["source_business_hash"] if existing else None,
@@ -448,6 +591,15 @@ def apply_container_projection(conn, event: Mapping[str, Any]) -> str:
             incoming_business_hash=incoming_hash,
             incoming_mutation_kind=mutation_kind,
         )
+        integrity_repair = bool(
+            existing is not None
+            and persisted_hash != existing["source_business_hash"]
+            and compare_firestore_revisions(
+                normalized["sourceRevision"], existing["source_revision"]
+            ) == 0
+        )
+        if integrity_repair:
+            decision = "apply"
         if decision in {"stale_noop", "duplicate_noop"}:
             return decision
         if decision == "revision_conflict_reject":
@@ -539,7 +691,7 @@ def apply_container_projection(conn, event: Mapping[str, Any]) -> str:
                 deleted_at,
             ),
         )
-    return "apply"
+    return "integrity_repaired" if integrity_repair else "apply"
 
 
 def _terminal_retain_until(now_utc: datetime) -> datetime:
@@ -683,6 +835,176 @@ def plan_projected_delivery(
     return plan
 
 
+def cancel_projected_delivery_plan(
+    conn,
+    *,
+    route_number: str,
+    delivery_id: str,
+    reason: str,
+    now_utc: datetime,
+) -> int:
+    """Cancel only unleased lifecycle rows invalidated by current projection."""
+    route_number = _require_route_number(route_number)
+    now_utc = _require_aware(now_utc, "now_utc").astimezone(timezone.utc)
+    normalized_reason = str(reason).strip().lower().replace(" ", "_")
+    if not normalized_reason or len(normalized_reason) > 64:
+        raise LifecycleContractError("cancellation reason must contain 1 through 64 characters")
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE due_work
+            SET status = 'cancelled',
+                terminal_outcome = %s,
+                terminal_at = %s,
+                retain_until = %s,
+                block_reason = NULL,
+                last_error = NULL,
+                updated_at = NOW()
+            WHERE kind = 'lifecycle'
+              AND route_number = %s
+              AND delivery_id = %s
+              AND transition_kind = %s
+              AND status = ANY(%s)
+            """,
+            (
+                f"projection_{normalized_reason}",
+                now_utc,
+                _terminal_retain_until(now_utc),
+                route_number,
+                str(delivery_id),
+                ARCHIVE_TRANSITION,
+                list(SUPERSEDABLE_STATUSES),
+            ),
+        )
+        return int(cur.rowcount)
+
+
+def plan_projected_delivery_from_current_policy(
+    conn,
+    *,
+    route_number: str,
+    delivery_id: str,
+    now_utc: datetime,
+    timezone_name: str = DEFAULT_TIMEZONE,
+) -> CleanupPlan:
+    """Replan one delivery from durable projection and effective route policy."""
+    now_utc = _require_aware(now_utc, "now_utc").astimezone(timezone.utc)
+    policy = load_route_retention_policy(conn, route_number)
+    if policy is None:
+        containers = load_projected_delivery(conn, route_number, delivery_id)
+        cancel_projected_delivery_plan(
+            conn,
+            route_number=route_number,
+            delivery_id=delivery_id,
+            reason="policy_missing",
+            now_utc=now_utc,
+        )
+        return CleanupPlan(None, "policy_missing", len(containers), 0, 0)
+
+    retention_days, policy_revision = policy
+    containers = load_projected_delivery(conn, route_number, delivery_id)
+    plan = build_cleanup_plan(
+        containers,
+        retention_days=retention_days,
+        policy_revision=policy_revision,
+        timezone_name=timezone_name,
+    )
+    if plan.candidate is None:
+        cancel_projected_delivery_plan(
+            conn,
+            route_number=route_number,
+            delivery_id=delivery_id,
+            reason=plan.reason,
+            now_utc=now_utc,
+        )
+        return plan
+
+    deadline_anchor = max(
+        plan.candidate.due_at,
+        firestore_revision_instant(plan.candidate.source_revision),
+    )
+    deadline_at = deadline_anchor + timedelta(
+        days=LIFECYCLE_RECOVERY_DAYS
+    )
+    schedule_cleanup_candidate(
+        conn,
+        plan.candidate,
+        deadline_at=deadline_at,
+        now_utc=now_utc,
+    )
+    return plan
+
+
+def plan_projected_route_from_current_policy(
+    conn,
+    *,
+    route_number: str,
+    now_utc: datetime,
+    timezone_name: str = DEFAULT_TIMEZONE,
+) -> list[tuple[str, CleanupPlan]]:
+    """Replan only projected deliveries belonging to one policy-changed route."""
+    route_number = _require_route_number(route_number)
+    now_utc = _require_aware(now_utc, "now_utc").astimezone(timezone.utc)
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT delivery_id
+            FROM items_current
+            WHERE route_number = %s
+              AND deleted_at IS NULL
+            GROUP BY delivery_id
+            HAVING BOOL_OR(active)
+            ORDER BY delivery_id
+            LIMIT %s
+            """,
+            (route_number, MAX_ROUTE_REPLAN_DELIVERIES + 1),
+        )
+        delivery_ids = [str(row[0]) for row in cur.fetchall()]
+    if len(delivery_ids) > MAX_ROUTE_REPLAN_DELIVERIES:
+        raise LifecycleContractError("route_active_delivery_limit_exceeded")
+
+    if load_route_retention_policy(conn, route_number) is None:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE due_work
+                SET status = 'cancelled',
+                    terminal_outcome = 'projection_policy_missing',
+                    terminal_at = %s,
+                    retain_until = %s,
+                    block_reason = NULL,
+                    last_error = NULL,
+                    updated_at = NOW()
+                WHERE kind = 'lifecycle'
+                  AND route_number = %s
+                  AND transition_kind = %s
+                  AND status = ANY(%s)
+                """,
+                (
+                    now_utc,
+                    _terminal_retain_until(now_utc),
+                    route_number,
+                    ARCHIVE_TRANSITION,
+                    list(SUPERSEDABLE_STATUSES),
+                ),
+            )
+        return []
+
+    return [
+        (
+            delivery_id,
+            plan_projected_delivery_from_current_policy(
+                conn,
+                route_number=route_number,
+                delivery_id=delivery_id,
+                now_utc=now_utc,
+                timezone_name=timezone_name,
+            ),
+        )
+        for delivery_id in delivery_ids
+    ]
+
+
 def _token_hash(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
@@ -817,24 +1139,28 @@ def refresh_lifecycle_claim_authority(
     with conn.cursor() as cur:
         cur.execute(
             """
+            WITH effect_boundary AS MATERIALIZED (
+                SELECT clock_timestamp() AS checked_at
+            )
             UPDATE due_work
             SET status = CASE WHEN %s THEN 'dispatching' ELSE status END,
-                lease_expires_at = clock_timestamp()
+                lease_expires_at = effect_boundary.checked_at
                     + (%s * INTERVAL '1 second'),
                 dispatch_deadline_at = CASE
                     WHEN %s OR status = 'dispatching'
-                    THEN clock_timestamp() + (%s * INTERVAL '1 second')
+                    THEN effect_boundary.checked_at + (%s * INTERVAL '1 second')
                     ELSE NULL
                 END,
-                updated_at = clock_timestamp()
+                updated_at = effect_boundary.checked_at
+            FROM effect_boundary
             WHERE id = %s
               AND kind = 'lifecycle'
               AND status = ANY(%s)
               AND claim_token_hash = %s
-              AND lease_expires_at > clock_timestamp()
-              AND deadline_at >= clock_timestamp()
+              AND lease_expires_at > effect_boundary.checked_at
+              AND deadline_at >= effect_boundary.checked_at
                     + (%s * INTERVAL '1 second')
-            RETURNING clock_timestamp()
+            RETURNING effect_boundary.checked_at
             """,
             (
                 begin_effect,

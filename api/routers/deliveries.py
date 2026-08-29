@@ -26,11 +26,19 @@ from fastapi.responses import FileResponse, Response
 
 from ..dependencies import (
     get_firestore,
+    get_pg_connection,
     require_route_access,
+    return_pg_connection,
     verify_firebase_token,
 )
 from ..middleware.rate_limit import rate_limit_history
 from ..models import ErrorResponse
+from ..pcf_active_serving import (
+    ProjectionContractError,
+    ProjectionUnavailable,
+    get_active_delivery_from_postgres,
+    list_active_deliveries_from_postgres,
+)
 
 logger = logging.getLogger("api.deliveries")
 
@@ -518,21 +526,30 @@ async def get_archived_image(
 # Active PCF Endpoints
 # ---------------------------------------------------------------------------
 
-def _process_active_container(container_doc, delivery_data: Dict[str, Any]) -> Dict[str, Any]:
+def _process_active_container(
+    container_doc,
+    delivery_data: Dict[str, Any],
+    *,
+    include_pages: bool = True,
+) -> Dict[str, Any]:
     """Process an active container document into a summary."""
     cdata = container_doc.to_dict() or {}
 
     # Extract items from pages for product search support
     products = []
     pages_data = []
+    page_count = 0
 
-    for page in cdata.get("pages", []):
+    for page_index, page in enumerate(cdata.get("pages", []), start=1):
+        page_count = page_index
         page_items = []
         for item in page.get("items", []):
             if item.get("product"):
                 # Detect short-coded items (days contains *)
                 days = item.get("days", "")
-                is_short_coded = "*" in days if days else False
+                is_short_coded = item.get("isShortCoded") is True or (
+                    "*" in days if days else False
+                )
 
                 product_info = {
                     "product": item.get("product"),
@@ -540,6 +557,7 @@ def _process_active_container(container_doc, delivery_data: Dict[str, Any]) -> D
                     "bestBefore": item.get("bestBefore"),
                     "days": days,
                     "isShortCoded": is_short_coded,
+                    "visibleOnList": item.get("visibleOnList") is not False,
                 }
 
                 # Include guarantee info if present
@@ -550,18 +568,19 @@ def _process_active_container(container_doc, delivery_data: Dict[str, Any]) -> D
                 products.append({
                     **product_info,
                     "containerCode": container_doc.id,
-                    "pageNumber": page.get("pageNumber", len(pages_data) + 1),
+                    "pageNumber": page.get("pageNumber", page_index),
                 })
 
-        pages_data.append({
-            "pageNumber": page.get("pageNumber", len(pages_data) + 1),
-            "items": page_items,
-        })
+        if include_pages:
+            pages_data.append({
+                "pageNumber": page.get("pageNumber", page_index),
+                "items": page_items,
+            })
 
     return {
         "containerCode": container_doc.id,
         "loadingDate": cdata.get("loadingDate"),
-        "pageCount": len(pages_data),
+        "pageCount": page_count,
         "totalItems": cdata.get("totalItems", len(products)),
         "expiringItems": cdata.get("expiringItems", 0),
         "expiredItems": cdata.get("expiredItems", 0),
@@ -590,74 +609,25 @@ async def list_active_deliveries(
     """
     await require_route_access(route, decoded_token, db)
 
-    deliveries = []
-
+    conn = None
     try:
-        pcfs_ref = db.collection("routes").document(route).collection("pcfs")
-
-        for delivery_doc in pcfs_ref.stream():
-            delivery_data = delivery_doc.to_dict() or {}
-
-            # Get containers for this delivery
-            containers_ref = delivery_doc.reference.collection("containers")
-            containers = []
-            total_items = 0
-            total_expiring = 0
-            total_expired = 0
-            loading_date = None
-            all_products = []
-
-            for container_doc in containers_ref.stream():
-                container_info = _process_active_container(container_doc, delivery_data)
-                containers.append({
-                    "containerCode": container_info["containerCode"],
-                    "pageCount": container_info["pageCount"],
-                    "totalItems": container_info["totalItems"],
-                })
-                total_items += container_info["totalItems"]
-                total_expiring += container_info.get("expiringItems", 0)
-                total_expired += container_info.get("expiredItems", 0)
-                all_products.extend(container_info["products"])
-
-                if not loading_date and container_info.get("loadingDate"):
-                    loading_date = container_info["loadingDate"]
-
-            deliveries.append({
-                "deliveryNumber": delivery_doc.id,
-                "routeNumber": route,
-                "status": delivery_data.get("status", "active"),
-                "loadingDate": loading_date,
-                "containerCount": len(containers),
-                "totalItems": total_items,
-                "expiringItems": total_expiring,
-                "expiredItems": total_expired,
-                "containers": containers,
-                "products": all_products,  # For client-side product search
-                "createdAt": delivery_data.get("createdAt"),
-                "updatedAt": delivery_data.get("updatedAt"),
-            })
-
-    except Exception as exc:
-        logger.error("Error fetching active PCFs for route %s: %s", route, exc)
-        raise HTTPException(500, "Failed to fetch active deliveries")
-
-    # Sort by loading date descending (newest first)
-    # loadingDate is MM/DD/YYYY — parse to YYYY-MM-DD for correct sort
-    def _parse_loading_date(d: dict) -> str:
-        ld = d.get("loadingDate") or ""
-        if "/" in ld:
-            parts = ld.split("/")
-            if len(parts) == 3:
-                return f"{parts[2]}-{parts[0].zfill(2)}-{parts[1].zfill(2)}"
-        return ld or "0000-00-00"
-
-    deliveries.sort(key=_parse_loading_date, reverse=True)
-
-    return _serialize({
-        "items": deliveries,
-        "total": len(deliveries),
-        "route": route,
-    })
+        conn = get_pg_connection()
+        return _serialize(list_active_deliveries_from_postgres(conn, route))
+    except ProjectionUnavailable as exc:
+        logger.info("active_pcf_projection_unavailable reason=%s", exc.reason)
+        raise HTTPException(
+            503,
+            {"code": "projection_unavailable", "reason": exc.reason},
+        ) from exc
+    except ProjectionContractError as exc:
+        logger.exception("active_pcf_projection_contract_error")
+        raise HTTPException(
+            503,
+            {"code": "projection_unusable", "reason": "contract_error"},
+        ) from exc
+    finally:
+        if conn is not None:
+            return_pg_connection(conn)
 
 
 @router.get(
@@ -683,43 +653,32 @@ async def get_active_delivery(
     if not _is_safe_pcf_resource_id(delivery_id):
         raise HTTPException(400, "Invalid delivery ID")
 
+    conn = None
     try:
-        delivery_ref = (
-            db.collection("routes")
-            .document(route)
-            .collection("pcfs")
-            .document(delivery_id)
+        conn = get_pg_connection()
+        delivery = get_active_delivery_from_postgres(
+            conn,
+            route,
+            delivery_id,
         )
-        delivery_doc = delivery_ref.get()
-
-        if not delivery_doc.exists:
+        if delivery is None:
             raise HTTPException(404, "Delivery not found")
-
-        delivery_data = delivery_doc.to_dict() or {}
-
-        # Get all containers with full detail
-        containers = []
-        containers_ref = delivery_ref.collection("containers")
-
-        for container_doc in containers_ref.stream():
-            container_info = _process_active_container(container_doc, delivery_data)
-            containers.append(container_info)
-
-        return _serialize({
-            "deliveryNumber": delivery_id,
-            "routeNumber": route,
-            "status": delivery_data.get("status", "active"),
-            "containers": containers,
-            "createdAt": delivery_data.get("createdAt"),
-            "updatedAt": delivery_data.get("updatedAt"),
-            "source": "firebase",
-        })
-
-    except HTTPException:
-        raise
-    except Exception as exc:
-        logger.error("Error fetching active delivery %s: %s", delivery_id, exc)
-        raise HTTPException(500, "Failed to fetch delivery")
+        return _serialize(delivery)
+    except ProjectionUnavailable as exc:
+        logger.info("active_pcf_projection_unavailable reason=%s", exc.reason)
+        raise HTTPException(
+            503,
+            {"code": "projection_unavailable", "reason": exc.reason},
+        ) from exc
+    except ProjectionContractError as exc:
+        logger.exception("active_pcf_projection_contract_error")
+        raise HTTPException(
+            503,
+            {"code": "projection_unusable", "reason": "contract_error"},
+        ) from exc
+    finally:
+        if conn is not None:
+            return_pg_connection(conn)
 
 
 @router.get(

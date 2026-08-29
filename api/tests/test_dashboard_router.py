@@ -13,6 +13,7 @@ class DashboardRouterAuthorizationTests(unittest.IsolatedAsyncioTestCase):
         db = object()
         conn = object()
         payload = {
+            "routeNumber": "989262",
             "activePcfs": [],
             "expiringItems": [],
             "freshness": {"fresh": True, "source": "postgres"},
@@ -25,7 +26,7 @@ class DashboardRouterAuthorizationTests(unittest.IsolatedAsyncioTestCase):
         ) as route_access, patch.object(
             dashboard, "get_pg_connection", return_value=conn
         ), patch.object(
-            dashboard, "get_dashboard_summary_payload", return_value=payload
+            dashboard, "get_dashboard_summary_from_postgres", return_value=payload
         ) as load_payload, patch.object(
             dashboard, "return_pg_connection"
         ) as return_connection:
@@ -39,9 +40,7 @@ class DashboardRouterAuthorizationTests(unittest.IsolatedAsyncioTestCase):
         route_access.assert_awaited_once_with(
             "989262", {"uid": "route-member"}, db
         )
-        load_payload.assert_called_once_with(
-            db=db, conn=conn, route_number="989262"
-        )
+        load_payload.assert_called_once_with(conn, "989262")
         return_connection.assert_called_once_with(conn)
         self.assertEqual(result["routeNumber"], "989262")
 

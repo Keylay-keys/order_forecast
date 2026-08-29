@@ -1,0 +1,44 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://routespark.internal/contracts/pcf/runtime-control-document-v1.schema.json",
+  "title": "RouteSpark PCF atomic runtime control",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "contractVersion",
+    "revision",
+    "previousRevision",
+    "updatedAt",
+    "approvedBy",
+    "goDecisionEvidence",
+    "controls"
+  ],
+  "properties": {
+    "contractVersion": { "const": "pcf-runtime-control-document-v1" },
+    "revision": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "previousRevision": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "updatedAt": { "type": "string", "format": "date-time" },
+    "approvedBy": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "goDecisionEvidence": { "type": "string", "minLength": 1, "maxLength": 2048 },
+    "controls": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "PCF_FIRESTORE_DISCOVERY_MODE",
+        "PCF_CLUSTER_STAGE",
+        "PCF_FIREBASE_WRITE_AUTHORITY"
+      ],
+      "properties": {
+        "PCF_FIRESTORE_DISCOVERY_MODE": {
+          "enum": ["legacy", "bounded", "disabled"]
+        },
+        "PCF_CLUSTER_STAGE": {
+          "enum": ["off", "ingress", "shadow", "claims", "projection"]
+        },
+        "PCF_FIREBASE_WRITE_AUTHORITY": {
+          "enum": ["legacy_mac", "cluster"]
+        }
+      }
+    }
+  }
+}

@@ -17,11 +17,12 @@
     "project": "routespark-1f47d",
     "location": "us-central1",
     "queue": "pcf-event-ingress-v1",
+    "producerServiceAccount": "pcf-event-producer@routespark-1f47d.iam.gserviceaccount.com",
     "target": "https://api.routespark.pro/internal/v1/pcf/events",
     "method": "POST",
     "contentType": "application/json",
     "bodyBytesMax": 65536,
-    "providerTaskBytesMax": 1048576,
+    "providerTaskBytesMax": 102400,
     "taskId": "base32_lower_sha256_source_event_id",
     "delivery": "at_least_once",
     "retentionDays": 31,
@@ -36,6 +37,24 @@
     "rate": {
       "maxDispatchesPerSecond": 5,
       "maxConcurrentDispatches": 10
+    },
+    "queueOverrides": {
+      "method": "POST",
+      "scheme": "HTTPS",
+      "host": "api.routespark.pro",
+      "path": "/internal/v1/pcf/events",
+      "contentType": "application/json",
+      "oidcServiceAccount": "pcf-task-dispatcher@routespark-1f47d.iam.gserviceaccount.com",
+      "oidcAudience": "https://api.routespark.pro/internal/v1/pcf/events"
+    },
+    "iam": {
+      "producerProjectRoles": [
+        "roles/datastore.user",
+        "roles/logging.logWriter"
+      ],
+      "producerQueueRole": "roles/cloudtasks.enqueuer",
+      "dispatcherActAsRole": "roles/iam.serviceAccountUser",
+      "queueScopedEnqueuer": true
     },
     "ageControls": {
       "operatingSloSeconds": 300,

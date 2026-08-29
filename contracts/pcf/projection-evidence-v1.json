@@ -12,8 +12,8 @@
     "firestorePathScopeClaimed": false,
     "applicationWriteAllowlist": [
       "pcf_processing_queue/{route}/queue/{delivery}",
-      "routes/{route}/pcf/{delivery}",
-      "routes/{route}/pcf/{delivery}/containers/{container}",
+      "routes/{route}/pcfs/{delivery}",
+      "routes/{route}/pcfs/{delivery}/containers/{container}",
       "routeDashboardSummaries/{route}",
       "routeDashboardSummaries/{route}/containers/{container}",
       "admin_alerts/{deterministicAlertId}"
@@ -28,6 +28,16 @@
     ]
   },
   "storageBoundaries": {
+    "canonicalProjector": {
+      "identity": "routespark-pcf-object-projector@routespark-1f47d.iam.gserviceaccount.com",
+      "customRole": "projects/routespark-1f47d/roles/routesparkPcfObjectProjector",
+      "permissions": ["storage.objects.get", "storage.objects.create", "storage.objects.update"],
+      "bucketCondition": "resource.name.startsWith('projects/_/buckets/routespark-1f47d.firebasestorage.app/objects/routes/')",
+      "callerBinding": "roles/iam.serviceAccountTokenCreator granted only to routespark-pcf-projection-fb on this service account",
+      "sourceGenerationPreconditionRequired": true,
+      "destinationGenerationPreconditionRequired": true,
+      "prefixOrBulkWriteForbidden": true
+    },
     "claimUrlSigner": {
       "identity": "routespark-pcf-object-signer@routespark-1f47d.iam.gserviceaccount.com",
       "customRole": "projects/routespark-1f47d/roles/routesparkPcfObjectReader",
@@ -59,6 +69,13 @@
   "evidenceAuthority": {
     "root": "/Volumes/Extreme SSD/routespark_offload/ocr-agent-review",
     "owner": "Mac OCR/review workflow",
+    "clusterReadMount": {
+      "root": "/mnt/routespark-pcf-evidence",
+      "mode": "readOnly",
+      "requiredFor": ["projecting", "cleaning"],
+      "writableByCluster": false,
+      "missingBehavior": "block_current_effect_step"
+    },
     "packageIdentity": ["route", "delivery", "inputHashVersion", "inputHash"],
     "requiredBeforeProjection": [
       "exact source-object inventory with Storage generations",

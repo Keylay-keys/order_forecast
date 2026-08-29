@@ -10,11 +10,13 @@ from order_forecast.api.pcf_event_contract import business_hash, firestore_revis
 from order_forecast.scripts.pcf_lifecycle_due import (
     ClaimedLifecycleWork,
     LifecycleContractError,
+    MAX_ROUTE_REPLAN_DELIVERIES,
     ProjectedContainer,
     build_cleanup_plan,
     business_date_at,
     cleanup_authority_decision,
     claim_one_lifecycle_work,
+    plan_projected_route_from_current_policy,
     resolve_cleanup_due_at,
 )
 
@@ -152,6 +154,50 @@ class CleanupCalendarTests(unittest.TestCase):
         )
         self.assertIsNotNone(plan.candidate)
         self.assertEqual(plan.candidate.item_count, 1)
+
+    def test_route_policy_replan_query_is_active_scoped_and_hard_bounded(self):
+        class Cursor:
+            def __init__(self):
+                self.sql = ""
+                self.params = ()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def execute(self, sql, params):
+                self.sql = " ".join(sql.split())
+                self.params = params
+
+            def fetchall(self):
+                return [(f"D{index}",) for index in range(MAX_ROUTE_REPLAN_DELIVERIES + 1)]
+
+        class Connection:
+            def __init__(self):
+                self.last_cursor = None
+
+            def cursor(self, *args, **kwargs):
+                self.last_cursor = Cursor()
+                return self.last_cursor
+
+        conn = Connection()
+        with self.assertRaisesRegex(
+            LifecycleContractError,
+            "route_active_delivery_limit_exceeded",
+        ):
+            plan_projected_route_from_current_policy(
+                conn,
+                route_number="989262",
+                now_utc=datetime(2026, 8, 28, tzinfo=timezone.utc),
+            )
+        self.assertIn("HAVING BOOL_OR(active)", conn.last_cursor.sql)
+        self.assertIn("LIMIT %s", conn.last_cursor.sql)
+        self.assertEqual(
+            conn.last_cursor.params,
+            ("989262", MAX_ROUTE_REPLAN_DELIVERIES + 1),
+        )
 
     def test_spring_dst_gap_moves_two_am_to_first_valid_instant(self):
         self.assertEqual(

@@ -22,7 +22,12 @@ ROOT = Path(__file__).resolve().parents[1]
 MIGRATION_PATH = ROOT / "migrations/pcf/0001_items_current_due_work.sql"
 CHECKSUM_PATH = ROOT / "migrations/pcf/0001_items_current_due_work.sha256"
 
-TABLES = ("items_current", "pcf_projection_routes", "due_work")
+TABLES = (
+    "items_current",
+    "pcf_projection_routes",
+    "route_dashboard_summaries",
+    "due_work",
+)
 INDEXES = (
     "items_current_active_route_delivery_idx",
     "items_current_active_serving_idx",
@@ -33,6 +38,46 @@ INDEXES = (
     "due_work_terminal_prune_idx",
 )
 ROLES = ("routespark_pcf_owner", "routespark_pcf_app")
+RETENTION_COLUMNS = (
+    "lifecycle_policy_active",
+    "lifecycle_retention_days",
+    "lifecycle_policy_revision",
+    "lifecycle_policy_synced_at",
+)
+RECONCILIATION_COLUMNS = (
+    "last_reconciliation_attempt_at",
+    "last_reconciled_at",
+)
+ROUTE_RUNTIME_INSERT_COLUMNS = (
+    "route_number",
+    "last_projected_revision",
+    "last_projected_at",
+    "lifecycle_policy_active",
+    "lifecycle_retention_days",
+    "lifecycle_policy_revision",
+    "lifecycle_policy_synced_at",
+    "created_at",
+    "updated_at",
+)
+ROUTE_RUNTIME_UPDATE_COLUMNS = (
+    "reconciliation_status",
+    "last_projected_revision",
+    "last_projected_at",
+    "parity_source_revision",
+    "parity_projection_revision",
+    "source_entity_count",
+    "projection_entity_count",
+    "source_business_hash",
+    "projection_business_hash",
+    "last_reconciliation_attempt_at",
+    "last_reconciled_at",
+    "healthy_until",
+    "lifecycle_policy_active",
+    "lifecycle_retention_days",
+    "lifecycle_policy_revision",
+    "lifecycle_policy_synced_at",
+    "updated_at",
+)
 
 
 def migration_sha256() -> str:
@@ -63,6 +108,7 @@ def inspect(conn) -> dict:
         cur.execute(
             "SELECT to_regclass('public.items_current'), "
             "to_regclass('public.pcf_projection_routes'), "
+            "to_regclass('public.route_dashboard_summaries'), "
             "to_regclass('public.due_work')"
         )
         table_values = cur.fetchone()
@@ -90,6 +136,30 @@ def inspect(conn) -> dict:
         )
         role_rows = cur.fetchall()
         present_roles = [row[0] for row in role_rows]
+        cur.execute(
+            """
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = 'public'
+              AND table_name = 'pcf_projection_routes'
+              AND column_name = ANY(%s)
+            ORDER BY column_name
+            """,
+            (list(RETENTION_COLUMNS),),
+        )
+        retention_columns = [row[0] for row in cur.fetchall()]
+        cur.execute(
+            """
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = 'public'
+              AND table_name = 'pcf_projection_routes'
+              AND column_name = ANY(%s)
+            ORDER BY column_name
+            """,
+            (list(RECONCILIATION_COLUMNS),),
+        )
+        reconciliation_columns = [row[0] for row in cur.fetchall()]
         cur.execute(
             """
             SELECT tablename, tableowner
@@ -140,11 +210,25 @@ def inspect(conn) -> dict:
             (list(TABLES),),
         )
         grants = [(row[0], row[1]) for row in cur.fetchall()]
+        cur.execute(
+            """
+            SELECT column_name, privilege_type
+            FROM information_schema.column_privileges
+            WHERE grantee = 'routespark_pcf_app'
+              AND table_schema = 'public'
+              AND table_name = 'pcf_projection_routes'
+              AND privilege_type IN ('INSERT', 'UPDATE')
+            ORDER BY column_name, privilege_type
+            """
+        )
+        route_column_grants = [(row[0], row[1]) for row in cur.fetchall()]
     conn.rollback()
     ready = (
         set(present_tables) == set(TABLES)
         and set(present_indexes) == set(INDEXES)
         and set(present_roles) == set(ROLES)
+        and set(retention_columns) == set(RETENTION_COLUMNS)
+        and set(reconciliation_columns) == set(RECONCILIATION_COLUMNS)
         and role_rows
         == [
             ("routespark_pcf_app", True, False, False, False),
@@ -156,9 +240,21 @@ def inspect(conn) -> dict:
         and default_public_grant_count == 0
         and set(grants)
         == {
-            (table, privilege)
-            for table in TABLES
-            for privilege in ("INSERT", "SELECT", "UPDATE")
+            ("due_work", "INSERT"),
+            ("due_work", "SELECT"),
+            ("due_work", "UPDATE"),
+            ("items_current", "INSERT"),
+            ("items_current", "SELECT"),
+            ("items_current", "UPDATE"),
+            ("pcf_projection_routes", "SELECT"),
+            ("route_dashboard_summaries", "INSERT"),
+            ("route_dashboard_summaries", "SELECT"),
+            ("route_dashboard_summaries", "UPDATE"),
+        }
+        and set(route_column_grants)
+        == {
+            *((column, "INSERT") for column in ROUTE_RUNTIME_INSERT_COLUMNS),
+            *((column, "UPDATE") for column in ROUTE_RUNTIME_UPDATE_COLUMNS),
         }
     )
     return {
@@ -167,11 +263,14 @@ def inspect(conn) -> dict:
         "tables": sorted(present_tables),
         "indexes": sorted(present_indexes),
         "roles": sorted(present_roles),
+        "retentionColumns": sorted(retention_columns),
+        "reconciliationColumns": sorted(reconciliation_columns),
         "roleAttributes": role_rows,
         "tableOwners": owners,
         "runtimeIsOwnerMember": runtime_is_owner_member,
         "defaultPublicGrantCount": default_public_grant_count,
         "runtimeTableGrants": grants,
+        "runtimeRouteColumnGrants": route_column_grants,
         "ready": ready,
     }
 

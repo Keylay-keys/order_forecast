@@ -46,6 +46,20 @@
     "reservationMeaning": "names only; no Firebase or Storage object exists or is claimed to exist",
     "createPolicy": "create-only in routespark-pcf-test-20260820 after runtime project-number read-back; refuse if any exact destination exists"
   },
+  "productionLegacyFixtures": [
+    {
+      "identity": "ocr-correction-988200-1806116556",
+      "generation": "legacy-v1",
+      "route": "988200",
+      "delivery": "1806116556",
+      "container": "100737310336040934",
+      "parentClassification": "invalid_fixture_marker",
+      "containerClassification": "ordinary_data",
+      "disposition": "exclude this exact entity through the signed immutable registry; do not weaken metadata classification and do not exclude route 988200",
+      "sourceEvidence": "deploy/firebase-tools/scripts/create-ocr-correction-fixture.js hard-codes this exact route/delivery/container and writes metadata.fixture=true plus metadata.automationExcluded=true",
+      "liveEvidence": "read-only 2026-08-28 exact-path audit found the parent legacy boolean fixture shape and an ordinary container; no payload values or write were used"
+    }
+  ],
   "testVectors": [
     {
       "name": "canonical_top_level",

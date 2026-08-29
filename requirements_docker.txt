@@ -14,6 +14,10 @@ psycopg2-binary>=2.9
 # Firebase
 firebase-admin>=6.0
 google-cloud-firestore>=2.0
+# Direct dependencies for generation-bound V4 claim URLs through IAM signBlob;
+# do not rely on Firebase Admin's transitive dependency set.
+google-auth>=2.43,<3
+google-cloud-storage>=3.7,<4
 
 # Web API (FastAPI)
 fastapi>=0.109

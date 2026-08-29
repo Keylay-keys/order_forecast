@@ -28,6 +28,7 @@
     "eventType": {
       "enum": [
         "projection.pcf_container.changed",
+        "projection.pcf_retention.changed",
         "projection.pcf_delivery.changed",
         "projection.notification_recipient.changed",
         "projection.route_entitlement.changed"
@@ -109,6 +110,21 @@
               "oneOf": [
                 { "type": "null" },
                 { "$ref": "#/definitions/recipientPayload" }
+              ]
+            }
+          }
+        },
+        {
+          "properties": {
+            "eventType": { "const": "projection.pcf_retention.changed" },
+            "sourcePath": {
+              "pattern": "^pcfProjectionRoutePolicies/[0-9]{1,10}$"
+            },
+            "entity": { "$ref": "#/definitions/routeEntity" },
+            "payload": {
+              "oneOf": [
+                { "type": "null" },
+                { "$ref": "#/definitions/retentionPayload" }
               ]
             }
           }
@@ -296,6 +312,15 @@
             { "$ref": "#/definitions/sha256" }
           ]
         }
+      }
+    },
+    "retentionPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["retentionDays", "ownerUserId"],
+      "properties": {
+        "retentionDays": { "type": "integer", "minimum": 1, "maximum": 3650 },
+        "ownerUserId": { "$ref": "#/definitions/entityId" }
       }
     },
     "entitlementPayload": {

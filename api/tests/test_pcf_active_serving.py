@@ -167,6 +167,65 @@ class PcfActiveServingTests(unittest.TestCase):
                 )
             )
 
+    def test_dashboard_contract_is_built_from_projection_without_firebase(self):
+        rows = [
+            _row(
+                items=[
+                    _item(
+                        product="1001",
+                        description="Whole Milk",
+                        expiry="2026-08-30",
+                        visible=False,
+                        low_quantity=True,
+                        short_coded=True,
+                        guaranteed={
+                            "isGuaranteed": True,
+                            "guaranteeExpiresAt": "2026-09-30T00:00:00Z",
+                        },
+                    ),
+                    _item(position=1, product="1002", expiry=None),
+                ]
+            )
+        ]
+        with (
+            patch.object(serving, "_load_route_state", return_value=_state()),
+            patch.object(serving, "_load_rows", return_value=rows),
+        ):
+            result = serving.get_dashboard_summary_from_postgres(
+                object(), "988200", now_utc=NOW
+            )
+
+        self.assertEqual(result["freshness"]["source"], "postgres")
+        self.assertTrue(result["freshness"]["fresh"])
+        self.assertEqual(result["counts"]["totalContainers"], 1)
+        self.assertEqual(result["activePcfs"][0]["itemCount"], 2)
+        self.assertEqual(len(result["activePcfs"][0]["items"]), 1)
+        item = result["expiringItems"][0]
+        self.assertEqual(item["expiryDate"], "08/30/2026")
+        self.assertEqual(item["daysLeft"], 5)
+        self.assertTrue(item["isShortCoded"])
+        self.assertFalse(item["visibleOnList"])
+        self.assertTrue(item["isLowQuantity"])
+        self.assertEqual(item["pageNumber"], 1)
+        self.assertEqual(
+            item["guaranteed"]["guaranteeExpiresAt"],
+            "2026-09-30T00:00:00Z",
+        )
+
+    def test_dashboard_zero_rows_is_fresh_only_after_route_gate_passes(self):
+        with (
+            patch.object(serving, "_load_route_state", return_value=_state()),
+            patch.object(serving, "_load_rows", return_value=[]),
+        ):
+            result = serving.get_dashboard_summary_from_postgres(
+                object(), "988200", now_utc=NOW
+            )
+
+        self.assertEqual(result["activePcfs"], [])
+        self.assertEqual(result["expiringItems"], [])
+        self.assertEqual(result["counts"]["totalPCFs"], 0)
+        self.assertTrue(result["freshness"]["fresh"])
+
     def test_route_state_is_fail_closed_for_each_required_proof(self):
         complete = {
             "route_number": "988200",

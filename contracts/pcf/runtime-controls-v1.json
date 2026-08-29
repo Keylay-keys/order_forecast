@@ -11,8 +11,10 @@
     "mutationRule": "replace the one ConfigMap object using its current resourceVersion; never patch individual control keys"
   },
   "revisionContract": {
-    "revision": "lowercase 64-character SHA-256 of the canonical proposed control document excluding signatures",
+    "documentSchema": "runtime-control-document-v1.schema.json",
+    "revision": "lowercase 64-character SHA-256 of UTF-8 JSON with keys sorted and compact separators over the complete proposed control document excluding only the self-referential revision field",
     "previousRevision": "the exact currently observed revision, required on every transition",
+    "bootstrapPreviousRevision": "64 lowercase zeroes for the first object only",
     "updatedAt": "RFC 3339 UTC",
     "approvedBy": "named release owner",
     "goDecisionEvidence": "absolute external-volume path to the signed phase bundle",
@@ -52,6 +54,13 @@
     "mac": "authenticated Mac worker reads the revision through the internal API; a cached revision is usable only for its signed max age and never grants direct Firebase writes",
     "legacyDiscovery": "legacy Mac discovery receives only the validated discovery value; on invalid or expired state it disables discovery",
     "maxObservedRevisionAgeSeconds": 300
+  },
+  "endpointGates": {
+    "POST /internal/v1/pcf/events": "ingress or later",
+    "POST /internal/v1/pcf/claims": "shadow or later",
+    "POST heartbeat; PUT result": "shadow or later so an admitted shadow/active claim can renew and finish",
+    "POST /internal/v1/pcf/backups/offbox-verifications": "ingress or later for append-only receipt acceptance; TTL repair remains projection-only",
+    "queue TTL repair": "projection plus cluster write authority plus disabled Firestore discovery"
   },
   "rollout": {
     "implementationPhase": "P2",

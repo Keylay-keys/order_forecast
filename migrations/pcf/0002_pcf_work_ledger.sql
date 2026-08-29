@@ -31,12 +31,14 @@ CREATE TABLE IF NOT EXISTS pcf_work_items (
     work_id UUID PRIMARY KEY,
     route_number TEXT NOT NULL,
     delivery_number TEXT NOT NULL,
+    source_revision TEXT NOT NULL,
     input_hash TEXT NOT NULL,
     input_hash_version TEXT NOT NULL,
     status TEXT NOT NULL,
     required_capability TEXT NOT NULL,
     priority SMALLINT NOT NULL DEFAULT 100,
     manifest JSONB NOT NULL,
+    ocr_context JSONB NOT NULL,
     result JSONB,
     source_queue_path TEXT NOT NULL,
     not_before TIMESTAMPTZ NOT NULL,
@@ -58,9 +60,13 @@ CREATE TABLE IF NOT EXISTS pcf_work_items (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     completed_at TIMESTAMPTZ,
     UNIQUE (route_number, delivery_number, input_hash_version, input_hash),
+    UNIQUE (route_number, delivery_number, source_revision),
     CONSTRAINT pcf_work_route_valid CHECK (route_number ~ '^[0-9]{1,10}$'),
     CONSTRAINT pcf_work_delivery_valid CHECK (
         delivery_number ~ '^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$'
+    ),
+    CONSTRAINT pcf_work_source_revision_valid CHECK (
+        source_revision ~ '^fsut1\|[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{9}Z\|0$'
     ),
     CONSTRAINT pcf_work_input_hash_valid CHECK (input_hash ~ '^[0-9a-f]{64}$'),
     CONSTRAINT pcf_work_input_hash_version_valid CHECK (
@@ -77,6 +83,7 @@ CREATE TABLE IF NOT EXISTS pcf_work_items (
         required_capability = 'macos_vision'
     ),
     CONSTRAINT pcf_work_manifest_object CHECK (jsonb_typeof(manifest) = 'object'),
+    CONSTRAINT pcf_work_ocr_context_object CHECK (jsonb_typeof(ocr_context) = 'object'),
     CONSTRAINT pcf_work_result_object CHECK (
         result IS NULL OR jsonb_typeof(result) = 'object'
     ),
@@ -144,6 +151,22 @@ CREATE TABLE IF NOT EXISTS pcf_work_items (
     )
 );
 
+-- This file is still pre-production. Keep repeated isolated-sandbox applies
+-- fail-closed while the frozen v1 shape is finalized: an older non-empty test
+-- table must be explicitly rebuilt instead of receiving invented OCR context.
+ALTER TABLE pcf_work_items ADD COLUMN IF NOT EXISTS ocr_context JSONB;
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pcf_work_items WHERE ocr_context IS NULL) THEN
+        RAISE EXCEPTION 'existing PCF work rows lack frozen OCR context';
+    END IF;
+END
+$$;
+ALTER TABLE pcf_work_items ALTER COLUMN ocr_context SET NOT NULL;
+ALTER TABLE pcf_work_items DROP CONSTRAINT IF EXISTS pcf_work_ocr_context_object;
+ALTER TABLE pcf_work_items ADD CONSTRAINT pcf_work_ocr_context_object
+    CHECK (jsonb_typeof(ocr_context) = 'object');
+
 CREATE INDEX IF NOT EXISTS pcf_work_claim_ready_idx
     ON pcf_work_items (
         required_capability,
@@ -160,6 +183,28 @@ CREATE INDEX IF NOT EXISTS pcf_work_effect_due_idx
 CREATE UNIQUE INDEX IF NOT EXISTS pcf_work_one_effect_authority_idx
     ON pcf_work_items (route_number, delivery_number)
     WHERE status IN ('leased', 'processing', 'effects_pending');
+
+-- LISTEN/NOTIFY is only a wake-up optimization. The durable queued row remains
+-- authoritative, and the API closes the LISTEN registration race by querying
+-- again after registration.
+CREATE OR REPLACE FUNCTION pcf_notify_work_available()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    PERFORM pg_notify('pcf_work_available', NEW.work_id::TEXT);
+    RETURN NEW;
+END
+$$;
+
+REVOKE ALL ON FUNCTION pcf_notify_work_available() FROM PUBLIC;
+
+DROP TRIGGER IF EXISTS pcf_work_available_notify ON pcf_work_items;
+CREATE TRIGGER pcf_work_available_notify
+AFTER INSERT OR UPDATE OF status, not_before ON pcf_work_items
+FOR EACH ROW
+WHEN (NEW.status = 'queued')
+EXECUTE FUNCTION pcf_notify_work_available();
 
 CREATE TABLE IF NOT EXISTS pcf_work_events (
     event_id UUID PRIMARY KEY,
@@ -201,6 +246,12 @@ CREATE UNIQUE INDEX IF NOT EXISTS pcf_work_events_source_event_id_idx
 CREATE INDEX IF NOT EXISTS pcf_work_events_work_created_idx
     ON pcf_work_events (work_id, created_at, event_id)
     WHERE work_id IS NOT NULL;
+
+-- Queue TTL arming reads only recent authenticated off-box receipts. Keep that
+-- global operational lookup off the append-only event table's historical body.
+CREATE INDEX IF NOT EXISTS pcf_work_events_offbox_backup_idx
+    ON pcf_work_events (created_at DESC, event_id DESC)
+    WHERE event_type = 'offbox_backup_verified';
 
 RESET ROLE;
 

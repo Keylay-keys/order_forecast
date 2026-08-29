@@ -1,0 +1,66 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://routespark.local/contracts/pcf/worker-result-v1.schema.json",
+  "title": "RouteSpark PCF worker result v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion", "workId", "attemptNumber", "claimToken",
+    "inputHashVersion", "inputHash", "workerId", "workerBuildVersion",
+    "ocrContractVersion", "completedAt", "proposal", "evidencePackage"
+  ],
+  "properties": {
+    "schemaVersion": {"const": 1},
+    "workId": {"type": "string", "format": "uuid", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"},
+    "attemptNumber": {"type": "integer", "minimum": 1},
+    "claimToken": {"type": "string", "minLength": 32, "maxLength": 512},
+    "inputHashVersion": {"const": "pcf-work-input-v1"},
+    "inputHash": {"$ref": "#/$defs/sha256"},
+    "workerId": {"type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{2,63}$"},
+    "workerBuildVersion": {"type": "string", "minLength": 1, "maxLength": 128},
+    "ocrContractVersion": {"type": "string", "minLength": 1, "maxLength": 128},
+    "completedAt": {"type": "string", "format": "date-time", "pattern": "Z$"},
+    "proposal": {"$ref": "review-proposal-v1.schema.json"},
+    "evidencePackage": {"$ref": "#/$defs/evidencePackage"}
+  },
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "relativePath": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512,
+      "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$))(?!.*\\\\).+$"
+    },
+    "evidencePackage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["route", "delivery", "inputHashVersion", "inputHash", "manifestSha256", "manifestRelativePath", "artifacts"],
+      "properties": {
+        "route": {"type": "string", "pattern": "^[0-9]{1,10}$"},
+        "delivery": {"type": "string", "pattern": "^[0-9]{8,12}$"},
+        "inputHashVersion": {"const": "pcf-work-input-v1"},
+        "inputHash": {"$ref": "#/$defs/sha256"},
+        "manifestSha256": {"$ref": "#/$defs/sha256"},
+        "manifestRelativePath": {"$ref": "#/$defs/relativePath"},
+        "artifacts": {
+          "type": "array",
+          "minItems": 4,
+          "maxItems": 256,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["role", "relativePath", "sha256", "sizeBytes", "objectPath", "generation"],
+            "properties": {
+              "role": {"enum": ["source_image", "before_payload", "proposed_result", "package_manifest"]},
+              "relativePath": {"$ref": "#/$defs/relativePath"},
+              "sha256": {"$ref": "#/$defs/sha256"},
+              "sizeBytes": {"type": "integer", "minimum": 1},
+              "objectPath": {"type": ["string", "null"], "maxLength": 1024},
+              "generation": {"type": ["string", "null"], "pattern": "^[1-9][0-9]{0,19}$"}
+            }
+          }
+        }
+      }
+    }
+  }
+}

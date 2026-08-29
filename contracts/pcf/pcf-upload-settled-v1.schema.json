@@ -15,6 +15,7 @@
     "quietPeriodElapsed",
     "coverageScope",
     "manifest",
+    "ocrContext",
     "sourceQueuePath",
     "automationExcluded",
     "fixture"
@@ -46,6 +47,20 @@
           "minItems": 1,
           "maxItems": 100,
           "items": { "$ref": "#/definitions/manifestObject" }
+        }
+      }
+    },
+    "ocrContext": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["validatedLoadingDate", "containers"],
+      "properties": {
+        "validatedLoadingDate": { "$ref": "#/definitions/loadingDate" },
+        "containers": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 100,
+          "items": { "$ref": "#/definitions/ocrContainer" }
         }
       }
     },
@@ -92,6 +107,43 @@
       "type": "string",
       "pattern": "^fsut1\\|[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\\.[0-9]{9}Z\\|0$"
     },
+    "loadingDate": {
+      "type": "string",
+      "pattern": "^(?:0[1-9]|1[0-2])/(?:0[1-9]|[12][0-9]|3[01])/[0-9]{4}$"
+    },
+    "ocrContainer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "containerCode",
+        "loadingDate",
+        "ssccBypassUsed",
+        "userVerifiedContainerCode",
+        "containerCodeSource",
+        "realSsccRecovered",
+        "ssccRecoveryStatus"
+      ],
+      "properties": {
+        "containerCode": {
+          "type": "string",
+          "pattern": "^[0-9]{18}$"
+        },
+        "loadingDate": { "$ref": "#/definitions/loadingDate" },
+        "ssccBypassUsed": { "type": "boolean" },
+        "userVerifiedContainerCode": { "type": "boolean" },
+        "containerCodeSource": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^(?:[A-Za-z0-9][A-Za-z0-9._: \u002D]{0,127})?$"
+        },
+        "realSsccRecovered": { "type": "boolean" },
+        "ssccRecoveryStatus": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^(?:[A-Za-z0-9][A-Za-z0-9._: \u002D]{0,127})?$"
+        }
+      }
+    },
     "manifestObject": {
       "type": "object",
       "additionalProperties": false,
@@ -106,9 +158,9 @@
       "properties": {
         "containerCode": {
           "type": "string",
-          "minLength": 1,
-          "maxLength": 128,
-          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:\\-]{0,127}$"
+          "minLength": 18,
+          "maxLength": 18,
+          "pattern": "^[0-9]{18}$"
         },
         "uploadPageNumber": { "type": "integer", "minimum": 1, "maximum": 1000 },
         "objectPath": {

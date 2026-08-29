@@ -25,8 +25,10 @@ INDEXES = (
     "pcf_work_one_effect_authority_idx",
     "pcf_work_events_source_event_id_idx",
     "pcf_work_events_work_created_idx",
+    "pcf_work_events_offbox_backup_idx",
 )
 ROLES = ("routespark_pcf_owner", "routespark_pcf_app")
+TRIGGERS = ("pcf_work_available_notify",)
 
 
 def migration_sha256() -> str:
@@ -62,6 +64,18 @@ def inspect(conn) -> dict:
         present_tables = [
             name for name, value in zip(TABLES, table_values) if value is not None
         ]
+        work_columns = []
+        if "pcf_work_items" in present_tables:
+            cur.execute(
+                """
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_schema = 'public' AND table_name = 'pcf_work_items'
+                  AND column_name IN ('manifest', 'ocr_context', 'source_revision')
+                ORDER BY column_name
+                """
+            )
+            work_columns = [row[0] for row in cur.fetchall()]
         cur.execute(
             """
             SELECT indexname
@@ -72,6 +86,21 @@ def inspect(conn) -> dict:
             (list(INDEXES),),
         )
         present_indexes = [row[0] for row in cur.fetchall()]
+        cur.execute(
+            """
+            SELECT trigger.tgname
+            FROM pg_trigger AS trigger
+            JOIN pg_class AS relation ON relation.oid = trigger.tgrelid
+            JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+            WHERE namespace.nspname = 'public'
+              AND relation.relname = 'pcf_work_items'
+              AND NOT trigger.tgisinternal
+              AND trigger.tgname = ANY(%s)
+            ORDER BY trigger.tgname
+            """,
+            (list(TRIGGERS),),
+        )
+        present_triggers = [row[0] for row in cur.fetchall()]
         cur.execute(
             """
             SELECT rolname, rolcanlogin, rolsuper, rolcreatedb, rolcreaterole
@@ -156,7 +185,9 @@ def inspect(conn) -> dict:
     }
     ready = (
         set(present_tables) == set(TABLES)
+        and set(work_columns) == {"manifest", "ocr_context", "source_revision"}
         and set(present_indexes) == set(INDEXES)
+        and set(present_triggers) == set(TRIGGERS)
         and set(present_roles) == set(ROLES)
         and role_rows
         == [
@@ -177,7 +208,9 @@ def inspect(conn) -> dict:
         "mode": "read-only",
         "checksum": verify_checksum(),
         "tables": sorted(present_tables),
+        "workColumns": sorted(work_columns),
         "indexes": sorted(present_indexes),
+        "triggers": sorted(present_triggers),
         "roles": sorted(present_roles),
         "roleAttributes": role_rows,
         "tableOwners": owners,

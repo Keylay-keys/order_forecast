@@ -28,6 +28,9 @@ class PcfWorkSchemaMigrationTests(unittest.TestCase):
             re.compile(r"GRANT[^;]*UPDATE[^;]*pcf_work_events", re.IGNORECASE),
         )
         self.assertIn("ON DELETE RESTRICT", sql)
+        self.assertIn("REVOKE ALL ON FUNCTION pcf_notify_work_available() FROM PUBLIC", sql)
+        self.assertIn("AFTER INSERT OR UPDATE OF status, not_before", sql)
+        self.assertIn("pg_notify('pcf_work_available'", sql)
 
     def test_schema_has_exact_hot_and_idempotency_indexes(self):
         self.assertEqual(
@@ -38,6 +41,7 @@ class PcfWorkSchemaMigrationTests(unittest.TestCase):
                 "pcf_work_one_effect_authority_idx",
                 "pcf_work_events_source_event_id_idx",
                 "pcf_work_events_work_created_idx",
+                "pcf_work_events_offbox_backup_idx",
             },
         )
 

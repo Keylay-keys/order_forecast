@@ -414,3 +414,130 @@ def get_active_delivery_from_postgres(
         "projectionRevision": state.last_projected_revision,
         "healthyUntil": state.healthy_until.isoformat(),
     }
+
+
+def get_dashboard_summary_from_postgres(
+    conn: Any,
+    route_number: str,
+    *,
+    now_utc: datetime | None = None,
+) -> dict[str, Any]:
+    """Build the mobile dashboard contract directly from ``items_current``.
+
+    The projection health proof is evaluated before the first item row is
+    loaded. This function deliberately has no Firebase read-through: callers
+    expose an unavailable projection to the client's bounded availability
+    fallback instead of repairing PostgreSQL during a user request.
+    """
+    now_utc = now_utc or datetime.now(timezone.utc)
+    state = _load_route_state(conn, route_number, now_utc=now_utc)
+    rows = _load_rows(
+        conn,
+        route_number=route_number,
+        delivery_id=None,
+        limit=MAX_ACTIVE_CONTAINERS_PER_ROUTE,
+    )
+    payload = build_dashboard_summary_payload(
+        route_number,
+        rows,
+        now_utc=now_utc,
+    )
+    generated_at = now_utc.isoformat()
+    payload["freshness"] = {
+        "source": "postgres",
+        "fresh": True,
+        "sourceRevision": state.last_projected_revision,
+        "mirroredRevision": state.last_projected_revision,
+        "generatedAt": generated_at,
+        "healthyUntil": state.healthy_until.isoformat(),
+    }
+    payload["generatedAt"] = generated_at
+    return payload
+
+
+def build_dashboard_summary_payload(
+    route_number: str,
+    rows: Iterable[Mapping[str, Any]],
+    *,
+    now_utc: datetime,
+) -> dict[str, Any]:
+    """Build a stable dashboard payload from already-bounded projection rows.
+
+    The helper performs no route-health lookup and no database I/O. Effect
+    finalization uses it inside its transaction; serving adds the independent
+    route-health envelope after loading the mirror.
+    """
+    now_utc = _aware_utc(now_utc, "now_utc")
+    business_date = _business_date(now_utc)
+    active_pcfs: list[dict[str, Any]] = []
+    expiring_items: list[dict[str, Any]] = []
+
+    for row in rows:
+        delivery_id = str(row["delivery_id"])
+        container = _container_from_row(row, business_date=business_date)
+        dashboard_items: list[dict[str, Any]] = []
+        for product in container["products"]:
+            expiry_date = product.get("bestBefore")
+            if not expiry_date:
+                continue
+            days_text = str(product.get("days") or "").rstrip("*")
+            try:
+                days_left = int(days_text)
+            except ValueError as exc:
+                raise ProjectionContractError(
+                    "projected item days value is invalid"
+                ) from exc
+            item = {
+                "description": product["description"],
+                "product": product["product"],
+                "expiryDate": expiry_date,
+                "daysLeft": days_left,
+                "isShortCoded": bool(product.get("isShortCoded")),
+                "deliveryNumber": delivery_id,
+                "containerCode": container["containerCode"],
+                "visibleOnList": product.get("visibleOnList") is not False,
+                "isLowQuantity": bool(product.get("isLowQuantity")),
+                "pageNumber": int(product["pageNumber"]),
+            }
+            if product.get("guaranteed") is not None:
+                item["guaranteed"] = product["guaranteed"]
+            dashboard_items.append(item)
+        expiring_items.extend(dashboard_items)
+        item_count = int(container["totalItems"])
+        expired_count = int(container["expiredItems"])
+        active_pcfs.append(
+            {
+                "id": container["containerCode"],
+                "deliveryNumber": delivery_id,
+                "containerCode": container["containerCode"],
+                "loadingDate": container["loadingDate"],
+                "itemCount": item_count,
+                "expiringCount": int(container["expiringItems"]),
+                "expiredCount": expired_count,
+                "routeId": route_number,
+                "status": "active",
+                "createdAt": None,
+                "updatedAt": container["projectionUpdatedAt"],
+                "allItemsExpired": item_count > 0 and expired_count >= item_count,
+                "items": dashboard_items,
+            }
+        )
+
+    expired_pcfs = sum(
+        row["itemCount"] > 0 and row["expiredCount"] >= row["itemCount"]
+        for row in active_pcfs
+    )
+    expiring_pcfs = sum(row["expiringCount"] > 0 for row in active_pcfs)
+    return {
+        "routeNumber": route_number,
+        "activePcfs": active_pcfs,
+        "expiringItems": expiring_items,
+        "counts": {
+            "totalPCFs": len(active_pcfs),
+            "activePCFs": len(active_pcfs),
+            "expiringPCFs": expiring_pcfs,
+            "expiredPCFs": expired_pcfs,
+            "totalContainers": len(active_pcfs),
+            "expiredContainers": expired_pcfs,
+        },
+    }

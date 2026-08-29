@@ -1,7 +1,7 @@
 {
   "contractVersion": "pcf-event-contract-v1",
   "selectedAt": "2026-08-20",
-  "amendedAt": "2026-08-25",
+  "amendedAt": "2026-08-29",
   "scope": {
     "productionResourcesExist": false,
     "effectsDefaultEnabled": false,
@@ -42,9 +42,9 @@
     "upsertRank": 0,
     "deleteRank": 1,
     "upsertInput": "after snapshot updateTime",
-    "deleteInput": "before snapshot updateTime",
+    "deleteInput": "before snapshot updateTime, except a retained inactive pcfProjectionRoutePolicies control uses its after snapshot updateTime as a logical tombstone",
     "ordering": "compare normalized updateTime, then operation rank",
-    "reason": "Firestore delivery is unordered and at-least-once. Delete oldValue has the last document updateTime, so delete rank wins that prior upsert; Firestore createTime/updateTime increases after delete/recreate, so the recreated upsert wins the tombstone.",
+    "reason": "Firestore delivery is unordered and at-least-once. For physical source documents, delete oldValue has the last document updateTime, so delete rank wins that prior upsert and a later recreation wins the tombstone. Effective retention policy is derived from multiple source documents whose updateTime values are not mutually orderable, so its source handlers first commit one retained canonical control generation; an inactive canonical generation is a logical tombstone ordered by that document's after updateTime.",
     "wallClockOrCloudEventIdIsOrderingAuthority": false,
     "cloudEventTimePurpose": "audit only"
   },
@@ -67,8 +67,18 @@
       ],
       "guaranteedRule": "null or exact {isGuaranteed:true, guaranteeExpiresAt:<Google RFC3339 timestamp>}; guarantee state is user-visible serving data and participates in the business hash",
       "stableItemIdentity": ["route", "delivery", "container", "pageNumber", "itemPosition"],
-      "namedExactPathEnrichment": "parent routes/{route}/pcfs/{delivery} only when loadingDate/active state is absent from the trigger snapshots",
+      "namedExactPathEnrichment": "at most one parent routes/{route}/pcfs/{delivery} read when loadingDate/active state is absent or to prove parent/child fixture-marker consistency before ordinary data enters the business projection",
       "maximumExactFirestoreReads": 1
+    },
+    "projection.pcf_retention.changed": {
+      "sourcePath": "pcfProjectionRoutePolicies/{route}, the retained canonical effective-policy control document",
+      "entityKeys": ["route"],
+      "upsertPayloadKeys": ["retentionDays", "ownerUserId"],
+      "retentionRangeDays": [1, 3650],
+      "authorityRule": "an enqueue-before-ack source handler resolves routes.ownerUid, then routeEntitlements.ownerUid, then routeNumbers.userId; it transactionally updates the retained canonical control document only when effective state changes and then enqueues that exact canonical generation",
+      "logicalTombstoneRule": "the canonical document is retained with active=false; the emitted event uses mutationKind=delete, payload=null, and the retained document after.updateTime with delete rank so later reactivation wins monotonically",
+      "namedExactPathEnrichment": "none in the canonical-policy event producer; authority resolution is owned by the preceding source handler",
+      "maximumExactFirestoreReads": 0
     },
     "projection.pcf_delivery.changed": {
       "sourcePath": "routes/{route}/pcfs/{delivery}",
@@ -136,9 +146,9 @@
   },
   "pcfWorkInputHash": {
     "version": "pcf-work-input-v1",
-    "computedBy": "cluster only after manifest validation",
+    "computedBy": "cluster only after manifest and OCR-context validation",
     "algorithm": "SHA-256 over UTF-8 Python JSON with sorted keys and compact separators",
-    "payloadKeys": ["route", "delivery", "coverageScope", "objects"],
+    "payloadKeys": ["route", "delivery", "coverageScope", "objects", "ocrContext"],
     "objectKeys": [
       "containerCode",
       "uploadPageNumber",
@@ -148,6 +158,17 @@
       "md5Hash"
     ],
     "objectOrder": ["objectPath", "numeric generation"],
+    "ocrContextKeys": ["validatedLoadingDate", "containers"],
+    "ocrContainerKeys": [
+      "containerCode",
+      "loadingDate",
+      "ssccBypassUsed",
+      "userVerifiedContainerCode",
+      "containerCodeSource",
+      "realSsccRecovered",
+      "ssccRecoveryStatus"
+    ],
+    "ocrContextRule": "canonical MM/DD/YYYY delivery date plus exact manifest-container coverage; every container date must match the human-validated delivery date; only bounded OCR-affecting SSCC provenance participates",
     "uniqueIdentity": ["route", "delivery", "input_hash_version", "input_hash"],
     "generationParticipates": true,
     "timestampsOrUrlsParticipate": false,
@@ -188,6 +209,20 @@
       "businessHashParticipates": false,
       "sourceRevisionParticipates": true
     }
+  },
+  "routeReconciliation": {
+    "checksumVersion": "pcf-route-checksum-v1",
+    "maximumCurrentEntitiesPerRoute": 500,
+    "sourceSnapshotBoundary": "the bounded Firestore read time encoded as fsut1 rank 0; it is an audit and concurrency fence, not an entity mutation revision",
+    "sourceMembers": "current non-fixture container upserts for exactly one eligible route, each at or before the source snapshot boundary",
+    "projectionMembers": "non-deleted items_current rows for exactly that route",
+    "projectionIntegrity": "recompute each business hash from actual active/loading_date/page_numbers/items content and require the stored source_business_hash to match it",
+    "projectionAheadRule": "if last_projected_revision is newer than the source snapshot boundary, take a fresh source snapshot and perform no repair",
+    "missingOrChangedRepair": "replay only the exact current source upsert through normal ingress",
+    "extraRepair": "a checksum difference is not deletion authority; first perform one exact missing-document read for the named source path, then emit a deterministic tombstone fenced by that readTime",
+    "laterRecreationRule": "a later Firestore recreation updateTime is newer than the absence-read tombstone and wins through normal per-entity revision ordering",
+    "orchestrationBounds": "preflight PostgreSQL eligibility before any Firestore read; at most two one-route source snapshots and one atomic repair transaction per run; all repairs use normal ingress receipts and lifecycle replanning",
+    "servingAuthority": "a matched reconciliation may record parity and bounded health only; it never creates eligibility or enables serving"
   },
   "idempotency": {
     "duplicateSourceEventId": "return the committed accepted/rejected identity without another projection or work write",

@@ -14,6 +14,24 @@ SCHEMA_PATH = ROOT / "order_forecast/contracts/pcf/projection-event-v1.schema.js
 UPLOAD_SCHEMA_PATH = ROOT / "order_forecast/contracts/pcf/pcf-upload-settled-v1.schema.json"
 
 
+def _ocr_context(*containers: str, loading_date: str = "08/20/2026") -> dict:
+    return {
+        "validatedLoadingDate": loading_date,
+        "containers": [
+            {
+                "containerCode": container,
+                "loadingDate": loading_date,
+                "ssccBypassUsed": False,
+                "userVerifiedContainerCode": True,
+                "containerCodeSource": "",
+                "realSsccRecovered": False,
+                "ssccRecoveryStatus": "",
+            }
+            for container in containers
+        ],
+    }
+
+
 def _container_event() -> dict:
     update_time = "2026-08-20T12:00:00.123456789Z"
     return {
@@ -256,6 +274,36 @@ class PcfEventContractTest(unittest.TestCase):
         with self.assertRaises(contract.EventContractError):
             contract.validate_projection_event(event)
 
+    def test_retention_policy_binds_canonical_control_and_tombstone(self):
+        update_time = "2026-08-20T12:00:00Z"
+        event = {
+            "schemaVersion": 1,
+            "sourceEventId": "firestore-retention-event-01",
+            "eventType": "projection.pcf_retention.changed",
+            "mutationKind": "upsert",
+            "occurredAt": update_time,
+            "sourcePath": "pcfProjectionRoutePolicies/989262",
+            "sourceRevision": contract.firestore_revision(update_time, "upsert"),
+            "entity": {"route": "989262"},
+            "automationExcluded": False,
+            "fixture": None,
+            "payload": {"retentionDays": 6, "ownerUserId": "owner-989262"},
+        }
+        normalized = contract.validate_projection_event(event)
+        self.assertEqual(normalized["payload"]["retentionDays"], 6)
+
+        mismatched = copy.deepcopy(event)
+        mismatched["sourcePath"] = "routes/989262"
+        with self.assertRaisesRegex(contract.EventContractError, "sourcePath"):
+            contract.validate_projection_event(mismatched)
+
+        tombstone = copy.deepcopy(event)
+        tombstone["sourceEventId"] = "firestore-retention-delete"
+        tombstone["mutationKind"] = "delete"
+        tombstone["sourceRevision"] = contract.firestore_revision(update_time, "delete")
+        tombstone["payload"] = None
+        self.assertIsNone(contract.validate_projection_event(tombstone)["payload"])
+
     def test_expiring_key_collapses_legacy_date_aliases(self):
         first = contract.expiring_semantic_key("user-1", "8/19/2026", 1)
         second = contract.expiring_semantic_key("user-1", "08/19/2026", 1)
@@ -287,17 +335,17 @@ class PcfEventContractTest(unittest.TestCase):
     def test_work_input_hash_is_order_independent_but_generation_bound(self):
         objects = [
             {
-                "containerCode": "C02",
+                "containerCode": "003400001234567891",
                 "uploadPageNumber": 2,
-                "objectPath": "routes/989262/unprocessed/1806242572_C02_page_2.jpg",
+                "objectPath": "routes/989262/unprocessed/1806242572_003400001234567891_page_2.jpg",
                 "generation": "20",
                 "size": 200,
                 "md5Hash": "MDEyMzQ1Njc4OWFiY2RlZg==",
             },
             {
-                "containerCode": "C01",
+                "containerCode": "003400001234567890",
                 "uploadPageNumber": 1,
-                "objectPath": "routes/989262/unprocessed/1806242572_C01_page_1.jpg",
+                "objectPath": "routes/989262/unprocessed/1806242572_003400001234567890_page_1.jpg",
                 "generation": "10",
                 "size": 100,
                 "md5Hash": "YWJjZGVmMDEyMzQ1Njc4OQ==",
@@ -308,12 +356,18 @@ class PcfEventContractTest(unittest.TestCase):
             delivery="1806242572",
             coverage_scope="uploaded_manifest",
             objects=objects,
+            ocr_context=_ocr_context(
+                "003400001234567890", "003400001234567891"
+            ),
         )
         second = contract.pcf_work_input_hash(
             route="989262",
             delivery="1806242572",
             coverage_scope="uploaded_manifest",
             objects=list(reversed(objects)),
+            ocr_context=_ocr_context(
+                "003400001234567891", "003400001234567890"
+            ),
         )
         replacement = copy.deepcopy(objects)
         replacement[0]["generation"] = "21"
@@ -322,10 +376,25 @@ class PcfEventContractTest(unittest.TestCase):
             delivery="1806242572",
             coverage_scope="uploaded_manifest",
             objects=replacement,
+            ocr_context=_ocr_context(
+                "003400001234567890", "003400001234567891"
+            ),
+        )
+        corrected_date = contract.pcf_work_input_hash(
+            route="989262",
+            delivery="1806242572",
+            coverage_scope="uploaded_manifest",
+            objects=objects,
+            ocr_context=_ocr_context(
+                "003400001234567890",
+                "003400001234567891",
+                loading_date="08/21/2026",
+            ),
         )
         self.assertRegex(first, r"^[0-9a-f]{64}$")
         self.assertEqual(first, second)
         self.assertNotEqual(first, third)
+        self.assertNotEqual(first, corrected_date)
 
     def test_float_and_out_of_scope_object_paths_are_rejected(self):
         with self.assertRaises(contract.EventContractError):
@@ -337,14 +406,15 @@ class PcfEventContractTest(unittest.TestCase):
                 coverage_scope="uploaded_manifest",
                 objects=[
                     {
-                        "containerCode": "C01",
+                        "containerCode": "003400001234567890",
                         "uploadPageNumber": 1,
-                        "objectPath": "routes/988200/unprocessed/1806242572_C01_page_1.jpg",
+                        "objectPath": "routes/988200/unprocessed/1806242572_003400001234567890_page_1.jpg",
                         "generation": "1",
                         "size": 100,
                         "md5Hash": "YWJjZGVmMDEyMzQ1Njc4OQ==",
                     }
                 ],
+                ocr_context=_ocr_context("003400001234567890"),
             )
 
     def test_upload_event_validates_counts_scope_and_computes_cluster_hash(self):
@@ -364,15 +434,16 @@ class PcfEventContractTest(unittest.TestCase):
                 "pageCount": 1,
                 "objects": [
                     {
-                        "containerCode": "C01",
+                        "containerCode": "003400001234567890",
                         "uploadPageNumber": 1,
-                        "objectPath": "routes/989262/unprocessed/1806242572_C01_page_1.jpg",
+                        "objectPath": "routes/989262/unprocessed/1806242572_003400001234567890_page_1.jpg",
                         "generation": "10",
                         "size": 4853371,
                         "md5Hash": "YWJjZGVmMDEyMzQ1Njc4OQ==",
                     }
                 ],
             },
+            "ocrContext": _ocr_context("003400001234567890"),
             "sourceQueuePath": "pcf_processing_queue/989262/queue/1806242572",
             "automationExcluded": False,
             "fixture": None,
@@ -393,11 +464,16 @@ class PcfEventContractTest(unittest.TestCase):
         with self.assertRaises(contract.EventContractError):
             contract.validate_pcf_upload_event(wrong_count)
 
+        conflicting_date = copy.deepcopy(event)
+        conflicting_date["ocrContext"]["containers"][0]["loadingDate"] = "08/21/2026"
+        with self.assertRaises(contract.EventContractError):
+            contract.validate_pcf_upload_event(conflicting_date)
+
     def test_upload_event_rejects_duplicate_logical_pages_and_oversized_objects(self):
         base_object = {
-            "containerCode": "C01",
+            "containerCode": "003400001234567890",
             "uploadPageNumber": 1,
-            "objectPath": "routes/989262/unprocessed/1806242572_C01_page_1.jpg",
+            "objectPath": "routes/989262/unprocessed/1806242572_003400001234567890_page_1.jpg",
             "generation": "10",
             "size": 100,
             "md5Hash": "YWJjZGVmMDEyMzQ1Njc4OQ==",
@@ -410,6 +486,7 @@ class PcfEventContractTest(unittest.TestCase):
                 delivery="1806242572",
                 coverage_scope="uploaded_manifest",
                 objects=[base_object, duplicate],
+                ocr_context=_ocr_context("003400001234567890"),
             )
         oversized = dict(base_object)
         oversized["size"] = 20_000_001
@@ -419,6 +496,7 @@ class PcfEventContractTest(unittest.TestCase):
                 delivery="1806242572",
                 coverage_scope="uploaded_manifest",
                 objects=[oversized],
+                ocr_context=_ocr_context("003400001234567890"),
             )
 
     def test_contract_forbids_route_wide_fixture_exclusion_and_secret_material(self):

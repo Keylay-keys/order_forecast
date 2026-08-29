@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import threading
@@ -9,11 +10,12 @@ import unittest
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import psycopg2
 from psycopg2 import errors
 from psycopg2.extensions import make_dsn
-from psycopg2.extras import Json
+from psycopg2.extras import Json, RealDictCursor
 
 from order_forecast.api.pcf_event_contract import firestore_revision
 from order_forecast.api.pcf_projection_ingress import (
@@ -21,21 +23,47 @@ from order_forecast.api.pcf_projection_ingress import (
     commit_projection_event,
     record_projection_rejection,
 )
+from order_forecast.api.pcf_projection_reconciliation import (
+    ExactFirestoreAbsenceProof,
+    ProjectionReconciliationError,
+    RouteEntityKey,
+    build_absence_tombstone,
+    reconcile_route_projection,
+    summarize_source_route,
+    targeted_repair_events,
+)
+from order_forecast.api.pcf_projection_reconciliation_runtime import (
+    ProjectionReconciliationRuntime,
+    record_reconciliation_failure,
+    reserve_due_reconciliation_route,
+)
+from order_forecast.api.pcf_projection_source import FirestoreRouteSnapshot
 from order_forecast.scripts.pcf_due_work_schema_migration import apply, inspect
 from order_forecast.scripts.pcf_work_schema_migration import apply as apply_work_schema
 from order_forecast.scripts.pcf_work_schema_migration import inspect as inspect_work_schema
 from order_forecast.scripts.pcf_lifecycle_due import (
+    LifecycleConflictError,
+    apply_route_retention_policy,
     apply_container_projection,
     block_lifecycle_claim,
     claim_one_lifecycle_work,
     complete_lifecycle_claim,
+    load_route_retention_policy,
     refresh_lifecycle_claim_authority,
     plan_projected_delivery,
+    plan_projected_delivery_from_current_policy,
     recover_expired_lifecycle_leases,
+)
+from order_forecast.scripts.pcf_projection_route_registry import (
+    RegistryEvidence,
+    RegistryRoute,
+    initialize_registry,
+    load_signed_census,
 )
 
 
 TEST_DSN = os.environ.get("TEST_PCF_POSTGRES_DSN", "").strip()
+SIGNED_RETENTION_CENSUS = os.environ.get("PCF_SIGNED_RETENTION_CENSUS", "").strip()
 NOW = datetime(2026, 8, 25, 10, 0, tzinfo=timezone.utc)
 
 
@@ -94,6 +122,54 @@ def container_event(
     }
 
 
+def retention_event(
+    *,
+    event_id: str,
+    route: str = "989262",
+    retention_days: int | None = 4,
+    source_revision: str | None = None,
+) -> dict:
+    mutation_kind = "delete" if retention_days is None else "upsert"
+    return {
+        "schemaVersion": 1,
+        "sourceEventId": event_id,
+        "eventType": "projection.pcf_retention.changed",
+        "mutationKind": mutation_kind,
+        "occurredAt": "2026-08-25T10:00:00.000000000Z",
+        "sourcePath": f"pcfProjectionRoutePolicies/{route}",
+        "sourceRevision": source_revision
+        or revision(21, mutation_kind=mutation_kind),
+        "entity": {"route": route},
+        "automationExcluded": False,
+        "fixture": None,
+        "payload": (
+            None
+            if retention_days is None
+            else {"retentionDays": retention_days, "ownerUserId": f"owner-{route}"}
+        ),
+    }
+
+
+def registry_evidence() -> RegistryEvidence:
+    routes = [
+        RegistryRoute(route_number=str(970000 + index), eligible=True)
+        for index in range(58)
+    ]
+    routes.extend(
+        RegistryRoute(route_number=route, eligible=True)
+        for route in ("900000", "988200", "989262")
+    )
+    routes.extend(
+        RegistryRoute(route_number=route, eligible=False)
+        for route in ("960462", "961636", "988580")
+    )
+    return RegistryEvidence(
+        census_sha256="a" * 64,
+        observed_at="2026-08-29T16:53:46.297Z",
+        routes=tuple(sorted(routes, key=lambda row: row.route_number)),
+    )
+
+
 @unittest.skipUnless(TEST_DSN, "TEST_PCF_POSTGRES_DSN is not set")
 class PcfLifecyclePostgresIntegrationTests(unittest.TestCase):
     @classmethod
@@ -128,7 +204,7 @@ class PcfLifecyclePostgresIntegrationTests(unittest.TestCase):
             with conn.cursor() as cur:
                 cur.execute(
                     "TRUNCATE pcf_work_events, pcf_work_items, due_work, "
-                    "items_current RESTART IDENTITY"
+                    "items_current, pcf_projection_routes RESTART IDENTITY"
                 )
             conn.commit()
         finally:
@@ -160,6 +236,963 @@ class PcfLifecyclePostgresIntegrationTests(unittest.TestCase):
         finally:
             conn.close()
 
+    def test_route_reconciliation_records_match_without_enabling_serving(self):
+        projected = container_event(
+            event_id="reconcile-match-event-0001",
+            source_revision=revision(20),
+        )
+        snapshot_revision = revision(24)
+        source = summarize_source_route("989262", snapshot_revision, [projected])
+        conn = self.connect()
+        try:
+            apply_container_projection(conn, projected)
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO pcf_projection_routes (
+                        route_number, eligible, last_projected_revision,
+                        last_projected_at
+                    ) VALUES ('989262', TRUE, %s, %s)
+                    """,
+                    (revision(20), NOW),
+                )
+            result = reconcile_route_projection(
+                conn,
+                source,
+                observed_at=NOW,
+                healthy_until=NOW + timedelta(minutes=5),
+            )
+            conn.commit()
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(
+                    """
+                    SELECT eligible, serving_enabled, reconciliation_status,
+                           parity_source_revision, parity_projection_revision,
+                           source_entity_count, projection_entity_count,
+                           source_business_hash, projection_business_hash,
+                           healthy_until
+                    FROM pcf_projection_routes
+                    WHERE route_number = '989262'
+                    """
+                )
+                control = cur.fetchone()
+        finally:
+            conn.close()
+        self.assertEqual(result.status, "matched")
+        self.assertTrue(control["eligible"])
+        self.assertFalse(control["serving_enabled"])
+        self.assertEqual(control["reconciliation_status"], "matched")
+        self.assertEqual(control["parity_source_revision"], snapshot_revision)
+        self.assertEqual(control["parity_projection_revision"], snapshot_revision)
+        self.assertEqual(control["source_entity_count"], 1)
+        self.assertEqual(control["projection_entity_count"], 1)
+        self.assertEqual(control["source_business_hash"], control["projection_business_hash"])
+        self.assertEqual(control["healthy_until"], NOW + timedelta(minutes=5))
+
+    def test_reconciliation_reservation_is_daily_fair_and_excludes_ineligible_routes(self):
+        conn = self.connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO pcf_projection_routes (
+                        route_number, eligible, last_reconciliation_attempt_at
+                    ) VALUES
+                        ('900000', FALSE, NULL),
+                        ('988200', TRUE, NULL),
+                        ('989262', TRUE, %s)
+                    """,
+                    (NOW - timedelta(days=2),),
+                )
+            conn.commit()
+            first = reserve_due_reconciliation_route(conn, observed_at=NOW)
+            conn.commit()
+            second = reserve_due_reconciliation_route(conn, observed_at=NOW)
+            conn.commit()
+            third = reserve_due_reconciliation_route(conn, observed_at=NOW)
+            conn.commit()
+            next_day = reserve_due_reconciliation_route(
+                conn,
+                observed_at=NOW + timedelta(days=1),
+            )
+            conn.commit()
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT route_number, last_reconciliation_attempt_at
+                    FROM pcf_projection_routes
+                    ORDER BY route_number
+                    """
+                )
+                attempts = cur.fetchall()
+        finally:
+            conn.close()
+        self.assertEqual((first, second, third, next_day), ("988200", "989262", None, "988200"))
+        self.assertIsNone(attempts[0][1])
+        self.assertEqual(attempts[1][1], NOW + timedelta(days=1))
+        self.assertEqual(attempts[2][1], NOW)
+
+    def test_reconciliation_failure_clears_health_without_enabling_serving(self):
+        conn = self.connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO pcf_projection_routes (
+                        route_number, eligible, serving_enabled,
+                        reconciliation_status, parity_source_revision,
+                        parity_projection_revision, source_entity_count,
+                        projection_entity_count, source_business_hash,
+                        projection_business_hash, last_reconciled_at, healthy_until
+                    ) VALUES (
+                        '989262', TRUE, FALSE, 'matched', %s, %s,
+                        1, 1, %s, %s, %s, %s
+                    )
+                    """,
+                    (revision(24), revision(24), "a" * 64, "a" * 64, NOW, NOW + timedelta(hours=1)),
+                )
+            conn.commit()
+            record_reconciliation_failure(conn, "989262")
+            conn.commit()
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT serving_enabled, reconciliation_status,
+                           last_reconciled_at, healthy_until
+                    FROM pcf_projection_routes
+                    WHERE route_number = '989262'
+                    """
+                )
+                control = cur.fetchone()
+        finally:
+            conn.close()
+        self.assertEqual(control, (False, "unknown", NOW, None))
+
+    def test_route_reconciliation_mismatch_clears_health_and_plans_exact_replay(self):
+        projected = container_event(
+            event_id="reconcile-old-event-0001",
+            source_revision=revision(20),
+            expiries=("2026-08-20",),
+        )
+        current = container_event(
+            event_id="reconcile-current-event-0001",
+            source_revision=revision(23),
+            expiries=("2026-09-30",),
+        )
+        source = summarize_source_route("989262", revision(24), [current])
+        conn = self.connect()
+        try:
+            apply_container_projection(conn, projected)
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO pcf_projection_routes (
+                        route_number, eligible, serving_enabled,
+                        reconciliation_status, last_projected_revision,
+                        last_projected_at, healthy_until
+                    ) VALUES (
+                        '989262', TRUE, TRUE, 'unknown', %s, %s, %s
+                    )
+                    """,
+                    (revision(20), NOW, NOW + timedelta(hours=1)),
+                )
+            result = reconcile_route_projection(conn, source, observed_at=NOW)
+            conn.commit()
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT reconciliation_status, healthy_until
+                    FROM pcf_projection_routes
+                    WHERE route_number = '989262'
+                    """
+                )
+                status, healthy_until = cur.fetchone()
+        finally:
+            conn.close()
+        self.assertEqual(result.status, "mismatched")
+        self.assertEqual(status, "mismatched")
+        self.assertIsNone(healthy_until)
+        repairs = targeted_repair_events(result)
+        self.assertEqual(len(repairs), 1)
+        self.assertEqual(repairs[0]["sourceEventId"], "reconcile-current-event-0001")
+
+    def test_route_reconciliation_detects_actual_row_corruption_with_stale_hash(self):
+        projected = container_event(
+            event_id="reconcile-integrity-event-0001",
+            source_revision=revision(20),
+        )
+        source = summarize_source_route("989262", revision(24), [projected])
+        conn = self.connect()
+        try:
+            apply_container_projection(conn, projected)
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO pcf_projection_routes (
+                        route_number, eligible, serving_enabled,
+                        reconciliation_status, last_projected_revision,
+                        last_projected_at, healthy_until
+                    ) VALUES (
+                        '989262', TRUE, TRUE, 'unknown', %s, %s, %s
+                    )
+                    """,
+                    (revision(20), NOW, NOW + timedelta(hours=1)),
+                )
+                cur.execute(
+                    """
+                    UPDATE items_current
+                    SET items = jsonb_set(items, '{0,product}', '"corrupt"'::jsonb)
+                    WHERE route_number = '989262'
+                      AND delivery_id = '1806242572'
+                      AND container_id = 'C01'
+                    """
+                )
+            result = reconcile_route_projection(conn, source, observed_at=NOW)
+            conn.commit()
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT reconciliation_status, healthy_until
+                    FROM pcf_projection_routes
+                    WHERE route_number = '989262'
+                    """
+                )
+                status, healthy_until = cur.fetchone()
+        finally:
+            conn.close()
+        self.assertEqual(result.status, "mismatched")
+        self.assertEqual(result.reason, "projection_integrity_mismatch")
+        self.assertEqual(status, "mismatched")
+        self.assertIsNone(healthy_until)
+        repairs = targeted_repair_events(result)
+        self.assertEqual(len(repairs), 1)
+        self.assertEqual(repairs[0]["sourceEventId"], "reconcile-integrity-event-0001")
+        conn = self.connect()
+        try:
+            repaired = commit_projection_event(
+                conn,
+                repairs[0],
+                actor_id="pcf-projection-reconciler",
+                now_utc=NOW,
+            )
+            self.assertEqual(repaired.disposition, "integrity_repaired")
+            verified = reconcile_route_projection(conn, source, observed_at=NOW)
+            conn.commit()
+        finally:
+            conn.close()
+        self.assertEqual(verified.status, "matched")
+
+    def test_same_revision_repairs_corrupt_stored_hash_without_accepting_new_content(self):
+        projected = container_event(
+            event_id="reconcile-hash-integrity-event-0001",
+            source_revision=revision(20),
+        )
+        conn = self.connect()
+        try:
+            apply_container_projection(conn, projected)
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE items_current
+                    SET source_business_hash = %s
+                    WHERE route_number = '989262'
+                      AND delivery_id = '1806242572'
+                      AND container_id = 'C01'
+                    """,
+                    ("f" * 64,),
+                )
+            self.assertEqual(
+                apply_container_projection(conn, projected),
+                "integrity_repaired",
+            )
+            changed = container_event(
+                event_id="reconcile-hash-conflict-event-0001",
+                source_revision=revision(20),
+                expiries=("2026-09-30",),
+            )
+            with self.assertRaises(LifecycleConflictError):
+                apply_container_projection(conn, changed)
+            conn.rollback()
+        finally:
+            conn.close()
+
+    def test_exact_absence_tombstone_is_applied_and_later_recreation_wins(self):
+        original = container_event(
+            event_id="reconcile-absence-original-0001",
+            source_revision=revision(20),
+        )
+        tombstone = build_absence_tombstone(
+            "989262",
+            RouteEntityKey("1806242572", "C01"),
+            ExactFirestoreAbsenceProof(
+                source_path="routes/989262/pcfs/1806242572/containers/C01",
+                read_time="2026-08-24T12:00:00Z",
+                exists=False,
+            ),
+        )
+        recreated = container_event(
+            event_id="reconcile-absence-recreated-0001",
+            source_revision=revision(25),
+            expiries=("2026-10-01",),
+        )
+        conn = self.connect()
+        try:
+            applied = apply_container_projection(conn, original)
+            deleted = apply_container_projection(conn, tombstone)
+            restored = apply_container_projection(conn, recreated)
+            conn.commit()
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT source_revision, deleted_at, items->0->>'expiryDate'
+                    FROM items_current
+                    WHERE route_number = '989262'
+                      AND delivery_id = '1806242572'
+                      AND container_id = 'C01'
+                    """
+                )
+                revision_value, deleted_at, expiry = cur.fetchone()
+        finally:
+            conn.close()
+        self.assertEqual(applied, "apply")
+        self.assertEqual(deleted, "apply")
+        self.assertEqual(restored, "apply")
+        self.assertEqual(revision_value, revision(25))
+        self.assertIsNone(deleted_at)
+        self.assertEqual(expiry, "2026-10-01")
+
+    def test_route_reconciliation_rejects_ineligible_route(self):
+        source = summarize_source_route("989262", revision(24), [])
+        conn = self.connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO pcf_projection_routes (route_number) VALUES ('989262')"
+                )
+            with self.assertRaisesRegex(ProjectionReconciliationError, "route_not_eligible"):
+                reconcile_route_projection(conn, source, observed_at=NOW)
+            conn.rollback()
+        finally:
+            conn.close()
+
+    def test_reconciliation_runtime_repairs_missing_projection_then_matches(self):
+        projected = container_event(
+            event_id="runtime-reconcile-source-0001",
+            source_revision=revision(20),
+        )
+        source = summarize_source_route("989262", revision(24), [projected])
+
+        class SourceAdapter:
+            def __init__(self):
+                self.reads = 0
+
+            def read_route(self, route):
+                self.reads += 1
+                self.assert_route = route
+                return FirestoreRouteSnapshot(source, 1, 1, 1, 2)
+
+            def read_exact_absence(self, route, key):
+                raise AssertionError((route, key))
+
+        source_adapter = SourceAdapter()
+        conn = self.connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO pcf_projection_routes (route_number, eligible)
+                    VALUES ('989262', TRUE)
+                    """
+                )
+            conn.commit()
+        finally:
+            conn.close()
+        runtime = ProjectionReconciliationRuntime(
+            connection_provider=self.connect,
+            connection_releaser=lambda current: current.close(),
+            source_adapter=source_adapter,
+        )
+        report = runtime.run_route("989262", observed_at=NOW)
+        conn = self.connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT reconciliation_status, serving_enabled, healthy_until
+                    FROM pcf_projection_routes
+                    WHERE route_number = '989262'
+                    """
+                )
+                status, serving_enabled, healthy_until = cur.fetchone()
+                cur.execute(
+                    "SELECT COUNT(*) FROM items_current WHERE deleted_at IS NULL"
+                )
+                active_count = cur.fetchone()[0]
+        finally:
+            conn.close()
+        self.assertEqual(report.status, "matched")
+        self.assertEqual(report.source_snapshot_count, 2)
+        self.assertEqual(report.upsert_repairs, 1)
+        self.assertEqual(report.tombstone_repairs, 0)
+        self.assertEqual(source_adapter.reads, 2)
+        self.assertEqual(status, "matched")
+        self.assertFalse(serving_enabled)
+        self.assertIsNone(healthy_until)
+        self.assertEqual(active_count, 1)
+
+    def test_review_route_reconciliation_observes_but_never_repairs(self):
+        projected_review_event = container_event(
+            event_id="runtime-review-existing-0001",
+            route="900000",
+            delivery="REVIEW-OLD",
+            source_revision=revision(19),
+        )
+        review_event = container_event(
+            event_id="runtime-review-observe-only-0001",
+            route="900000",
+            delivery="REVIEW-NEW",
+            source_revision=revision(20),
+        )
+        source = summarize_source_route("900000", revision(24), [review_event])
+
+        class SourceAdapter:
+            def __init__(self):
+                self.reads = 0
+                self.absence_reads = 0
+
+            def read_route(self, route):
+                self.reads += 1
+                self.assert_route = route
+                return FirestoreRouteSnapshot(
+                    source=source,
+                    route_reads=1,
+                    delivery_reads=1,
+                    container_reads=1,
+                    query_count=2,
+                    minimum_billed_document_reads=3,
+                )
+
+            def read_exact_absence(self, route, key):
+                self.absence_reads += 1
+                raise AssertionError((route, key))
+
+        source_adapter = SourceAdapter()
+        conn = self.connect()
+        try:
+            apply_container_projection(conn, projected_review_event)
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO pcf_projection_routes (route_number, eligible)
+                    VALUES ('900000', TRUE)
+                    """
+                )
+            conn.commit()
+        finally:
+            conn.close()
+        runtime = ProjectionReconciliationRuntime(
+            connection_provider=self.connect,
+            connection_releaser=lambda current: current.close(),
+            source_adapter=source_adapter,
+        )
+        report = runtime.run_route("900000", observed_at=NOW)
+        conn = self.connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT COUNT(*) FROM items_current WHERE route_number = '900000'"
+                )
+                projected_count = cur.fetchone()[0]
+        finally:
+            conn.close()
+        self.assertEqual(report.repair_mode, "observe_only")
+        self.assertEqual(report.status, "mismatched")
+        self.assertEqual(report.source_snapshot_count, 1)
+        self.assertEqual(report.upsert_repairs, 0)
+        self.assertEqual(report.tombstone_repairs, 0)
+        self.assertEqual(report.unresolved_extras, 1)
+        self.assertEqual(len(report.final_result.missing_in_projection), 1)
+        self.assertEqual(len(report.final_result.extra_in_projection), 1)
+        self.assertEqual(report.minimum_firestore_reads, 3)
+        self.assertEqual(source_adapter.reads, 1)
+        self.assertEqual(source_adapter.absence_reads, 0)
+        self.assertEqual(projected_count, 1)
+
+    def test_reconciliation_runtime_requires_absence_before_exact_tombstone(self):
+        projected = container_event(
+            event_id="runtime-reconcile-extra-0001",
+            source_revision=revision(20),
+        )
+        first_source = summarize_source_route("989262", revision(24), [])
+        second_source = summarize_source_route(
+            "989262",
+            firestore_revision("2026-08-24T14:00:00Z", "upsert"),
+            [],
+        )
+
+        class SourceAdapter:
+            def __init__(self):
+                self.sources = [first_source, second_source]
+
+            def read_route(self, route):
+                return FirestoreRouteSnapshot(self.sources.pop(0), 1, 1, 0, 2)
+
+            def read_exact_absence(self, route, key):
+                return ExactFirestoreAbsenceProof(
+                    source_path=(
+                        f"routes/{route}/pcfs/{key.delivery_id}/containers/"
+                        f"{key.container_id}"
+                    ),
+                    read_time="2026-08-24T13:00:00Z",
+                    exists=False,
+                )
+
+        conn = self.connect()
+        try:
+            apply_container_projection(conn, projected)
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO pcf_projection_routes (
+                        route_number, eligible, last_projected_revision,
+                        last_projected_at
+                    ) VALUES ('989262', TRUE, %s, %s)
+                    """,
+                    (revision(20), NOW),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+        runtime = ProjectionReconciliationRuntime(
+            connection_provider=self.connect,
+            connection_releaser=lambda current: current.close(),
+            source_adapter=SourceAdapter(),
+        )
+        report = runtime.run_route("989262", observed_at=NOW)
+        conn = self.connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT deleted_at FROM items_current WHERE route_number = '989262'"
+                )
+                deleted_at = cur.fetchone()[0]
+        finally:
+            conn.close()
+        self.assertEqual(report.status, "matched")
+        self.assertEqual(report.upsert_repairs, 0)
+        self.assertEqual(report.tombstone_repairs, 1)
+        self.assertEqual(report.unresolved_extras, 0)
+        self.assertIsNotNone(deleted_at)
+
+    def test_reconciliation_runtime_reads_no_firestore_for_ineligible_route(self):
+        class SourceAdapter:
+            def read_route(self, route):
+                raise AssertionError(f"unexpected Firestore read for {route}")
+
+        conn = self.connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO pcf_projection_routes (route_number) VALUES ('989262')"
+                )
+            conn.commit()
+        finally:
+            conn.close()
+        runtime = ProjectionReconciliationRuntime(
+            connection_provider=self.connect,
+            connection_releaser=lambda current: current.close(),
+            source_adapter=SourceAdapter(),
+        )
+        with self.assertRaisesRegex(ProjectionReconciliationError, "route_not_eligible"):
+            runtime.run_route("989262", observed_at=NOW)
+
+    def test_reconciliation_runtime_never_tombstones_when_source_still_exists(self):
+        projected = container_event(
+            event_id="runtime-reconcile-existing-extra-0001",
+            source_revision=revision(20),
+        )
+        sources = [
+            summarize_source_route("989262", revision(24), []),
+            summarize_source_route("989262", revision(25), []),
+        ]
+
+        class SourceAdapter:
+            def read_route(self, route):
+                return FirestoreRouteSnapshot(sources.pop(0), 1, 1, 0, 2)
+
+            def read_exact_absence(self, route, key):
+                return ExactFirestoreAbsenceProof(
+                    source_path=(
+                        f"routes/{route}/pcfs/{key.delivery_id}/containers/"
+                        f"{key.container_id}"
+                    ),
+                    read_time="2026-08-24T13:00:00Z",
+                    exists=True,
+                )
+
+        conn = self.connect()
+        try:
+            apply_container_projection(conn, projected)
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO pcf_projection_routes (
+                        route_number, eligible, last_projected_revision,
+                        last_projected_at
+                    ) VALUES ('989262', TRUE, %s, %s)
+                    """,
+                    (revision(20), NOW),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+        runtime = ProjectionReconciliationRuntime(
+            connection_provider=self.connect,
+            connection_releaser=lambda current: current.close(),
+            source_adapter=SourceAdapter(),
+        )
+        report = runtime.run_route("989262", observed_at=NOW)
+        conn = self.connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT deleted_at FROM items_current WHERE route_number = '989262'"
+                )
+                deleted_at = cur.fetchone()[0]
+        finally:
+            conn.close()
+        self.assertEqual(report.status, "mismatched")
+        self.assertEqual(report.tombstone_repairs, 0)
+        self.assertEqual(report.unresolved_extras, 1)
+        self.assertIsNone(deleted_at)
+
+    def test_reconciliation_runtime_two_consecutive_projection_ahead_snapshots_fail_closed(self):
+        projected = container_event(
+            event_id="runtime-reconcile-ahead-0001",
+            source_revision=revision(20),
+        )
+        sources = [
+            summarize_source_route("989262", revision(24), [projected]),
+            summarize_source_route("989262", revision(25), [projected]),
+        ]
+
+        class SourceAdapter:
+            def __init__(self):
+                self.reads = 0
+                self.absence_reads = 0
+
+            def read_route(self, route):
+                self.reads += 1
+                return FirestoreRouteSnapshot(
+                    source=sources.pop(0),
+                    route_reads=1,
+                    delivery_reads=1,
+                    container_reads=1,
+                    query_count=2,
+                    minimum_billed_document_reads=3,
+                )
+
+            def read_exact_absence(self, route, key):
+                self.absence_reads += 1
+                raise AssertionError((route, key))
+
+        source_adapter = SourceAdapter()
+        conn = self.connect()
+        try:
+            apply_container_projection(conn, projected)
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO pcf_projection_routes (
+                        route_number, eligible, last_projected_revision,
+                        last_projected_at
+                    ) VALUES ('989262', TRUE, %s, %s)
+                    ON CONFLICT (route_number) DO UPDATE
+                    SET eligible = TRUE,
+                        last_projected_revision = EXCLUDED.last_projected_revision,
+                        last_projected_at = EXCLUDED.last_projected_at
+                    """,
+                    (revision(26), NOW),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+
+        runtime = ProjectionReconciliationRuntime(
+            connection_provider=self.connect,
+            connection_releaser=lambda current: current.close(),
+            source_adapter=source_adapter,
+        )
+        report = runtime.run_route("989262", observed_at=NOW)
+
+        conn = self.connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT reconciliation_status, serving_enabled, healthy_until,
+                           last_projected_revision
+                    FROM pcf_projection_routes
+                    WHERE route_number = '989262'
+                    """
+                )
+                status, serving_enabled, healthy_until, last_revision = cur.fetchone()
+                cur.execute(
+                    """
+                    SELECT COUNT(*) FROM items_current
+                    WHERE route_number = '989262' AND deleted_at IS NULL
+                    """
+                )
+                active_count = cur.fetchone()[0]
+        finally:
+            conn.close()
+
+        self.assertEqual(report.status, "mismatched")
+        self.assertEqual(report.reason, "projection_ahead_of_snapshot")
+        self.assertEqual(report.source_snapshot_count, 2)
+        self.assertEqual(report.upsert_repairs, 0)
+        self.assertEqual(report.tombstone_repairs, 0)
+        self.assertEqual(report.unresolved_extras, 0)
+        self.assertEqual(report.minimum_firestore_reads, 6)
+        self.assertEqual(source_adapter.reads, 2)
+        self.assertEqual(source_adapter.absence_reads, 0)
+        self.assertEqual(status, "mismatched")
+        self.assertFalse(serving_enabled)
+        self.assertIsNone(healthy_until)
+        self.assertEqual(last_revision, revision(26))
+        self.assertEqual(active_count, 1)
+
+    def test_route_retention_policy_is_monotonic_idempotent_and_fail_closed(self):
+        conn = self.connect()
+        try:
+            self.assertIsNone(load_route_retention_policy(conn, "989262"))
+            self.assertEqual(
+                apply_route_retention_policy(
+                    conn,
+                    route_number="989262",
+                    retention_days=4,
+                    policy_revision=revision(20),
+                ),
+                "inserted",
+            )
+            self.assertEqual(
+                apply_route_retention_policy(
+                    conn,
+                    route_number="989262",
+                    retention_days=4,
+                    policy_revision=revision(20),
+                ),
+                "duplicate_noop",
+            )
+            self.assertEqual(
+                apply_route_retention_policy(
+                    conn,
+                    route_number="989262",
+                    retention_days=4,
+                    policy_revision=revision(21),
+                ),
+                "advance_watermark_only",
+            )
+            self.assertEqual(
+                apply_route_retention_policy(
+                    conn,
+                    route_number="989262",
+                    retention_days=9,
+                    policy_revision=revision(19),
+                ),
+                "stale_noop",
+            )
+            with self.assertRaises(LifecycleConflictError):
+                apply_route_retention_policy(
+                    conn,
+                    route_number="989262",
+                    retention_days=6,
+                    policy_revision=revision(21),
+                )
+            self.assertEqual(
+                apply_route_retention_policy(
+                    conn,
+                    route_number="989262",
+                    retention_days=6,
+                    policy_revision=revision(22),
+                ),
+                "updated",
+            )
+            self.assertEqual(
+                load_route_retention_policy(conn, "989262"),
+                (6, revision(22)),
+            )
+            self.assertEqual(
+                apply_route_retention_policy(
+                    conn,
+                    route_number="989262",
+                    retention_days=None,
+                    policy_revision=revision(23, mutation_kind="delete"),
+                ),
+                "updated",
+            )
+            self.assertIsNone(load_route_retention_policy(conn, "989262"))
+            self.assertEqual(
+                apply_route_retention_policy(
+                    conn,
+                    route_number="989262",
+                    retention_days=9,
+                    policy_revision=revision(22),
+                ),
+                "stale_noop",
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def test_policy_event_replans_route_and_container_delete_cancels_exact_delivery(self):
+        conn = self.connect()
+        try:
+            for delivery in ("1806242572", "1806242573"):
+                projected = commit_projection_event(
+                    conn,
+                    container_event(
+                        event_id=f"event-{delivery}",
+                        delivery=delivery,
+                        expiries=("2026-08-30",),
+                    ),
+                    actor_id="dispatcher@example.com",
+                    now_utc=NOW,
+                )
+                self.assertEqual(projected.planning_disposition, "policy_missing")
+
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) FROM due_work")
+                self.assertEqual(cur.fetchone()[0], 0)
+
+            policy = commit_projection_event(
+                conn,
+                retention_event(event_id="event-policy-route"),
+                actor_id="dispatcher@example.com",
+                now_utc=NOW,
+            )
+            self.assertEqual(policy.planning_disposition, "route_replanned")
+            self.assertEqual(policy.planned_delivery_count, 2)
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT delivery_id, status
+                    FROM due_work
+                    WHERE kind = 'lifecycle'
+                    ORDER BY delivery_id
+                    """
+                )
+                self.assertEqual(
+                    cur.fetchall(),
+                    [("1806242572", "scheduled"), ("1806242573", "scheduled")],
+                )
+
+            deleted = commit_projection_event(
+                conn,
+                container_event(
+                    event_id="event-container-delete",
+                    delivery="1806242572",
+                    source_revision=revision(22, mutation_kind="delete"),
+                    mutation_kind="delete",
+                ),
+                actor_id="dispatcher@example.com",
+                now_utc=NOW,
+            )
+            self.assertEqual(deleted.planning_disposition, "no_containers")
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT delivery_id, status, terminal_outcome
+                    FROM due_work
+                    WHERE kind = 'lifecycle'
+                    ORDER BY delivery_id
+                    """
+                )
+                self.assertEqual(
+                    cur.fetchall(),
+                    [
+                        ("1806242572", "cancelled", "projection_no_containers"),
+                        ("1806242573", "scheduled", None),
+                    ],
+                )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def test_overdue_replan_deadline_is_stable_across_wall_clock_time(self):
+        conn = self.connect()
+        try:
+            apply_container_projection(
+                conn,
+                container_event(
+                    event_id="stable-deadline-container-0001",
+                    expiries=("2026-08-01",),
+                ),
+            )
+            apply_route_retention_policy(
+                conn,
+                route_number="989262",
+                retention_days=4,
+                policy_revision=revision(21),
+            )
+            first = plan_projected_delivery_from_current_policy(
+                conn,
+                route_number="989262",
+                delivery_id="1806242572",
+                now_utc=NOW,
+            )
+            second = plan_projected_delivery_from_current_policy(
+                conn,
+                route_number="989262",
+                delivery_id="1806242572",
+                now_utc=NOW + timedelta(days=2),
+            )
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT COUNT(*), MIN(deadline_at), MAX(deadline_at)
+                    FROM due_work
+                    WHERE kind = 'lifecycle'
+                    """
+                )
+                count, minimum, maximum = cur.fetchone()
+            conn.commit()
+        finally:
+            conn.close()
+        self.assertEqual(first.candidate.semantic_key, second.candidate.semantic_key)
+        self.assertEqual(count, 1)
+        self.assertEqual(minimum, maximum)
+
+    def test_container_ingress_holds_shared_route_plan_lock_until_commit(self):
+        first = self.connect()
+        observer = self.connect()
+        lock_key = "pcf-lifecycle-route:989262"
+        try:
+            commit_projection_event(
+                first,
+                container_event(event_id="event-route-lock"),
+                actor_id="dispatcher@example.com",
+                now_utc=NOW,
+            )
+            with observer.cursor() as cur:
+                cur.execute(
+                    "SELECT pg_try_advisory_xact_lock(hashtextextended(%s, 0))",
+                    (lock_key,),
+                )
+                self.assertFalse(cur.fetchone()[0])
+            observer.rollback()
+            first.commit()
+            with observer.cursor() as cur:
+                cur.execute(
+                    "SELECT pg_try_advisory_xact_lock(hashtextextended(%s, 0))",
+                    (lock_key,),
+                )
+                self.assertTrue(cur.fetchone()[0])
+            observer.rollback()
+        finally:
+            first.close()
+            observer.close()
+
     def test_migration_is_checksum_verified_idempotent_and_ready(self):
         conn = self.connect()
         try:
@@ -177,6 +1210,116 @@ class PcfLifecyclePostgresIntegrationTests(unittest.TestCase):
         self.assertEqual(first["checksum"], second["checksum"])
         self.assertRegex(first_work["checksum"], r"^[0-9a-f]{64}$")
         self.assertEqual(first_work["checksum"], second_work["checksum"])
+
+    def test_owner_only_registry_initializer_sets_exact_signed_eligibility(self):
+        conn = self.connect()
+        try:
+            first = initialize_registry(conn, registry_evidence())
+            second = initialize_registry(conn, registry_evidence())
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT COUNT(*),
+                           COUNT(*) FILTER (WHERE eligible),
+                           COUNT(*) FILTER (WHERE serving_enabled),
+                           COUNT(*) FILTER (WHERE lifecycle_policy_active),
+                           COUNT(*) FILTER (WHERE reconciliation_status <> 'unknown')
+                    FROM pcf_projection_routes
+                    """
+                )
+                counts = cur.fetchone()
+                cur.execute(
+                    """
+                    SELECT route_number, eligible
+                    FROM pcf_projection_routes
+                    WHERE route_number = ANY(%s)
+                    ORDER BY route_number
+                    """,
+                    (["960462", "961636", "988580"],),
+                )
+                unresolved = cur.fetchall()
+        finally:
+            conn.close()
+        self.assertEqual(first["eligibleCount"], 61)
+        self.assertEqual(second["eligibleCount"], 61)
+        self.assertEqual(counts, (64, 61, 0, 0, 0))
+        self.assertEqual(
+            unresolved,
+            [("960462", False), ("961636", False), ("988580", False)],
+        )
+
+    @unittest.skipUnless(
+        SIGNED_RETENTION_CENSUS,
+        "PCF_SIGNED_RETENTION_CENSUS is not set",
+    )
+    def test_exact_production_census_initializes_only_its_proven_routes(self):
+        evidence = load_signed_census(Path(SIGNED_RETENTION_CENSUS))
+        conn = self.connect()
+        try:
+            result = initialize_registry(conn, evidence)
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT route_number, eligible, serving_enabled,
+                           lifecycle_policy_active,
+                           last_reconciliation_attempt_at
+                    FROM pcf_projection_routes
+                    ORDER BY route_number
+                    """
+                )
+                rows = cur.fetchall()
+        finally:
+            conn.close()
+        self.assertEqual(result["censusSha256"], evidence.census_sha256)
+        self.assertEqual((len(rows), sum(row[1] for row in rows)), (64, 61))
+        self.assertTrue(all(not row[2] and not row[3] and row[4] is None for row in rows))
+        self.assertEqual(
+            [(row[0], row[1]) for row in rows if not row[1]],
+            [("960462", False), ("961636", False), ("988580", False)],
+        )
+
+    def test_runtime_role_cannot_initialize_route_registry(self):
+        conn = psycopg2.connect(make_dsn(TEST_DSN, user="routespark_pcf_app"))
+        try:
+            with self.assertRaises(errors.InsufficientPrivilege):
+                initialize_registry(conn, registry_evidence())
+        finally:
+            conn.close()
+
+    def test_registry_initializer_rejects_unproven_existing_eligibility(self):
+        conn = self.connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO pcf_projection_routes (route_number, eligible) "
+                    "VALUES ('999999', TRUE)"
+                )
+            conn.commit()
+            with self.assertRaisesRegex(RuntimeError, "unproven eligible"):
+                initialize_registry(conn, registry_evidence())
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT eligible FROM pcf_projection_routes "
+                    "WHERE route_number = '999999'"
+                )
+                self.assertTrue(cur.fetchone()[0])
+        finally:
+            conn.close()
+
+    def test_registry_initializer_refuses_any_serving_enabled_route(self):
+        conn = self.connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO pcf_projection_routes "
+                    "(route_number, eligible, serving_enabled) "
+                    "VALUES ('989262', TRUE, TRUE)"
+                )
+            conn.commit()
+            with self.assertRaisesRegex(RuntimeError, "serving-enabled"):
+                initialize_registry(conn, registry_evidence())
+        finally:
+            conn.close()
 
     def test_runtime_role_is_least_privilege_and_not_owner_member(self):
         conn = self.connect()
@@ -212,9 +1355,40 @@ class PcfLifecyclePostgresIntegrationTests(unittest.TestCase):
                     """
                 )
                 owner = cur.fetchone()[0]
+                cur.execute(
+                    """
+                    SELECT
+                        has_column_privilege(
+                            'routespark_pcf_app', 'pcf_projection_routes',
+                            'route_number', 'INSERT'
+                        ),
+                        has_column_privilege(
+                            'routespark_pcf_app', 'pcf_projection_routes',
+                            'last_reconciliation_attempt_at', 'UPDATE'
+                        ),
+                        has_column_privilege(
+                            'routespark_pcf_app', 'pcf_projection_routes',
+                            'eligible', 'INSERT'
+                        ),
+                        has_column_privilege(
+                            'routespark_pcf_app', 'pcf_projection_routes',
+                            'eligible', 'UPDATE'
+                        ),
+                        has_column_privilege(
+                            'routespark_pcf_app', 'pcf_projection_routes',
+                            'serving_enabled', 'INSERT'
+                        ),
+                        has_column_privilege(
+                            'routespark_pcf_app', 'pcf_projection_routes',
+                            'serving_enabled', 'UPDATE'
+                        )
+                    """
+                )
+                route_privileges = cur.fetchone()
         finally:
             conn.close()
         self.assertEqual(privileges, (True, True, True, False, False, False))
+        self.assertEqual(route_privileges, (True, True, False, False, False, False))
         self.assertEqual(role_attributes, (True, False, False, False, False))
         self.assertEqual(owner, "routespark_pcf_owner")
 
@@ -231,6 +1405,63 @@ class PcfLifecyclePostgresIntegrationTests(unittest.TestCase):
             conn.rollback()
         finally:
             conn.close()
+
+    def test_runtime_role_can_project_and_reconcile_but_cannot_arm_route(self):
+        owner_conn = self.connect()
+        try:
+            with owner_conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO pcf_projection_routes (route_number, eligible)
+                    VALUES ('989262', TRUE)
+                    """
+                )
+            owner_conn.commit()
+        finally:
+            owner_conn.close()
+
+        app_conn = psycopg2.connect(make_dsn(TEST_DSN, user="routespark_pcf_app"))
+        projected = container_event(
+            event_id="runtime-column-grant-event-0001",
+            source_revision=revision(20),
+        )
+        try:
+            applied = apply_container_projection(app_conn, projected)
+            policy = apply_route_retention_policy(
+                app_conn,
+                route_number="989262",
+                retention_days=4,
+                policy_revision=revision(21),
+            )
+            reserved = reserve_due_reconciliation_route(app_conn, observed_at=NOW)
+            source = summarize_source_route("989262", revision(24), [projected])
+            reconciliation = reconcile_route_projection(
+                app_conn,
+                source,
+                observed_at=NOW,
+            )
+            app_conn.commit()
+            self.assertEqual(applied, "apply")
+            self.assertEqual(policy, "updated")
+            self.assertEqual(reserved, "989262")
+            self.assertEqual(reconciliation.status, "matched")
+
+            with self.assertRaises(errors.InsufficientPrivilege):
+                with app_conn.cursor() as cur:
+                    cur.execute(
+                        "UPDATE pcf_projection_routes SET eligible = FALSE "
+                        "WHERE route_number = '989262'"
+                    )
+            app_conn.rollback()
+            with self.assertRaises(errors.InsufficientPrivilege):
+                with app_conn.cursor() as cur:
+                    cur.execute(
+                        "INSERT INTO pcf_projection_routes "
+                        "(route_number, eligible) VALUES ('999999', TRUE)"
+                    )
+            app_conn.rollback()
+        finally:
+            app_conn.close()
 
     def test_event_receipts_are_append_only_for_runtime_role(self):
         conn = self.connect()
@@ -312,13 +1543,14 @@ class PcfLifecyclePostgresIntegrationTests(unittest.TestCase):
                 cur.execute(
                     """
                     INSERT INTO pcf_work_items (
-                        work_id, route_number, delivery_number, input_hash,
+                        work_id, route_number, delivery_number, source_revision, input_hash,
                         input_hash_version, status, required_capability,
-                        manifest, source_queue_path, not_before
+                        manifest, ocr_context, source_queue_path, not_before
                     ) VALUES (
-                        %s, '989262', '1806242572', %s,
+                        %s, '989262', '1806242572',
+                        'fsut1|2026-08-29T18:00:00.000000000Z|0', %s,
                         'pcf-work-input-v1', 'queued', 'macos_vision',
-                        '{}'::jsonb,
+                        '{}'::jsonb, '{}'::jsonb,
                         'pcf_processing_queue/989262/queue/1806242572', NOW()
                     )
                     """,
@@ -399,10 +1631,20 @@ class PcfLifecyclePostgresIntegrationTests(unittest.TestCase):
                 source_event_id=source_event_id,
             )
             conn.commit()
+            accepted = commit_projection_event(
+                conn,
+                container_event(event_id=source_event_id),
+                actor_id="pcf-task-dispatcher@routespark-1f47d.iam.gserviceaccount.com",
+            )
+            conn.commit()
             with conn.cursor() as cur:
                 cur.execute(
-                    "SELECT COUNT(*) FROM pcf_work_events WHERE source_event_id = %s",
-                    (source_event_id,),
+                    """
+                    SELECT COUNT(*)
+                    FROM pcf_work_events
+                    WHERE payload->>'rejectedSourceEventIdSha256' = %s
+                    """,
+                    (hashlib.sha256(source_event_id.encode("utf-8")).hexdigest(),),
                 )
                 count = cur.fetchone()[0]
         finally:
@@ -411,6 +1653,7 @@ class PcfLifecyclePostgresIntegrationTests(unittest.TestCase):
         self.assertFalse(first)
         self.assertTrue(second)
         self.assertEqual(count, 1)
+        self.assertFalse(accepted.duplicate_transport_event)
 
     def test_reused_source_id_cannot_change_projection(self):
         event = container_event(event_id="event-ingress-conflict1")

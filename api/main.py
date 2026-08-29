@@ -31,6 +31,7 @@ from .middleware.code_protection import setup_code_protection
 from .middleware.request_context import setup_request_context
 from .middleware.usage_analytics import setup_usage_analytics
 from .middleware.internal_machine_auth import setup_internal_machine_auth
+from .middleware.pcf_runtime_control import setup_pcf_runtime_control
 from .utils.security_store import flush_security_events, security_store, start_security_maintenance
 
 # =============================================================================
@@ -145,6 +146,7 @@ app.add_middleware(
         "X-RouteSpark-App-Version",
         "X-RouteSpark-Build-Number",
         "X-RouteSpark-Platform",
+        "X-RouteSpark-Capabilities",
     ],
     expose_headers=["X-Request-ID"],
     max_age=3600,
@@ -182,6 +184,9 @@ async def add_security_headers(request: Request, call_next):
 
 setup_request_context(app, logger)
 setup_usage_analytics(app, logger)
+# Add the runtime-control gate first so the authentication middleware added
+# below remains outermost and rejects invalid identity before reading controls.
+setup_pcf_runtime_control(app)
 # Last-added middleware is outermost in Starlette. Keep this after CORS and all
 # shared request middleware so disabled/invalid internal requests are rejected
 # before CORS, analytics, Firebase auth, or request-body parsing.

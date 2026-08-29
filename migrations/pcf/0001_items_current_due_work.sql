@@ -142,8 +142,13 @@ CREATE TABLE IF NOT EXISTS pcf_projection_routes (
     projection_entity_count INTEGER,
     source_business_hash TEXT,
     projection_business_hash TEXT,
+    last_reconciliation_attempt_at TIMESTAMPTZ,
     last_reconciled_at TIMESTAMPTZ,
     healthy_until TIMESTAMPTZ,
+    lifecycle_policy_active BOOLEAN NOT NULL DEFAULT FALSE,
+    lifecycle_retention_days SMALLINT,
+    lifecycle_policy_revision TEXT,
+    lifecycle_policy_synced_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     CONSTRAINT pcf_projection_route_valid CHECK (
@@ -184,6 +189,31 @@ CREATE TABLE IF NOT EXISTS pcf_projection_routes (
         projection_business_hash IS NULL
         OR projection_business_hash ~ '^[0-9a-f]{64}$'
     ),
+    CONSTRAINT pcf_projection_lifecycle_policy_complete CHECK (
+        (
+            lifecycle_policy_active = FALSE
+            AND
+            lifecycle_retention_days IS NULL
+            AND lifecycle_policy_revision IS NULL
+            AND lifecycle_policy_synced_at IS NULL
+        )
+        OR (
+            lifecycle_policy_revision ~ '^fsut1\|[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{9}Z\|[01]$'
+            AND lifecycle_policy_synced_at IS NOT NULL
+            AND (
+                (
+                    lifecycle_policy_active = TRUE
+                    AND lifecycle_retention_days BETWEEN 1 AND 3650
+                    AND lifecycle_policy_revision LIKE '%|0'
+                )
+                OR (
+                    lifecycle_policy_active = FALSE
+                    AND lifecycle_retention_days IS NULL
+                    AND lifecycle_policy_revision LIKE '%|1'
+                )
+            )
+        )
+    ),
     CONSTRAINT pcf_projection_matched_proof_complete CHECK (
         reconciliation_status <> 'matched'
         OR (
@@ -202,8 +232,34 @@ CREATE TABLE IF NOT EXISTS pcf_projection_routes (
 );
 
 CREATE INDEX IF NOT EXISTS pcf_projection_routes_reconcile_idx
-    ON pcf_projection_routes (updated_at, route_number)
+    ON pcf_projection_routes (last_reconciliation_attempt_at, route_number)
     WHERE eligible = TRUE;
+
+-- Existing compact dashboard mirror, now owned by the versioned PCF schema.
+-- Runtime code may update a route row but cannot create or delete the table.
+CREATE TABLE IF NOT EXISTS route_dashboard_summaries (
+    route_number TEXT PRIMARY KEY,
+    payload JSONB NOT NULL,
+    source_revision TEXT,
+    source_updated_at TIMESTAMPTZ,
+    mirrored_revision TEXT,
+    mirrored_at TIMESTAMPTZ,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT route_dashboard_summaries_route_valid CHECK (
+        route_number ~ '^[0-9]{1,10}$'
+    ),
+    CONSTRAINT route_dashboard_summaries_payload_object CHECK (
+        jsonb_typeof(payload) = 'object'
+    ),
+    CONSTRAINT route_dashboard_summaries_source_revision_valid CHECK (
+        source_revision IS NULL
+        OR source_revision ~ '^fsut1\|[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{9}Z\|[01]$'
+    ),
+    CONSTRAINT route_dashboard_summaries_mirrored_revision_valid CHECK (
+        mirrored_revision IS NULL
+        OR mirrored_revision ~ '^fsut1\|[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{9}Z\|[01]$'
+    )
+);
 
 CREATE TABLE IF NOT EXISTS due_work (
     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -358,15 +414,55 @@ RESET ROLE;
 
 ALTER TABLE items_current OWNER TO routespark_pcf_owner;
 ALTER TABLE pcf_projection_routes OWNER TO routespark_pcf_owner;
+ALTER TABLE route_dashboard_summaries OWNER TO routespark_pcf_owner;
 ALTER TABLE due_work OWNER TO routespark_pcf_owner;
 ALTER SEQUENCE IF EXISTS due_work_id_seq OWNER TO routespark_pcf_owner;
 
-REVOKE ALL ON TABLE items_current, pcf_projection_routes, due_work FROM PUBLIC;
+REVOKE ALL ON TABLE items_current, pcf_projection_routes,
+    route_dashboard_summaries, due_work FROM PUBLIC;
 REVOKE ALL ON SEQUENCE due_work_id_seq FROM PUBLIC;
 GRANT USAGE ON SCHEMA public TO routespark_pcf_app;
-GRANT SELECT, INSERT, UPDATE ON TABLE items_current, pcf_projection_routes, due_work
+GRANT SELECT ON TABLE items_current, pcf_projection_routes,
+    route_dashboard_summaries, due_work
     TO routespark_pcf_app;
+GRANT INSERT, UPDATE ON TABLE items_current, route_dashboard_summaries, due_work
+    TO routespark_pcf_app;
+REVOKE INSERT, UPDATE ON TABLE pcf_projection_routes FROM routespark_pcf_app;
+REVOKE INSERT (eligible, serving_enabled),
+       UPDATE (eligible, serving_enabled)
+    ON pcf_projection_routes FROM routespark_pcf_app;
+GRANT INSERT (
+        route_number,
+        last_projected_revision,
+        last_projected_at,
+        lifecycle_policy_active,
+        lifecycle_retention_days,
+        lifecycle_policy_revision,
+        lifecycle_policy_synced_at,
+        created_at,
+        updated_at
+    ) ON pcf_projection_routes TO routespark_pcf_app;
+GRANT UPDATE (
+        reconciliation_status,
+        last_projected_revision,
+        last_projected_at,
+        parity_source_revision,
+        parity_projection_revision,
+        source_entity_count,
+        projection_entity_count,
+        source_business_hash,
+        projection_business_hash,
+        last_reconciliation_attempt_at,
+        last_reconciled_at,
+        healthy_until,
+        lifecycle_policy_active,
+        lifecycle_retention_days,
+        lifecycle_policy_revision,
+        lifecycle_policy_synced_at,
+        updated_at
+    ) ON pcf_projection_routes TO routespark_pcf_app;
 GRANT USAGE, SELECT ON SEQUENCE due_work_id_seq TO routespark_pcf_app;
 
 -- The runtime role is intentionally denied table ownership, DELETE, TRUNCATE,
--- role administration, and membership in routespark_pcf_owner.
+-- role administration, membership in routespark_pcf_owner, and both INSERT and
+-- UPDATE authority over eligible/serving_enabled.

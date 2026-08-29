@@ -21,6 +21,7 @@ WORK_INPUT_HASH_VERSION = "pcf-work-input-v1"
 EVENT_TYPES = frozenset(
     {
         "projection.pcf_container.changed",
+        "projection.pcf_retention.changed",
         "projection.pcf_delivery.changed",
         "projection.notification_recipient.changed",
         "projection.route_entitlement.changed",
@@ -33,6 +34,9 @@ _ENTITY_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _EVENT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/+-]{7,255}$")
 _HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 _MD5_BASE64_RE = re.compile(r"^[A-Za-z0-9+/]{22}==$")
+_PCF_CONTAINER_RE = re.compile(r"^[0-9]{18}$")
+_PCF_LOADING_DATE_RE = re.compile(r"^[0-9]{2}/[0-9]{2}/[0-9]{4}$")
+_PCF_PROVENANCE_RE = re.compile(r"^(?:[A-Za-z0-9][A-Za-z0-9._: -]{0,127})?$")
 _PCF_OBJECT_PATH_RE = re.compile(
     r"^routes/(?P<route>[0-9]{1,10})/unprocessed/"
     r"(?P<delivery>[0-9]{1,20})_(?P<container>[^/]{1,128})_page_"
@@ -175,6 +179,12 @@ def compare_firestore_revisions(left: str, right: str) -> int:
     return (left_value > right_value) - (left_value < right_value)
 
 
+def firestore_revision_instant(value: str) -> datetime:
+    """Return the immutable UTC instant embedded in a Firestore revision."""
+    normalized, _ = _revision_tuple(value)
+    return datetime.fromisoformat(normalized.replace("Z", "+00:00"))
+
+
 def projection_decision(
     *,
     current_revision: str | None,
@@ -267,6 +277,7 @@ def pcf_work_input_hash(
     delivery: str,
     coverage_scope: str,
     objects: Sequence[Mapping[str, Any]],
+    ocr_context: Mapping[str, Any],
     version: str = WORK_INPUT_HASH_VERSION,
 ) -> str:
     if version != WORK_INPUT_HASH_VERSION:
@@ -298,7 +309,7 @@ def pcf_work_input_hash(
             },
             f"objects[{index}]",
         )
-        container = _require_string(raw["containerCode"], "containerCode", _ENTITY_ID_RE)
+        container = _require_string(raw["containerCode"], "containerCode", _PCF_CONTAINER_RE)
         page = raw["uploadPageNumber"]
         size = raw["size"]
         if isinstance(page, bool) or not isinstance(page, int) or not 1 <= page <= 1000:
@@ -341,15 +352,116 @@ def pcf_work_input_hash(
         )
 
     normalized.sort(key=lambda item: (item["objectPath"], int(item["generation"])))
+    normalized_ocr_context = validate_pcf_ocr_context(
+        ocr_context,
+        manifest_containers={item["containerCode"] for item in normalized},
+    )
     payload = {
         "coverageScope": coverage_scope,
         "delivery": delivery_value,
         "objects": normalized,
+        "ocrContext": normalized_ocr_context,
         "route": route_value,
     }
     # The architecture contract hashes this payload directly, without an extra
     # wrapper; input_hash_version is persisted beside the digest.
     return hashlib.sha256(canonical_json_bytes(payload)).hexdigest()
+
+
+def _canonical_pcf_loading_date(value: Any, name: str) -> str:
+    raw = _require_string(value, name)
+    if _PCF_LOADING_DATE_RE.fullmatch(raw) is None:
+        raise EventContractError(f"{name} must be canonical MM/DD/YYYY")
+    try:
+        parsed = datetime.strptime(raw, "%m/%d/%Y").date()
+    except ValueError as exc:
+        raise EventContractError(f"{name} is not a valid calendar date") from exc
+    canonical = parsed.strftime("%m/%d/%Y")
+    if raw != canonical:
+        raise EventContractError(f"{name} must be canonical MM/DD/YYYY")
+    return canonical
+
+
+def _optional_provenance(value: Any, name: str) -> str:
+    if not isinstance(value, str) or value != value.strip():
+        raise EventContractError(f"{name} must be a trimmed string")
+    if _PCF_PROVENANCE_RE.fullmatch(value) is None:
+        raise EventContractError(f"{name} has invalid format")
+    return value
+
+
+def validate_pcf_ocr_context(
+    value: Mapping[str, Any],
+    *,
+    manifest_containers: set[str] | None = None,
+) -> dict[str, Any]:
+    """Freeze only queue fields that can change the OCR proposal or evidence."""
+    if not isinstance(value, Mapping):
+        raise EventContractError("ocrContext must be an object")
+    _require_exact_keys(value, {"validatedLoadingDate", "containers"}, "ocrContext")
+    validated_date = _canonical_pcf_loading_date(
+        value["validatedLoadingDate"], "ocrContext.validatedLoadingDate"
+    )
+    containers = value["containers"]
+    if not isinstance(containers, Sequence) or isinstance(
+        containers, (str, bytes, bytearray)
+    ):
+        raise EventContractError("ocrContext.containers must be an array")
+    if not 1 <= len(containers) <= 100:
+        raise EventContractError("ocrContext.containers must contain 1 through 100 entries")
+
+    normalized: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    expected_keys = {
+        "containerCode",
+        "loadingDate",
+        "ssccBypassUsed",
+        "userVerifiedContainerCode",
+        "containerCodeSource",
+        "realSsccRecovered",
+        "ssccRecoveryStatus",
+    }
+    for index, raw in enumerate(containers):
+        if not isinstance(raw, Mapping):
+            raise EventContractError(f"ocrContext.containers[{index}] must be an object")
+        _require_exact_keys(raw, expected_keys, f"ocrContext.containers[{index}]")
+        container = _require_string(
+            raw["containerCode"], "ocrContext.containerCode", _PCF_CONTAINER_RE
+        )
+        if container in seen:
+            raise EventContractError("duplicate ocrContext containerCode")
+        seen.add(container)
+        loading_date = _canonical_pcf_loading_date(
+            raw["loadingDate"], "ocrContext.loadingDate"
+        )
+        if loading_date != validated_date:
+            raise EventContractError("container loadingDate conflicts with validatedLoadingDate")
+        for field in (
+            "ssccBypassUsed",
+            "userVerifiedContainerCode",
+            "realSsccRecovered",
+        ):
+            if not isinstance(raw[field], bool):
+                raise EventContractError(f"ocrContext.{field} must be boolean")
+        normalized.append(
+            {
+                "containerCode": container,
+                "containerCodeSource": _optional_provenance(
+                    raw["containerCodeSource"], "ocrContext.containerCodeSource"
+                ),
+                "loadingDate": loading_date,
+                "realSsccRecovered": raw["realSsccRecovered"],
+                "ssccBypassUsed": raw["ssccBypassUsed"],
+                "ssccRecoveryStatus": _optional_provenance(
+                    raw["ssccRecoveryStatus"], "ocrContext.ssccRecoveryStatus"
+                ),
+                "userVerifiedContainerCode": raw["userVerifiedContainerCode"],
+            }
+        )
+    if manifest_containers is not None and seen != manifest_containers:
+        raise EventContractError("ocrContext containers do not exactly cover manifest containers")
+    normalized.sort(key=lambda item: item["containerCode"])
+    return {"containers": normalized, "validatedLoadingDate": validated_date}
 
 
 def validate_pcf_upload_event(event: Mapping[str, Any]) -> dict[str, Any]:
@@ -367,6 +479,7 @@ def validate_pcf_upload_event(event: Mapping[str, Any]) -> dict[str, Any]:
         "quietPeriodElapsed",
         "coverageScope",
         "manifest",
+        "ocrContext",
         "sourceQueuePath",
         "automationExcluded",
         "fixture",
@@ -427,6 +540,7 @@ def validate_pcf_upload_event(event: Mapping[str, Any]) -> dict[str, Any]:
         delivery=delivery,
         coverage_scope=event["coverageScope"],
         objects=objects,
+        ocr_context=event["ocrContext"],
     )
     return {
         "event": dict(event),
@@ -500,6 +614,10 @@ def validate_projection_event(event: Mapping[str, Any]) -> dict[str, Any]:
         _require_exact_keys(entity, {"userId"}, "entity")
         user_id = _require_string(entity["userId"], "entity.userId", _ENTITY_ID_RE)
         expected_path = f"users/{user_id}"
+    elif event_type == "projection.pcf_retention.changed":
+        _require_exact_keys(entity, {"route"}, "entity")
+        route = _require_string(entity["route"], "entity.route", _ROUTE_RE)
+        expected_path = f"pcfProjectionRoutePolicies/{route}"
     else:
         _require_exact_keys(entity, {"route"}, "entity")
         route = _require_string(entity["route"], "entity.route", _ROUTE_RE)
@@ -643,6 +761,22 @@ def _normalize_projection_payload(
             "items": normalized_items,
             "loadingDate": _nullable_date(payload["loadingDate"], "loadingDate"),
             "pageNumbers": page_numbers,
+        }
+
+    if event_type == "projection.pcf_retention.changed":
+        _require_exact_keys(payload, {"retentionDays", "ownerUserId"}, "payload")
+        retention_days = payload["retentionDays"]
+        if (
+            isinstance(retention_days, bool)
+            or not isinstance(retention_days, int)
+            or not 1 <= retention_days <= 3650
+        ):
+            raise EventContractError("retentionDays must be 1 through 3650")
+        return {
+            "ownerUserId": _require_string(
+                payload["ownerUserId"], "ownerUserId", _ENTITY_ID_RE
+            ),
+            "retentionDays": retention_days,
         }
 
     if event_type == "projection.pcf_delivery.changed":
