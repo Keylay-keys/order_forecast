@@ -41,7 +41,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import psycopg2
-from psycopg2.extras import RealDictCursor, execute_values
+from psycopg2.extras import Json, RealDictCursor, execute_values
 from google.cloud import firestore
 
 try:
@@ -558,6 +558,19 @@ def handle_sync_order(conn: psycopg2.extensions.connection, db: firestore.Client
                     else int(current_row[0] or 0)
                 )
                 if current_revision >= incoming_revision:
+                    scheduled_order = data.get('scheduledOrder')
+                    if (
+                        isinstance(scheduled_order, dict)
+                        and scheduled_order.get('version') == 2
+                    ):
+                        cur.execute(
+                            """
+                            UPDATE orders_historical
+                            SET scheduled_order = %s
+                            WHERE order_id = %s AND route_number = %s
+                            """,
+                            [Json(scheduled_order), order_id, str(route_number)],
+                        )
                     conn.commit()
                     committed = True
                     cur.close()
@@ -593,8 +606,9 @@ def handle_sync_order(conn: psycopg2.extensions.connection, db: firestore.Client
                 delivery_date, order_date, status, total_units, store_count, is_holiday_week,
                 order_revision, last_mutation_kind, last_mutation_id, last_mutation_at,
                 reallocation_count, last_reallocated_at, last_reallocation_id, synced_at
+                , scheduled_order
             ) VALUES (%s, %s, %s, %s, %s, %s, 'finalized', %s, %s, %s,
-                      %s, %s, %s, %s, %s, %s, %s, %s)
+                      %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (order_id) DO UPDATE SET
                 route_number = EXCLUDED.route_number,
                 user_id = EXCLUDED.user_id,
@@ -612,6 +626,7 @@ def handle_sync_order(conn: psycopg2.extensions.connection, db: firestore.Client
                 reallocation_count = EXCLUDED.reallocation_count,
                 last_reallocated_at = EXCLUDED.last_reallocated_at,
                 last_reallocation_id = EXCLUDED.last_reallocation_id,
+                scheduled_order = EXCLUDED.scheduled_order,
                 synced_at = EXCLUDED.synced_at
         """, [
             order_id,
@@ -630,7 +645,10 @@ def handle_sync_order(conn: psycopg2.extensions.connection, db: firestore.Client
             int(reallocation_summary.get('count') or 0),
             _mutation_timestamp(reallocation_summary.get('lastAppliedAtMs')),
             reallocation_summary.get('lastAdjustmentId'),
-            now
+            now,
+            Json(data.get('scheduledOrder'))
+                if isinstance(data.get('scheduledOrder'), dict)
+                else None,
         ])
 
         # Rebuild the derived snapshot from Firebase order truth. Upsert-only
@@ -906,6 +924,84 @@ def handle_sync_order(conn: psycopg2.extensions.connection, db: firestore.Client
                 conn.autocommit = True
             except Exception:
                 pass
+
+
+def project_scheduled_order_archive_metadata(
+    conn: psycopg2.extensions.connection,
+    db: firestore.Client,
+    order_id: str,
+    route_number: str,
+    order_data: dict,
+) -> Dict:
+    """Project only a v2 order stamp and its verified receipt.
+
+    This is the finalized-order backfill path. It intentionally does not run
+    forecast extraction, line replacement, allocations, or finalization hooks.
+    """
+    scheduled_order = order_data.get('scheduledOrder')
+    if not (
+        isinstance(scheduled_order, dict)
+        and scheduled_order.get('version') == 2
+    ):
+        return {'error': 'scheduledOrder v2 is required'}
+
+    committed = False
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        cur.execute(
+            """
+            UPDATE orders_historical
+            SET scheduled_order = %s
+            WHERE order_id = %s AND route_number = %s
+            """,
+            [Json(scheduled_order), str(order_id), str(route_number)],
+        )
+        if cur.rowcount != 1:
+            conn.rollback()
+            return {'error': 'archived order not found'}
+        cur.execute(
+            """
+            SELECT total_units, store_count,
+                   (SELECT COUNT(*) FROM order_line_items li
+                    WHERE li.order_id = orders_historical.order_id) AS line_item_count
+            FROM orders_historical
+            WHERE order_id = %s AND route_number = %s
+            """,
+            [str(order_id), str(route_number)],
+        )
+        archive = cur.fetchone()
+        if not archive:
+            conn.rollback()
+            return {'error': 'archived order summary unavailable'}
+        conn.commit()
+        committed = True
+        if not isinstance(archive, dict):
+            archive = {
+                'total_units': archive[0],
+                'store_count': archive[1],
+                'line_item_count': archive[2],
+            }
+        write_verified_order_archive_receipt(
+            db,
+            str(order_id),
+            str(route_number),
+            order_data,
+            archive_total_units=int(archive.get('total_units') or 0),
+            archive_store_count=int(archive.get('store_count') or 0),
+            archive_line_item_count=int(archive.get('line_item_count') or 0),
+        )
+        return {
+            'success': True,
+            'orderId': str(order_id),
+            'archiveReceiptWritten': True,
+            'projection': 'scheduled_order_only',
+        }
+    except Exception as exc:
+        if not committed:
+            conn.rollback()
+        return {'error': str(exc)}
+    finally:
+        cur.close()
 
 
 def handle_get_historical_shares(conn: psycopg2.extensions.connection, payload: Dict) -> Dict:

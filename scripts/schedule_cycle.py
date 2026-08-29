@@ -6,8 +6,8 @@ reverse-mapping rules in lockstep so mobile, sync, and forecast code agree.
 
 from __future__ import annotations
 
-from datetime import date, timedelta
-from typing import Any, Dict, List, Optional, TypedDict
+from datetime import date, datetime, timedelta
+from typing import Any, Dict, List, Literal, Optional, TypedDict
 
 
 MAX_SCHEDULE_OFFSET_DAYS = 60
@@ -49,12 +49,33 @@ class ScheduleKeyResolution(TypedDict):
     matches: List[ScheduleMatch]
 
 
+class ResolvedDeliverySchedule(TypedDict):
+    status: Literal["resolved"]
+    orderDate: str
+    loadDate: str
+    deliveryDate: str
+    scheduleKey: str
+    cycle: NormalizedOrderCycle
+
+
+class UnresolvedDeliverySchedule(TypedDict):
+    status: Literal["unresolved"]
+    reason: Literal["missing_schedule", "ambiguous_schedule", "off_cycle"]
+
+
+DeliveryScheduleResolution = ResolvedDeliverySchedule | UnresolvedDeliverySchedule
+
+
 def is_valid_weekday(value: Any) -> bool:
-    return isinstance(value, int) and 1 <= value <= 7
+    return isinstance(value, int) and not isinstance(value, bool) and 1 <= value <= 7
 
 
 def is_valid_offset(value: Any) -> bool:
-    return isinstance(value, int) and 0 <= value <= MAX_SCHEDULE_OFFSET_DAYS
+    return (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and 0 <= value <= MAX_SCHEDULE_OFFSET_DAYS
+    )
 
 
 def schedule_key_for_day(day_number: int) -> str:
@@ -157,6 +178,8 @@ def normalize_order_cycle(cycle: Dict[str, Any]) -> NormalizedOrderCycle:
 
 
 def parse_civil_date(value: str | date) -> date:
+    if isinstance(value, datetime):
+        return value.date()
     if isinstance(value, date):
         return value
     return date.fromisoformat(value)
@@ -204,6 +227,43 @@ def get_cycle_dates(cycle: Dict[str, Any], from_date: str | date) -> Dict[str, A
     }
 
 
+def resolve_order_schedule_for_delivery_date(
+    delivery_date: str | date,
+    order_cycles: List[Dict[str, Any]],
+    schedule_key: str | None = None,
+) -> DeliveryScheduleResolution:
+    if not order_cycles:
+        return {"status": "unresolved", "reason": "missing_schedule"}
+
+    target = parse_civil_date(delivery_date)
+    wanted = str(schedule_key or "").strip().lower()
+    candidates: List[ResolvedDeliverySchedule] = []
+    for raw_cycle in order_cycles:
+        cycle = normalize_order_cycle(raw_cycle)
+        key = schedule_key_for_day(cycle["orderDay"])
+        if wanted and key != wanted:
+            continue
+        order_date = target - timedelta(days=cycle["deliveryOffsetDays"])
+        if order_date.isoweekday() != cycle["orderDay"]:
+            continue
+        candidates.append(
+            {
+                "status": "resolved",
+                "orderDate": order_date.isoformat(),
+                "loadDate": (order_date + timedelta(days=cycle["loadOffsetDays"])).isoformat(),
+                "deliveryDate": target.isoformat(),
+                "scheduleKey": key,
+                "cycle": cycle,
+            }
+        )
+
+    if not candidates:
+        return {"status": "unresolved", "reason": "off_cycle"}
+    if len(candidates) > 1:
+        return {"status": "unresolved", "reason": "ambiguous_schedule"}
+    return candidates[0]
+
+
 def get_schedule_key_for_delivery_date(
     delivery_date: str | date,
     order_cycles: List[Dict[str, Any]],
@@ -220,7 +280,10 @@ def get_schedule_key_for_delivery_date(
         )
         load_candidate_order_date = add_days(target, -normalized["loadOffsetDays"])
 
-        if delivery_candidate_order_date.isoweekday() == normalized["orderDay"]:
+        delivery_matches = delivery_candidate_order_date.isoweekday() == normalized["orderDay"]
+        load_matches = load_candidate_order_date.isoweekday() == normalized["orderDay"]
+
+        if delivery_matches:
             matches.append(
                 {
                     "scheduleKey": schedule_key,
@@ -231,7 +294,10 @@ def get_schedule_key_for_delivery_date(
                 }
             )
 
-        if load_candidate_order_date.isoweekday() == normalized["orderDay"]:
+        if load_matches and not (
+            delivery_matches
+            and normalized["loadOffsetDays"] == normalized["deliveryOffsetDays"]
+        ):
             matches.append(
                 {
                     "scheduleKey": schedule_key,
@@ -245,8 +311,24 @@ def get_schedule_key_for_delivery_date(
     if not matches:
         return None
 
+    deduped: Dict[str, ScheduleMatch] = {}
+    for match in matches:
+        cycle = match["cycle"]
+        key = ":".join(
+            str(value)
+            for value in (
+                match["scheduleKey"],
+                match["orderDay"],
+                cycle["loadOffsetDays"],
+                cycle["deliveryOffsetDays"],
+            )
+        )
+        existing = deduped.get(key)
+        if existing is None or match["matchedBy"] == "delivery":
+            deduped[key] = match
+
     sorted_matches = sorted(
-        matches,
+        deduped.values(),
         key=lambda match: (
             0 if match["matchedBy"] == "delivery" else 1,
             match["offsetDays"],

@@ -137,6 +137,7 @@ def _create_order_tables(cur) -> None:
             reallocation_count INTEGER NOT NULL DEFAULT 0,
             last_reallocated_at TIMESTAMP WITH TIME ZONE,
             last_reallocation_id VARCHAR(255),
+            scheduled_order JSONB,
             synced_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
         )
     """)
@@ -147,6 +148,7 @@ def _create_order_tables(cur) -> None:
     cur.execute("ALTER TABLE orders_historical ADD COLUMN IF NOT EXISTS reallocation_count INTEGER NOT NULL DEFAULT 0")
     cur.execute("ALTER TABLE orders_historical ADD COLUMN IF NOT EXISTS last_reallocated_at TIMESTAMP WITH TIME ZONE")
     cur.execute("ALTER TABLE orders_historical ADD COLUMN IF NOT EXISTS last_reallocation_id VARCHAR(255)")
+    cur.execute("ALTER TABLE orders_historical ADD COLUMN IF NOT EXISTS scheduled_order JSONB")
     
     # Individual line items (one row per store/item in each order)
     cur.execute("""

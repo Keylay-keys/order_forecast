@@ -103,6 +103,7 @@ class _FakeCursor:
         self.connection = conn
         self._fetchone = None
         self.description = None
+        self.rowcount = -1
 
     def execute(self, sql, params=None):
         normalized = " ".join(sql.split()).lower()
@@ -130,7 +131,37 @@ class _FakeCursor:
                 "last_mutation_kind": params[10],
                 "last_mutation_id": params[11],
                 "synced_at": params[16],
+                "scheduled_order": getattr(params[17], "adapted", None),
             }
+            self.rowcount = 1
+            return
+
+        if normalized.startswith("update orders_historical set scheduled_order"):
+            order_id = params[1]
+            route_number = params[2]
+            row = self.conn.orders_historical.get(order_id)
+            if row and row.get("route_number") == route_number:
+                row["scheduled_order"] = getattr(params[0], "adapted", None)
+                self.rowcount = 1
+            else:
+                self.rowcount = 0
+            return
+
+        if normalized.startswith("select total_units, store_count"):
+            order_id, route_number = params
+            row = self.conn.orders_historical.get(order_id)
+            if row and row.get("route_number") == route_number:
+                line_count = sum(
+                    1 for line in self.conn.order_line_items.values()
+                    if line[1] == order_id
+                )
+                self._fetchone = {
+                    "total_units": row.get("total_units", 0),
+                    "store_count": row.get("store_count", 0),
+                    "line_item_count": line_count,
+                }
+            else:
+                self._fetchone = None
             return
 
         if normalized.startswith("select order_revision from orders_historical"):
@@ -242,6 +273,99 @@ class TestHandleSyncOrderProjectionReplacement(unittest.TestCase):
 
     def tearDown(self):
         self.receipt_patcher.stop()
+
+    def test_sync_persists_v2_scheduled_order_snapshot(self):
+        route_number = "988200"
+        order_id = "order-988200-stamped"
+        stamp = {
+            "version": 2,
+            "date": "2026-08-18",
+            "timezone": "America/Denver",
+            "scheduleKey": "tuesday",
+        }
+        order = {
+            "routeNumber": route_number,
+            "userId": "user-1",
+            "expectedDeliveryDate": "2026-08-20",
+            "orderDate": "2026-08-18",
+            "scheduleKey": "tuesday",
+            "scheduledOrder": stamp,
+            "stores": [{
+                "storeId": "store-1",
+                "storeName": "Store One",
+                "items": [{"sap": "100", "quantity": 2, "cases": 0}],
+            }],
+        }
+        conn = _FakeConnection()
+        db = _FakeFirestoreDB({(route_number, order_id): order}, {})
+
+        with (
+            mock.patch.object(worker, "execute_values", side_effect=_fake_execute_values),
+            mock.patch.object(worker, "resolve_store_id_from_db", side_effect=lambda conn, route, store: store),
+            mock.patch.object(worker, "is_holiday_week", return_value=(False, "")),
+        ):
+            result = worker.handle_sync_order(
+                conn,
+                db,
+                {"orderId": order_id, "routeNumber": route_number},
+            )
+
+        self.assertTrue(result["success"])
+        self.assertEqual(conn.orders_historical[order_id]["scheduled_order"], stamp)
+
+    def test_finalized_backfill_projects_only_stamp_and_v2_receipt(self):
+        route_number = "988200"
+        order_id = "order-988200-archive-stamp"
+        stamp = {
+            "version": 2,
+            "date": "2026-08-18",
+            "timezone": "America/Denver",
+            "scheduleKey": "tuesday",
+        }
+        conn = _FakeConnection()
+        conn.orders_historical[order_id] = {
+            "order_id": order_id,
+            "route_number": route_number,
+            "total_units": 2,
+            "store_count": 1,
+            "scheduled_order": None,
+        }
+        conn.order_line_items["line-1"] = (
+            "line-1", order_id, route_number, "tuesday", "2026-08-20",
+            "store-1", "Store One", "100", "Item", 2,
+        )
+        order = {
+            "routeNumber": route_number,
+            "scheduleKey": "tuesday",
+            "expectedDeliveryDate": "2026-08-20",
+            "scheduledOrder": stamp,
+            "stores": [{
+                "storeId": "store-1",
+                "storeName": "Store One",
+                "items": [{"sap": "100", "quantity": 2}],
+            }],
+        }
+
+        result = worker.project_scheduled_order_archive_metadata(
+            conn,
+            object(),
+            order_id,
+            route_number,
+            order,
+        )
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["projection"], "scheduled_order_only")
+        self.assertEqual(conn.orders_historical[order_id]["scheduled_order"], stamp)
+        self.receipt_mock.assert_called_with(
+            mock.ANY,
+            order_id,
+            route_number,
+            order,
+            archive_total_units=2,
+            archive_store_count=1,
+            archive_line_item_count=1,
+        )
 
     def test_schema_v2_snapshot_records_omitted_zero_add_and_changed_amounts(self):
         route_number = "988200"

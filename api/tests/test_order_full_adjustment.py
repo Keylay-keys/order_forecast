@@ -341,6 +341,10 @@ class FullAdjustmentTransactionTests(unittest.TestCase):
             sentBatchId=self.batch["id"],
             acceptedSaps=["41051"],
         )
+        self.stores_ref = _CollectionRef({
+            "store-a": _DocRef("store-a", {"name": "Alpha", "isActive": True, "items": ["41051", "24521"]}),
+            "store-b": _DocRef("store-b", {"name": "Beta", "isActive": True, "items": ["24521"]}),
+        })
 
     def _confirm(self):
         return self.apply(
@@ -351,10 +355,7 @@ class FullAdjustmentTransactionTests(unittest.TestCase):
             audit_ref=self.audit_ref,
             order_audit_ref=self.order_audit_ref,
             route_adjustments_ref=self.route_adjustments_ref,
-            stores_ref=_CollectionRef({
-                "store-a": _DocRef("store-a", {"isActive": True, "items": ["41051", "24521"]}),
-                "store-b": _DocRef("store-b", {"isActive": True, "items": ["24521"]}),
-            }),
+            stores_ref=self.stores_ref,
             route_number=ROUTE,
             payload=self.payload,
             actor_user_id="owner-988200",
@@ -375,6 +376,100 @@ class FullAdjustmentTransactionTests(unittest.TestCase):
         result = self._confirm()
         self.assertTrue(result["idempotent"])
         self.assertEqual(result["orderRevision"], 4)
+
+    def test_route_989262_untouched_historical_catalog_drift_does_not_block_confirm(self):
+        stale_item = {"sap": "53151", "quantity": 19}
+        self.order_ref.data["stores"][0]["items"].append(deepcopy(stale_item))
+        self.batch["workingCopySnapshot"]["stores"][0]["items"].append(deepcopy(stale_item))
+        self.batch["workingCopySignature"] = working_copy_signature(
+            self.batch["workingCopySnapshot"]
+        )
+        self.batch_ref.data = deepcopy(self.batch)
+        self.adjustment_ref.data["lastSent"]["workingCopySignature"] = self.batch["workingCopySignature"]
+        self.stores_ref.docs["store-a"].data["items"] = ["41051", "24521"]
+
+        result = self._confirm()
+
+        self.assertFalse(result["idempotent"])
+        items = {
+            item["sap"]: item["quantity"]
+            for item in self.order_ref.data["stores"][0]["items"]
+        }
+        self.assertEqual(items, {"41051": 24, "53151": 19})
+
+    def test_adjustment_add_to_uncarried_store_returns_actionable_details(self):
+        self.stores_ref.docs["store-a"].data["items"] = ["24521"]
+
+        with self.assertRaises(StructuredApiError) as raised:
+            self._confirm()
+
+        self.assertEqual(raised.exception.code, "ADJUSTMENT_ITEM_NOT_CARRIED")
+        self.assertEqual(
+            raised.exception.details,
+            {"items": [{"sap": "41051", "storeId": "store-a", "storeName": "Alpha"}]},
+        )
+
+    def test_catalog_sap_whitespace_is_normalized(self):
+        self.stores_ref.docs["store-a"].data["items"] = [" 41051 ", "24521"]
+        result = self._confirm()
+        self.assertFalse(result["idempotent"])
+
+    def test_inactive_untouched_store_does_not_block_another_store_adjustment(self):
+        inactive = {
+            "storeId": "store-inactive",
+            "storeName": "Historical",
+            "items": [{"sap": "53162", "quantity": 16}],
+        }
+        self.order_ref.data["stores"].append(deepcopy(inactive))
+        self.batch["workingCopySnapshot"]["stores"].append(deepcopy(inactive))
+        self.batch["workingCopySignature"] = working_copy_signature(
+            self.batch["workingCopySnapshot"]
+        )
+        self.batch_ref.data = deepcopy(self.batch)
+        self.adjustment_ref.data["lastSent"]["workingCopySignature"] = self.batch["workingCopySignature"]
+        self.stores_ref.docs["store-inactive"] = _DocRef(
+            "store-inactive",
+            {"name": "Historical", "isActive": False, "items": []},
+        )
+
+        result = self._confirm()
+        self.assertFalse(result["idempotent"])
+
+    def test_collects_all_uncarried_items_from_touched_pairs(self):
+        prior = {
+            "stores": [
+                {"storeId": "store-a", "items": []},
+                {"storeId": "store-b", "items": []},
+            ],
+            "inboundTransferStoreAllocations": [],
+        }
+        merged = {
+            "stores": [
+                {"storeId": "store-a", "storeName": "Alpha", "items": [{"sap": "111", "quantity": 1}]},
+                {"storeId": "store-b", "storeName": "Beta", "items": [{"sap": "222", "quantity": 2}]},
+            ],
+            "inboundTransferStoreAllocations": [],
+        }
+        route_stores = {
+            "store-a": {"name": "Alpha", "isActive": True, "items": []},
+            "store-b": {"name": "Beta", "isActive": True, "items": []},
+        }
+
+        with self.assertRaises(StructuredApiError) as raised:
+            orders._validate_adjusted_store_allocations(
+                merged,
+                route_stores,
+                prior_order_data=prior,
+            )
+
+        self.assertEqual(raised.exception.code, "ADJUSTMENT_ITEM_NOT_CARRIED")
+        self.assertEqual(
+            raised.exception.details,
+            {"items": [
+                {"sap": "111", "storeId": "store-a", "storeName": "Alpha"},
+                {"sap": "222", "storeId": "store-b", "storeName": "Beta"},
+            ]},
+        )
 
     def test_route_988200_unrelated_team_member_cannot_confirm_adjustment(self):
         self.adjustment_ref.data["userId"] = "other-member-988200"

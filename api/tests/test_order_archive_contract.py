@@ -56,6 +56,12 @@ class OrderArchiveContractTests(unittest.TestCase):
         self.assertEqual(summary["storeReallocationSummary"]["count"], 1)
 
     def test_exact_id_lookup_is_scoped_to_route(self):
+        stamp = {
+            "version": 2,
+            "date": "2026-05-04",
+            "timezone": "America/Denver",
+            "scheduleKey": "monday",
+        }
         with patch.object(pg_utils, "fetch_one", return_value={
             "order_id": "order-989262-1777988222651",
             "schedule_key": "monday",
@@ -63,6 +69,7 @@ class OrderArchiveContractTests(unittest.TestCase):
             "delivery_date": date(2026, 5, 11),
             "total_units": 300,
             "store_count": 1,
+            "scheduled_order": stamp,
         }) as fetch_header, patch.object(pg_utils, "fetch_all", return_value=[{
             "store_id": "store-1",
             "store_name": "Store 1",
@@ -76,8 +83,22 @@ class OrderArchiveContractTests(unittest.TestCase):
             "order-989262-1777988222651",
         ])
         self.assertIn("route_number = %s AND order_id = %s", fetch_header.call_args.args[0])
+        self.assertIn("scheduled_order", fetch_header.call_args.args[0])
         self.assertEqual(order["id"], "order-989262-1777988222651")
         self.assertEqual(order["deliveryDate"], "2026-05-11")
+        self.assertEqual(order["scheduledOrder"], stamp)
+
+    def test_legacy_archive_omits_missing_scheduled_order(self):
+        with patch.object(pg_utils, "fetch_one", return_value={
+            "order_id": "legacy",
+            "schedule_key": "monday",
+            "order_date": date(2026, 5, 5),
+            "delivery_date": date(2026, 5, 11),
+            "scheduled_order": None,
+        }), patch.object(pg_utils, "fetch_all", return_value=[]):
+            order = pg_utils.get_order_by_id("989262", "legacy")
+
+        self.assertNotIn("scheduledOrder", order)
 
     def test_date_fallback_is_deterministic(self):
         with patch.object(pg_utils, "fetch_one", return_value=None) as fetch_header:

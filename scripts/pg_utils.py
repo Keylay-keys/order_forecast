@@ -210,7 +210,7 @@ def _build_archived_order(route_number: str, order_row: dict) -> dict:
     if hasattr(synced_at, 'isoformat'):
         synced_at = synced_at.isoformat()
 
-    return {
+    archived = {
         'id': order_id,
         'routeNumber': route_number,
         'userId': order_row.get('user_id') or '',
@@ -236,6 +236,9 @@ def _build_archived_order(route_number: str, order_row: dict) -> dict:
         } if (order_row.get('reallocation_count') or 0) > 0 else None,
         'stores': list(stores.values()),
     }
+    if isinstance(order_row.get('scheduled_order'), dict):
+        archived['scheduledOrder'] = order_row['scheduled_order']
+    return archived
 
 
 def get_order_by_id(route_number: str, order_id: str) -> Optional[dict]:
@@ -245,7 +248,7 @@ def get_order_by_id(route_number: str, order_id: str) -> Optional[dict]:
                finalized_at, synced_at, total_units, store_count,
                order_revision, last_mutation_kind, last_mutation_id,
                last_mutation_at, reallocation_count, last_reallocated_at,
-               last_reallocation_id
+               last_reallocation_id, scheduled_order
         FROM orders_historical
         WHERE route_number = %s AND order_id = %s
         LIMIT 1
@@ -260,7 +263,7 @@ def get_order_by_date(route_number: str, delivery_date: str) -> Optional[dict]:
                finalized_at, synced_at, total_units, store_count,
                order_revision, last_mutation_kind, last_mutation_id,
                last_mutation_at, reallocation_count, last_reallocated_at,
-               last_reallocation_id
+               last_reallocation_id, scheduled_order
         FROM orders_historical
         WHERE route_number = %s AND delivery_date = %s
         ORDER BY order_date DESC, order_id DESC

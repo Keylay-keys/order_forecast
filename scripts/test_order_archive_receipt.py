@@ -122,6 +122,72 @@ class TestOrderArchiveReceipt(unittest.TestCase):
         )
         self.assertIsNone(evaluate_order_archive_receipt(projection, receipt))
 
+    def test_unstamped_order_keeps_legacy_schema_v1_compatibility(self):
+        projection = build_order_archive_projection(
+            self.order_id,
+            self.route_number,
+            self.order,
+        )
+        self.assertEqual(projection["schemaVersion"], 1)
+        self.assertNotIn("scheduledOrder", projection)
+        receipt = {
+            **projection,
+            "status": "verified",
+            "archiveTotalUnits": projection["totalUnits"],
+            "archiveStoreCount": projection["storeCount"],
+            "archiveLineItemCount": projection["lineItemCount"],
+        }
+        self.assertIsNone(evaluate_order_archive_receipt(projection, receipt))
+
+    def test_stamped_order_requires_schema_v2_and_exact_stamp(self):
+        stamp = {
+            "version": 2,
+            "date": "2026-05-04",
+            "timezone": "America/Denver",
+            "scheduleKey": "monday",
+        }
+        stamped = {**self.order, "scheduledOrder": stamp}
+        projection = build_order_archive_projection(
+            self.order_id,
+            self.route_number,
+            stamped,
+        )
+        self.assertEqual(projection["schemaVersion"], 2)
+        self.assertEqual(projection["scheduledOrder"], stamp)
+
+        receipt = {
+            **projection,
+            "status": "verified",
+            "archiveTotalUnits": projection["totalUnits"],
+            "archiveStoreCount": projection["storeCount"],
+            "archiveLineItemCount": projection["lineItemCount"],
+        }
+        self.assertIsNone(evaluate_order_archive_receipt(projection, receipt))
+        self.assertEqual(
+            evaluate_order_archive_receipt(
+                projection,
+                {**receipt, "schemaVersion": 1},
+            ),
+            "receipt_schema_mismatch",
+        )
+
+        changed_projection = build_order_archive_projection(
+            self.order_id,
+            self.route_number,
+            {
+                **stamped,
+                "scheduledOrder": {**stamp, "date": "2026-05-05"},
+            },
+        )
+        self.assertNotEqual(
+            changed_projection["sourceFingerprint"],
+            projection["sourceFingerprint"],
+        )
+        self.assertEqual(
+            evaluate_order_archive_receipt(changed_projection, receipt),
+            "receipt_source_changed",
+        )
+
     def test_missing_and_changed_source_receipts_fail_closed(self):
         projection = build_order_archive_projection(
             self.order_id,

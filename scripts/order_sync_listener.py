@@ -16,8 +16,10 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import socket
+import threading
 import time
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -190,6 +192,79 @@ def _skip_initial_snapshot() -> bool:
 def _order_event_key(document: Any) -> str:
     """Keep route-scoped orders distinct even when document IDs collide."""
     return str(document.reference.path)
+
+
+def _identity_value(value: Any) -> str:
+    if hasattr(value, "isoformat"):
+        return str(value.isoformat())
+    return str(value or "").strip()
+
+
+def finalization_identity(route_number: str, order_id: str, data: dict) -> str | None:
+    """Stable identity for one genuine finalization transition."""
+    if data.get("status") != "finalized":
+        return None
+    mutation = data.get("lastMutation") or {}
+    if (
+        isinstance(mutation, dict)
+        and mutation.get("kind") == "finalization"
+        and _identity_value(mutation.get("mutationId"))
+    ):
+        return f"{route_number}:{order_id}:{_identity_value(mutation.get('mutationId'))}"
+    submitted = _identity_value(data.get("submittedAt"))
+    return f"{route_number}:{order_id}:{submitted}" if submitted else None
+
+
+class FinalizationDispatchGuard:
+    """Thread-safe in-process guard primed from the listener's initial snapshot."""
+
+    def __init__(self) -> None:
+        self._seen: set[str] = set()
+        self._lock = threading.Lock()
+
+    def prime(self, identity: str | None) -> None:
+        if not identity:
+            return
+        with self._lock:
+            self._seen.add(identity)
+
+    def claim(self, identity: str | None) -> bool:
+        if not identity:
+            return False
+        with self._lock:
+            if identity in self._seen:
+                return False
+            self._seen.add(identity)
+            return True
+
+
+def dispatch_finalized_order_if_new(
+    guard: FinalizationDispatchGuard,
+    fb_client: firestore.Client,
+    order_id: str,
+    data: dict,
+    *,
+    handler=None,
+) -> bool:
+    """Guard the entire finalized-order side-effect handler behind one identity."""
+    route_number = str(data.get("routeNumber") or "").strip()
+    identity = finalization_identity(route_number, order_id, data)
+    if not guard.claim(identity):
+        print(json.dumps({
+            "event": "order_finalization_dispatch_skipped",
+            "routeNumber": route_number,
+            "orderId": order_id,
+            "identity": identity,
+        }, sort_keys=True))
+        return False
+    print(json.dumps({
+        "event": "order_finalization_dispatched",
+        "routeNumber": route_number,
+        "orderId": order_id,
+        "identity": identity,
+    }, sort_keys=True))
+    (handler or handle_finalized_order)(fb_client, order_id, data)
+    return True
 
 
 def get_firestore_client(sa_path: str) -> firestore.Client:
@@ -1131,6 +1206,7 @@ def watch_all_orders(sa_path: str):
     
     # Track seen orders to avoid reprocessing
     seen_order_paths = set()
+    finalization_guard = FinalizationDispatchGuard()
     initial_snapshot_seen = False
     
     def on_snapshot(col_snapshot, changes, read_time):
@@ -1139,6 +1215,28 @@ def watch_all_orders(sa_path: str):
 
         if not initial_snapshot_seen:
             initial_snapshot_seen = True
+            # Prime every pre-existing finalization before processing any ADDED
+            # callbacks. A listener restart must never replay general finalize work.
+            primed_finalizations = 0
+            for change in changes:
+                doc = change.document
+                path_parts = doc.reference.path.split('/')
+                if len(path_parts) != 4 or path_parts[0] != 'routes' or path_parts[2] != 'orders':
+                    continue
+                data = doc.to_dict() or {}
+                identity = finalization_identity(
+                    str(data.get('routeNumber') or path_parts[1]),
+                    doc.id,
+                    data,
+                )
+                finalization_guard.prime(identity)
+                if identity:
+                    primed_finalizations += 1
+            print(json.dumps({
+                "event": "order_sync_listener_initial_prime",
+                "primedFinalizations": primed_finalizations,
+                "changeCount": len(changes),
+            }, sort_keys=True))
             if _skip_initial_snapshot():
                 primed = 0
                 for change in changes:
@@ -1171,14 +1269,18 @@ def watch_all_orders(sa_path: str):
                     
                     # If it was already finalized, sync it
                     if status == 'finalized':
-                        handle_finalized_order(fb_client, order_id, data)
+                        dispatch_finalized_order_if_new(
+                            finalization_guard, fb_client, order_id, data
+                        )
             
             elif change.type.name == 'MODIFIED':
                 # Check if status changed to finalized
                 if status == 'finalized':
                     if order_event_key not in seen_order_paths:
                         seen_order_paths.add(order_event_key)
-                    handle_finalized_order(fb_client, order_id, data)
+                    dispatch_finalized_order_if_new(
+                        finalization_guard, fb_client, order_id, data
+                    )
 
     def on_adjustment_snapshot(col_snapshot, changes, read_time):
         """Process durable projection receipts, including pending docs on startup."""

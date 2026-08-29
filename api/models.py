@@ -8,8 +8,9 @@ from __future__ import annotations
 
 from datetime import date, datetime, timezone
 from typing import List, Optional, Dict, Any, Literal
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 import re
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
 # =============================================================================
@@ -69,6 +70,7 @@ class OrderCreateRequest(BaseModel):
     deliveryDate: date = Field(..., description="Expected delivery date")
     scheduleKey: str = Field(..., description="Order day (monday, tuesday, etc.)")
     isHolidaySchedule: Optional[bool] = None
+    allowUnresolvedHolidaySchedule: bool = False
     notes: Optional[str] = None
     coreItemPolicyVersion: Optional[int] = Field(default=None, ge=1, le=1)
     
@@ -298,6 +300,21 @@ class FullOrderAdjustmentConfirmResponse(BaseModel):
     model_config = ConfigDict(extra='forbid')
 
 
+class AdjustmentReminderReconcileRequest(BaseModel):
+    expectedSettingsUpdatedAtMs: Optional[int] = Field(default=None, ge=0)
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class AdjustmentReminderReconcileResponse(BaseModel):
+    orderId: str
+    adjustmentId: str
+    changed: bool
+    fields: Dict[str, Any]
+
+    model_config = ConfigDict(extra="forbid")
+
+
 class OrderItem(BaseModel):
     """Single product line item in an order."""
     sap: str
@@ -371,6 +388,35 @@ class StoreOrder(BaseModel):
         return parsed if parsed is not None else v
 
 
+class ScheduledOrder(BaseModel):
+    """Immutable cycle-day authority used by source-backed adjustment scheduling."""
+
+    version: Literal[2]
+    date: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}$")
+    timezone: str = Field(min_length=1, max_length=64)
+    scheduleKey: str = Field(pattern=SCHEDULE_KEY_PATTERN.pattern)
+    orderDay: int = Field(ge=1, le=7, strict=True)
+    loadOffsetDays: int = Field(ge=0, le=60, strict=True)
+    deliveryOffsetDays: int = Field(ge=0, le=60, strict=True)
+    provenance: Literal["cycle", "backfill"]
+
+    model_config = ConfigDict(extra="forbid")
+
+    @model_validator(mode="after")
+    def validate_cycle_identity(self) -> "ScheduledOrder":
+        try:
+            stamped_date = date.fromisoformat(self.date)
+            ZoneInfo(self.timezone)
+        except (TypeError, ValueError, ZoneInfoNotFoundError) as exc:
+            raise ValueError("Invalid scheduled order date or timezone") from exc
+        day_keys = ("", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
+        if stamped_date.isoweekday() != self.orderDay or self.scheduleKey != day_keys[self.orderDay]:
+            raise ValueError("Scheduled order weekday identity is inconsistent")
+        if self.deliveryOffsetDays < self.loadOffsetDays:
+            raise ValueError("Delivery offset must not precede load offset")
+        return self
+
+
 class Order(BaseModel):
     """Full order document (mirrors Firestore structure)."""
     id: str
@@ -380,6 +426,7 @@ class Order(BaseModel):
     expectedDeliveryDate: str
     expectedLoadDate: Optional[str] = None
     scheduleKey: Optional[str] = None
+    scheduledOrder: Optional[ScheduledOrder] = None
     status: str = Field(..., pattern='^(draft|finalized)$')
     stores: List[StoreOrder]
     createdAt: datetime

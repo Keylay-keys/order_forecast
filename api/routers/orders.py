@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import logging
 import os
+from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone
 from typing import Optional, List, Dict, Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Path, Query, Request
 from google.cloud import firestore
-from schedule_cycle import get_schedule_key_for_delivery_date
+from schedule_cycle import resolve_order_schedule_for_delivery_date
 
 from ..dependencies import (
     verify_firebase_token,
@@ -21,7 +23,10 @@ from ..dependencies import (
 from ..errors import StructuredApiError
 from ..middleware.rate_limit import rate_limit_write
 from ..order_attention import build_core_item_issues, build_next_order_store_updates
+from ..order_adjustment_schedule_v2_release import stamp_write_allowed_for_headers
 from ..models import (
+    AdjustmentReminderReconcileRequest,
+    AdjustmentReminderReconcileResponse,
     Order,
     OrderCreateRequest,
     OrderUpdateRequest,
@@ -31,18 +36,150 @@ from ..models import (
     FullOrderAdjustmentConfirmResponse,
     ErrorResponse,
 )
+from ..firestore_timestamp import timestamp_ms
 from ..order_full_adjustment import validate_and_merge_full_adjustment
 from ..order_reallocation import apply_store_reallocation, moves_signature
+try:
+    from ...scripts.order_adjustment_schedule import (
+        build_canonical_reminder_fields,
+        meaningful_lines,
+        protected_existing_fields,
+        reminder_fields_equal,
+        trusted_adjustment_settings,
+    )
+except ImportError:
+    from scripts.order_adjustment_schedule import (
+        build_canonical_reminder_fields,
+        meaningful_lines,
+        protected_existing_fields,
+        reminder_fields_equal,
+        trusted_adjustment_settings,
+    )
 
 try:
     from ...scripts.finalize_rollout import api_finalize_rollout_enabled_for_route
 except ImportError:
     from scripts.finalize_rollout import api_finalize_rollout_enabled_for_route
 
-from .schedule import get_order_cycles_from_firestore
+from .schedule import (
+    get_order_schedule_context_from_firestore,
+    get_schedule_timezone_from_firestore,
+)
 
 
 router = APIRouter()
+
+
+@firestore.transactional
+def _reconcile_adjustment_reminder_document(
+    transaction,
+    *,
+    adjustment_ref,
+    source_ref,
+    settings_ref,
+    route_number: str,
+    order_id: str,
+    adjustment_id: str,
+    authenticated_uid: str,
+    payload: AdjustmentReminderReconcileRequest,
+    now_ms: int,
+) -> Dict[str, Any]:
+    adjustment_snap = adjustment_ref.get(transaction=transaction)
+    source_snap = source_ref.get(transaction=transaction)
+    settings_snap = settings_ref.get(transaction=transaction)
+
+    if not adjustment_snap.exists:
+        raise StructuredApiError(404, "Adjustment missing", "ADJUSTMENT_NOT_FOUND")
+    if not source_snap.exists:
+        raise StructuredApiError(404, "Adjustment source missing", "MISSING_SOURCE_ORDER")
+    if not settings_snap.exists:
+        raise StructuredApiError(422, "Adjustment settings missing", "MISSING_ADJUSTMENT_SETTINGS")
+
+    adjustment = adjustment_snap.to_dict() or {}
+    source = source_snap.to_dict() or {}
+    requester = settings_snap.to_dict() or {}
+    if adjustment.get("routeNumber") != route_number:
+        raise StructuredApiError(409, "Adjustment route changed", "ADJUSTMENT_ROUTE_CHANGED")
+    if source.get("routeNumber") != route_number:
+        raise StructuredApiError(404, "Adjustment source missing", "MISSING_SOURCE_ORDER")
+    if adjustment.get("sourceOrderId") != order_id:
+        raise StructuredApiError(409, "Adjustment source changed", "ADJUSTMENT_SOURCE_CHANGED")
+
+    user_settings = requester.get("userSettings") or {}
+    if not isinstance(user_settings, Mapping):
+        raise StructuredApiError(422, "Adjustment settings missing", "MISSING_ADJUSTMENT_SETTINGS")
+    notifications = user_settings.get("notifications") or {}
+    if not isinstance(notifications, Mapping):
+        raise StructuredApiError(422, "Adjustment settings missing", "MISSING_ADJUSTMENT_SETTINGS")
+    raw_adjustment_settings = notifications.get("orderAdjustmentSettings") or {}
+    if not isinstance(raw_adjustment_settings, Mapping):
+        raise StructuredApiError(422, "Adjustment settings missing", "MISSING_ADJUSTMENT_SETTINGS")
+    settings = trusted_adjustment_settings(
+        raw_adjustment_settings
+    )
+    timestamp_container = user_settings.get("timestamps") or {}
+    if not isinstance(timestamp_container, Mapping):
+        raise StructuredApiError(422, "Invalid settings revision", "INVALID_SETTINGS_REVISION")
+    settings_updated_at_ms = timestamp_ms(
+        timestamp_container.get("updatedAt")
+    )
+    if (
+        payload.expectedSettingsUpdatedAtMs is not None
+        and payload.expectedSettingsUpdatedAtMs != settings_updated_at_ms
+    ):
+        raise StructuredApiError(409, "Settings changed", "SETTINGS_REVISION_CHANGED")
+
+    if (
+        str(adjustment.get("status") or "draft") != "draft"
+        or str(adjustment.get("reminderStatus") or "none") in {"sending", "sent"}
+    ):
+        return {
+            "orderId": order_id,
+            "adjustmentId": adjustment_id,
+            "changed": False,
+            "fields": protected_existing_fields(adjustment),
+        }
+
+    fields = build_canonical_reminder_fields(
+        source,
+        settings=settings,
+        has_meaningful_lines=meaningful_lines(adjustment),
+        status=str(adjustment.get("status") or "draft"),
+        now_ms=now_ms,
+    )
+    existing_skipped_at_ms = adjustment.get("reminderSkippedAtMs")
+    if (
+        fields.get("reminderStatus") == "skipped"
+        and adjustment.get("reminderStatus") == "skipped"
+        and fields.get("reminderSkipReason") == adjustment.get("reminderSkipReason")
+        and isinstance(existing_skipped_at_ms, int)
+        and not isinstance(existing_skipped_at_ms, bool)
+        and existing_skipped_at_ms >= 0
+    ):
+        # reminderSkippedAtMs records the transition into this skip state. It
+        # must not become a fresh "now" value on every trusted reconcile.
+        fields["reminderSkippedAtMs"] = existing_skipped_at_ms
+    if reminder_fields_equal(adjustment, fields):
+        return {
+            "orderId": order_id,
+            "adjustmentId": adjustment_id,
+            "changed": False,
+            "fields": fields,
+        }
+
+    transaction.update(
+        adjustment_ref,
+        {
+            **fields,
+            "updatedAt": firestore.SERVER_TIMESTAMP,
+        },
+    )
+    return {
+        "orderId": order_id,
+        "adjustmentId": adjustment_id,
+        "changed": True,
+        "fields": fields,
+    }
 API_FORECAST_WORKER_ID = "api-finalize"
 CORE_ITEM_ENFORCEMENT_ENABLED = (
     os.environ.get("CORE_ITEM_ENFORCEMENT_ENABLED", "false").lower() == "true"
@@ -96,93 +233,102 @@ def _resolve_route_group_id(
         return ""
 
 
-def _validate_non_holiday_schedule_key(
+def _valid_iana_timezone(value: Any) -> Optional[str]:
+    timezone_name = str(value or "").strip()
+    if not timezone_name:
+        return None
+    try:
+        ZoneInfo(timezone_name)
+    except (ZoneInfoNotFoundError, ValueError):
+        return None
+    return timezone_name
+
+
+def _require_route_owner_timezone(db: firestore.Client, route_number: str) -> str:
+    timezone_name, status = get_schedule_timezone_from_firestore(db, route_number)
+    if timezone_name:
+        return timezone_name
+    errors = {
+        "missing_owner": ("Route owner is not configured.", "ROUTE_OWNER_MISSING"),
+        "owner_conflict": ("Route owner records disagree.", "ROUTE_OWNER_CONFLICT"),
+        "missing_owner_user": ("Route owner profile is missing.", "ROUTE_OWNER_PROFILE_MISSING"),
+        "missing_timezone": ("Select a business timezone.", "ROUTE_TIMEZONE_MISSING"),
+        "invalid_timezone": ("Select a valid business timezone.", "ROUTE_TIMEZONE_INVALID"),
+    }
+    message, code = errors.get(status, errors["missing_owner"])
+    raise StructuredApiError(422, message, code)
+
+
+def _build_scheduled_order(
+    resolution: Mapping[str, Any],
+    timezone_name: str,
+    *,
+    provenance: str = "cycle",
+) -> Dict[str, Any]:
+    cycle = resolution["cycle"]
+    return {
+        "version": 2,
+        "date": resolution["orderDate"],
+        "timezone": timezone_name,
+        "scheduleKey": resolution["scheduleKey"],
+        "orderDay": cycle["orderDay"],
+        "loadOffsetDays": cycle["loadOffsetDays"],
+        "deliveryOffsetDays": cycle["deliveryOffsetDays"],
+        "provenance": provenance,
+    }
+
+
+def _resolve_create_schedule(
     db: firestore.Client,
     payload: OrderCreateRequest,
-) -> Optional[Dict[str, Any]]:
-    """Reject normal orders whose scheduleKey disagrees with the route schedule.
-
-    Holiday/off-schedule orders are allowed to bypass this because their normal
-    route cycle may not apply.
-    """
-    if payload.isHolidaySchedule:
-        return None
-
+) -> tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
     try:
-        cycles = get_order_cycles_from_firestore(db, payload.routeNumber)
+        schedule_context = get_order_schedule_context_from_firestore(db, payload.routeNumber)
+        cycles = list(schedule_context["cycles"])
     except Exception as exc:
-        logger.warning(
-            "Schedule key validation skipped for route %s: failed to load cycles: %s",
-            payload.routeNumber,
-            exc,
-        )
-        return None
+        logger.warning("Order schedule lookup failed route=%s: %s", payload.routeNumber, exc)
+        raise StructuredApiError(
+            503,
+            "Could not load the route order schedule. Try again.",
+            "ORDER_SCHEDULE_UNAVAILABLE",
+        ) from exc
+    resolution = resolve_order_schedule_for_delivery_date(
+        payload.deliveryDate,
+        cycles,
+        payload.scheduleKey,
+    )
+    if resolution["status"] == "unresolved":
+        if not payload.isHolidaySchedule:
+            code = {
+                "missing_schedule": "ORDER_SCHEDULE_MISSING",
+                "ambiguous_schedule": "ORDER_SCHEDULE_AMBIGUOUS",
+                "off_cycle": "ORDER_SCHEDULE_OFF_CYCLE",
+            }[resolution["reason"]]
+            raise StructuredApiError(
+                400,
+                "Delivery date does not match one configured order cycle.",
+                code,
+            )
+        if not payload.allowUnresolvedHolidaySchedule:
+            raise StructuredApiError(
+                409,
+                "Acknowledge that this holiday order will have no Order Adjustment window.",
+                "HOLIDAY_SCHEDULE_ACK_REQUIRED",
+            )
+        return None, None
 
-    if not cycles:
-        logger.info(
-            "Schedule key validation skipped for route %s: no configured cycles",
-            payload.routeNumber,
-        )
-        return None
-
-    resolution = get_schedule_key_for_delivery_date(payload.deliveryDate, cycles)
-    if not resolution:
-        logger.info(
-            "Schedule key validation skipped for route %s delivery %s: no matching cycle",
-            payload.routeNumber,
-            payload.deliveryDate,
-        )
-        return None
-
-    valid_keys = {
-        str(match.get("scheduleKey", "")).lower()
-        for match in resolution.get("matches", [])
-        if match.get("scheduleKey")
-    }
-    if not valid_keys:
-        valid_keys = {str(resolution.get("scheduleKey", "")).lower()}
-
-    if payload.scheduleKey.lower() not in valid_keys:
-        raise HTTPException(
-            400,
-            (
-                "Schedule key does not match the selected delivery date. "
-                "Refresh the page and try again."
-            ),
-        )
-
-    return resolution
-
-
-def _derive_expected_load_date(
-    payload: OrderCreateRequest,
-    resolution: Optional[Dict[str, Any]],
-) -> Optional[str]:
-    if not resolution:
-        return None
-
-    schedule_key = payload.scheduleKey.lower()
-    matches = [
-        match
-        for match in resolution.get("matches", [])
-        if match.get("matchedBy") == "delivery"
-        and str(match.get("scheduleKey") or "").lower() == schedule_key
-    ]
-    if len(matches) != 1:
-        return None
-
-    cycle = matches[0].get("cycle") or {}
-    order_day = cycle.get("orderDay")
-    load_offset = cycle.get("loadOffsetDays")
-    delivery_offset = cycle.get("deliveryOffsetDays")
-    if not all(isinstance(value, int) for value in (order_day, load_offset, delivery_offset)):
-        return None
-
-    order_date = payload.deliveryDate - timedelta(days=delivery_offset)
-    if order_date.isoweekday() != order_day:
-        return None
-
-    return (order_date + timedelta(days=load_offset)).isoformat()
+    timezone_name = schedule_context.get("timezone")
+    if not timezone_name:
+        errors = {
+            "missing_owner": ("Route owner is not configured.", "ROUTE_OWNER_MISSING"),
+            "owner_conflict": ("Route owner records disagree.", "ROUTE_OWNER_CONFLICT"),
+            "missing_owner_user": ("Route owner profile is missing.", "ROUTE_OWNER_PROFILE_MISSING"),
+            "missing_timezone": ("Select a business timezone.", "ROUTE_TIMEZONE_MISSING"),
+            "invalid_timezone": ("Select a valid business timezone.", "ROUTE_TIMEZONE_INVALID"),
+        }
+        message, code = errors.get(str(schedule_context.get("status")), errors["missing_owner"])
+        raise StructuredApiError(422, message, code)
+    return resolution, _build_scheduled_order(resolution, timezone_name)
 
 
 def _get_local_order_date(db: firestore.Client, route_number: str) -> str:
@@ -196,6 +342,33 @@ def _get_local_order_date(db: firestore.Client, route_number: str) -> str:
         except Exception:
             pass
     return datetime.utcnow().date().isoformat()
+
+
+def _resolve_finalize_stamp(
+    db: firestore.Client,
+    *,
+    route_number: str,
+    order_data: Mapping[str, Any],
+) -> tuple[Optional[Dict[str, Any]], Optional[str], Optional[str]]:
+    delivery_date = str(order_data.get("expectedDeliveryDate") or "").strip()
+    schedule_key = str(order_data.get("scheduleKey") or "").strip().lower()
+    if not delivery_date or not schedule_key:
+        return None, None, None
+    try:
+        schedule_context = get_order_schedule_context_from_firestore(db, route_number)
+        cycles = list(schedule_context["cycles"])
+        resolution = resolve_order_schedule_for_delivery_date(
+            delivery_date,
+            cycles,
+            schedule_key,
+        )
+        timezone_name = schedule_context.get("timezone")
+    except Exception as exc:
+        logger.warning("Finalize stamp resolution failed route=%s: %s", route_number, exc)
+        return None, delivery_date, schedule_key
+    if resolution["status"] != "resolved" or timezone_name is None:
+        return None, delivery_date, schedule_key
+    return _build_scheduled_order(resolution, timezone_name), delivery_date, schedule_key
 
 
 def _to_datetime(value: Any) -> Optional[datetime]:
@@ -331,20 +504,80 @@ def _prove_intervening_reallocations(
 def _validate_adjusted_store_allocations(
     order_data: Dict[str, Any],
     route_stores: Dict[str, Dict[str, Any]],
+    *,
+    prior_order_data: Dict[str, Any],
 ) -> None:
-    """Validate the complete server-merged allocation before committing it."""
+    """Validate merged truth without re-litigating untouched catalog history."""
+    def allocation_quantities(data: Dict[str, Any]) -> Dict[tuple[str, str], int]:
+        result: Dict[tuple[str, str], int] = {}
+        for raw_store in data.get("stores") or []:
+            store_id = str(raw_store.get("storeId") or raw_store.get("id") or "").strip()
+            for raw_item in raw_store.get("items") or []:
+                sap = str(raw_item.get("sap") or "").strip()
+                quantity = raw_item.get("quantity")
+                if (
+                    store_id
+                    and sap
+                    and isinstance(quantity, int)
+                    and not isinstance(quantity, bool)
+                    and quantity > 0
+                ):
+                    key = (store_id, sap)
+                    result[key] = result.get(key, 0) + quantity
+        return result
+
+    prior_quantities = allocation_quantities(prior_order_data)
+    merged_quantities = allocation_quantities(order_data)
+    changed_pairs = {
+        key
+        for key in set(prior_quantities) | set(merged_quantities)
+        if prior_quantities.get(key, 0) != merged_quantities.get(key, 0)
+    }
+    increased_pairs = {
+        key
+        for key in changed_pairs
+        if merged_quantities.get(key, 0) > prior_quantities.get(key, 0)
+    }
+    touched_store_ids = {store_id for store_id, _sap in changed_pairs}
+
     quantities: Dict[tuple[str, str], int] = {}
     seen_store_ids: set[str] = set()
+    not_carried: list[Dict[str, str]] = []
     for store in order_data.get("stores") or []:
         store_id = str(store.get("storeId") or store.get("id") or "").strip()
         route_store = route_stores.get(store_id)
-        if not store_id or store_id in seen_store_ids or route_store is None:
+        if not store_id or store_id in seen_store_ids:
             raise StructuredApiError(422, "The adjusted order contains an invalid store.", "ADJUSTMENT_STORE_INVALID")
-        if route_store.get("isActive", True) is False:
-            raise StructuredApiError(409, "The adjusted order contains an inactive store.", "ADJUSTMENT_STORE_INACTIVE")
+        if store_id in touched_store_ids and route_store is None:
+            raise StructuredApiError(
+                422,
+                "The adjustment changes a store that is no longer available.",
+                "ADJUSTMENT_STORE_INVALID",
+                {"stores": [{"storeId": store_id, "storeName": store.get("storeName") or ""}]},
+            )
+        if (
+            store_id in touched_store_ids
+            and route_store is not None
+            and route_store.get("isActive", True) is False
+        ):
+            raise StructuredApiError(
+                409,
+                "The adjustment changes an inactive store.",
+                "ADJUSTMENT_STORE_INACTIVE",
+                {
+                    "stores": [{
+                        "storeId": store_id,
+                        "storeName": route_store.get("name") or store.get("storeName") or "",
+                    }],
+                },
+            )
         seen_store_ids.add(store_id)
-        carried = route_store.get("items")
-        carried_saps = {str(sap) for sap in carried} if isinstance(carried, list) else None
+        carried = route_store.get("items") if route_store is not None else None
+        carried_saps = (
+            {str(sap).strip() for sap in carried if str(sap).strip()}
+            if isinstance(carried, list)
+            else None
+        )
         seen_saps: set[str] = set()
         for item in store.get("items") or []:
             sap = str(item.get("sap") or "").strip()
@@ -357,10 +590,30 @@ def _validate_adjusted_store_allocations(
                 or quantity <= 0
             ):
                 raise StructuredApiError(422, "The adjusted order contains an invalid item.", "ADJUSTMENT_ITEM_INVALID")
-            if carried_saps is not None and sap not in carried_saps:
-                raise StructuredApiError(409, "A store does not carry an adjusted item.", "ADJUSTMENT_ITEM_NOT_CARRIED")
+            if (
+                carried_saps is not None
+                and (store_id, sap) in increased_pairs
+                and sap not in carried_saps
+            ):
+                not_carried.append({
+                    "sap": sap,
+                    "storeId": store_id,
+                    "storeName": str(
+                        route_store.get("name")
+                        or store.get("storeName")
+                        or store_id
+                    ),
+                })
             seen_saps.add(sap)
             quantities[(store_id, sap)] = quantity
+
+    if not_carried:
+        raise StructuredApiError(
+            409,
+            "A store does not carry an adjusted item.",
+            "ADJUSTMENT_ITEM_NOT_CARRIED",
+            {"items": sorted(not_carried, key=lambda item: (item["storeName"], item["sap"]))},
+        )
 
     inbound_floors: Dict[tuple[str, str], int] = {}
     for allocation in order_data.get("inboundTransferStoreAllocations") or []:
@@ -465,7 +718,11 @@ def _confirm_full_order_adjustment_document(
     )
     store_docs = list(stores_ref.stream(transaction=transaction))
     route_stores = {str(doc.id): (doc.to_dict() or {}) for doc in store_docs}
-    _validate_adjusted_store_allocations(merged, route_stores)
+    _validate_adjusted_store_allocations(
+        merged,
+        route_stores,
+        prior_order_data=order_data,
+    )
     if CORE_ITEM_ENFORCEMENT_ENABLED and payload.acceptedSaps:
         issues = build_core_item_issues(
             order_data=merged,
@@ -569,6 +826,9 @@ def _finalize_order_document(
     stores_ref,
     route_number: str,
     now: datetime,
+    resolved_stamp: Optional[Dict[str, Any]] = None,
+    resolved_delivery_date: Optional[str] = None,
+    resolved_schedule_key: Optional[str] = None,
 ) -> Dict[str, Any]:
     order_doc = order_ref.get(transaction=transaction)
     if not order_doc.exists:
@@ -606,7 +866,7 @@ def _finalize_order_document(
 
     next_revision = max(1, _order_revision(order_data) + 1)
     updated_at_ms = int(now.timestamp() * 1000)
-    transaction.update(order_ref, {
+    finalize_update: Dict[str, Any] = {
         "status": "finalized",
         "submittedAt": now,
         "updatedAt": now,
@@ -616,7 +876,15 @@ def _finalize_order_document(
             "mutationId": str(order_data.get("id") or order_ref.id),
             "atMs": updated_at_ms,
         },
-    })
+    }
+    if (
+        "scheduledOrder" not in order_data
+        and resolved_stamp is not None
+        and order_data.get("expectedDeliveryDate") == resolved_delivery_date
+        and str(order_data.get("scheduleKey") or "").strip().lower() == resolved_schedule_key
+    ):
+        finalize_update["scheduledOrder"] = resolved_stamp
+    transaction.update(order_ref, finalize_update)
     for store_doc in store_docs:
         if store_doc.id not in next_order_updates:
             continue
@@ -624,7 +892,7 @@ def _finalize_order_document(
             "nextOrderItems": next_order_updates[store_doc.id],
             "updatedAt": updated_at_ms,
         })
-    return order_data
+    return {**order_data, **finalize_update}
 
 
 @firestore.transactional
@@ -934,11 +1202,24 @@ async def create_order(
 ) -> Order:
     """Create a new draft order."""
     await require_route_feature_access(payload.routeNumber, "ordering", decoded_token, db)
-    schedule_resolution = _validate_non_holiday_schedule_key(db, payload)
-    expected_load_date = _derive_expected_load_date(payload, schedule_resolution)
+    schedule_resolution, resolved_scheduled_order = _resolve_create_schedule(db, payload)
+    request_headers = getattr(request, "headers", {})
+    stamp_allowed = stamp_write_allowed_for_headers(request_headers)
+    scheduled_order = resolved_scheduled_order if stamp_allowed else None
+    if resolved_scheduled_order is not None and not stamp_allowed:
+        logger.info(
+            "order_adjustment_v2_stamp_withheld route=%s endpoint=create client=%s",
+            payload.routeNumber,
+            request_headers.get("x-routespark-app-version", "unknown"),
+        )
+    expected_load_date = (
+        str(schedule_resolution["loadDate"])
+        if schedule_resolution is not None
+        else None
+    )
 
-    order_id = f"order-{payload.routeNumber}-{int(datetime.utcnow().timestamp() * 1000)}"
     now = datetime.now(timezone.utc)
+    order_id = f"order-{payload.routeNumber}-{int(now.timestamp() * 1000)}"
 
     order_doc = {
         "id": order_id,
@@ -948,6 +1229,7 @@ async def create_order(
         "expectedDeliveryDate": payload.deliveryDate.isoformat(),
         **({"expectedLoadDate": expected_load_date} if expected_load_date else {}),
         "scheduleKey": payload.scheduleKey,
+        **({"scheduledOrder": scheduled_order} if scheduled_order is not None else {}),
         "status": "draft",
         "stores": [],
         "createdAt": now,
@@ -973,7 +1255,11 @@ async def create_order(
         payload.routeNumber,
         decoded_token["uid"],
         "order_created",
-        {"deliveryDate": payload.deliveryDate.isoformat(), "scheduleKey": payload.scheduleKey},
+        {
+            "deliveryDate": payload.deliveryDate.isoformat(),
+            "scheduleKey": payload.scheduleKey,
+            "scheduledOrderVersion": scheduled_order.get("version") if scheduled_order else None,
+        },
     )
 
     return Order(**order_doc)
@@ -1230,6 +1516,23 @@ async def finalize_order(
     requester_user_data = await require_route_feature_access(route, "ordering", decoded_token, db)
 
     order_ref = _order_ref(db, route, order_id)
+    pre_transaction_order = order_ref.get()
+    pre_transaction_data = pre_transaction_order.to_dict() or {} if pre_transaction_order.exists else {}
+    if "scheduledOrder" in pre_transaction_data:
+        resolved_stamp, resolved_delivery_date, resolved_schedule_key = None, None, None
+    elif not stamp_write_allowed_for_headers(getattr(request, "headers", {})):
+        resolved_stamp, resolved_delivery_date, resolved_schedule_key = None, None, None
+        logger.info(
+            "order_adjustment_v2_stamp_withheld route=%s endpoint=finalize client=%s",
+            route,
+            getattr(request, "headers", {}).get("x-routespark-app-version", "unknown"),
+        )
+    else:
+        resolved_stamp, resolved_delivery_date, resolved_schedule_key = _resolve_finalize_stamp(
+            db,
+            route_number=route,
+            order_data=pre_transaction_data,
+        )
     now = datetime.now(timezone.utc)
     order_data = _finalize_order_document(
         db.transaction(),
@@ -1237,6 +1540,9 @@ async def finalize_order(
         stores_ref=db.collection("routes").document(route).collection("stores"),
         route_number=route,
         now=now,
+        resolved_stamp=resolved_stamp,
+        resolved_delivery_date=resolved_delivery_date,
+        resolved_schedule_key=resolved_schedule_key,
     )
     route_number = str(order_data.get("routeNumber", ""))
 
@@ -1435,6 +1741,7 @@ async def finalize_order(
     return {
         "orderId": order_id,
         "status": "finalized",
+        "scheduledOrder": order_data.get("scheduledOrder"),
         "sync": sync_result,
         "forecastQueue": forecast_queue_result,
     }
@@ -1508,6 +1815,62 @@ async def create_store_reallocation(
         result["idempotent"],
     )
     return StoreReallocationResponse(**result)
+
+
+@router.post(
+    "/orders/{order_id}/adjustments/{adjustment_id}/reminder/reconcile",
+    response_model=AdjustmentReminderReconcileResponse,
+    responses={
+        401: {"model": ErrorResponse},
+        403: {"model": ErrorResponse},
+        404: {"model": ErrorResponse},
+        409: {"model": ErrorResponse},
+        422: {"model": ErrorResponse},
+    },
+)
+@rate_limit_write
+async def reconcile_order_adjustment_reminder(
+    request: Request,
+    payload: AdjustmentReminderReconcileRequest,
+    order_id: str = Path(..., min_length=1, max_length=160, pattern=r"^[A-Za-z0-9_-]+$"),
+    adjustment_id: str = Path(..., min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_-]+$"),
+    route: str = Query(..., pattern=r"^\d{1,10}$", description="Route number"),
+    decoded_token: dict = Depends(verify_firebase_token),
+    db: firestore.Client = Depends(get_firestore),
+) -> AdjustmentReminderReconcileResponse:
+    """Reconcile one draft from the live source stamp and persisted requester settings."""
+    requester_uid = str(decoded_token.get("uid") or "").strip()
+    if not requester_uid:
+        raise StructuredApiError(401, "Authentication required", "AUTH_REQUIRED")
+    await require_route_feature_access(route, "ordering", decoded_token, db)
+
+    route_ref = db.collection("routes").document(route)
+    source_ref = route_ref.collection("orders").document(order_id)
+    adjustment_ref = route_ref.collection("orderAdjustments").document(adjustment_id)
+    settings_ref = db.collection("users").document(requester_uid)
+    now = datetime.now(timezone.utc)
+    now_ms = int(now.timestamp()) * 1000 + now.microsecond // 1000
+    result = _reconcile_adjustment_reminder_document(
+        db.transaction(),
+        adjustment_ref=adjustment_ref,
+        source_ref=source_ref,
+        settings_ref=settings_ref,
+        route_number=route,
+        order_id=order_id,
+        adjustment_id=adjustment_id,
+        authenticated_uid=requester_uid,
+        payload=payload,
+        now_ms=now_ms,
+    )
+    logger.info(
+        "order_adjustment_reminder_reconciled route=%s order_id=%s adjustment_id=%s changed=%s requester=%s",
+        route,
+        order_id,
+        adjustment_id,
+        result["changed"],
+        requester_uid,
+    )
+    return AdjustmentReminderReconcileResponse(**result)
 
 
 @router.post(

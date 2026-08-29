@@ -18,6 +18,58 @@ class _FakeAdjustmentRef:
 
 
 class TestReallocationListenerRouting(unittest.TestCase):
+    def test_finalization_identity_prefers_mutation_and_falls_back_to_submission(self):
+        self.assertEqual(
+            listener.finalization_identity(ROUTE_NUMBER, "order-1", {
+                "status": "finalized",
+                "submittedAt": "old",
+                "lastMutation": {"kind": "finalization", "mutationId": "finalize-1"},
+            }),
+            "988200:order-1:finalize-1",
+        )
+        self.assertEqual(
+            listener.finalization_identity(ROUTE_NUMBER, "order-1", {
+                "status": "finalized", "submittedAt": "2026-08-28T12:00:00+00:00",
+            }),
+            "988200:order-1:2026-08-28T12:00:00+00:00",
+        )
+        self.assertIsNone(listener.finalization_identity(ROUTE_NUMBER, "order-1", {"status": "draft"}))
+
+    def test_guard_dispatches_transition_once_and_skips_stamp_only_update(self):
+        guard = listener.FinalizationDispatchGuard()
+        handler = mock.Mock()
+        base = {
+            "routeNumber": ROUTE_NUMBER,
+            "status": "finalized",
+            "lastMutation": {"kind": "finalization", "mutationId": "finalize-1"},
+        }
+
+        self.assertTrue(listener.dispatch_finalized_order_if_new(
+            guard, mock.Mock(), "order-1", base, handler=handler,
+        ))
+        self.assertFalse(listener.dispatch_finalized_order_if_new(
+            guard,
+            mock.Mock(),
+            "order-1",
+            {**base, "scheduledOrder": {"version": 2, "date": "2026-08-25"}},
+            handler=handler,
+        ))
+        handler.assert_called_once()
+
+    def test_initial_prime_suppresses_existing_finalization(self):
+        guard = listener.FinalizationDispatchGuard()
+        data = {
+            "routeNumber": ROUTE_NUMBER,
+            "status": "finalized",
+            "submittedAt": "2026-08-28T12:00:00+00:00",
+        }
+        guard.prime(listener.finalization_identity(ROUTE_NUMBER, "order-1", data))
+        handler = mock.Mock()
+        self.assertFalse(listener.dispatch_finalized_order_if_new(
+            guard, mock.Mock(), "order-1", data, handler=handler,
+        ))
+        handler.assert_not_called()
+
     def test_seen_key_is_full_route_scoped_path_not_bare_order_id(self):
         first = mock.Mock()
         first.reference.path = "routes/988200/orders/order-shared"

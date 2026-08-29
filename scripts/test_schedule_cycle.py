@@ -1,15 +1,28 @@
+import json
 import unittest
+from datetime import datetime, timezone
+from pathlib import Path
 
 from schedule_cycle import (
     add_days,
     get_cycle_dates,
     get_schedule_key_for_delivery_date,
+    is_valid_offset,
+    is_valid_weekday,
     normalize_order_cycle,
+    parse_civil_date,
+    resolve_order_schedule_for_delivery_date,
     weekday_after,
 )
 
 
 class ScheduleCycleTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        root = Path(__file__).resolve().parents[2]
+        cls.shared_contract = json.loads(
+            (root / "contracts/order-adjustment-scheduled-order-day-v2.json").read_text()
+        )
     def test_normalizes_long_monday_order_cycle(self):
         cycle = normalize_order_cycle(
             {
@@ -34,6 +47,24 @@ class ScheduleCycleTest(unittest.TestCase):
             },
         )
         self.assertEqual(weekday_after(cycle["orderDay"], cycle["deliveryOffsetDays"]), 3)
+
+    def test_boolean_values_are_not_valid_integer_schedule_fields(self):
+        self.assertFalse(is_valid_weekday(True))
+        self.assertFalse(is_valid_offset(False))
+        normalized = normalize_order_cycle({
+            "orderDay": True,
+            "loadOffsetDays": False,
+            "deliveryOffsetDays": True,
+        })
+        self.assertEqual(normalized["orderDay"], 1)
+        self.assertEqual(normalized["loadOffsetDays"], 0)
+        self.assertEqual(normalized["deliveryOffsetDays"], 7)
+
+    def test_datetime_input_is_normalized_to_a_civil_date(self):
+        self.assertEqual(
+            parse_civil_date(datetime(2026, 8, 25, 23, 30, tzinfo=timezone.utc)).isoformat(),
+            "2026-08-25",
+        )
 
     def test_preserves_same_weekday_delivery_as_next_occurrence(self):
         cycle = normalize_order_cycle({"orderDay": 5, "loadDay": 5, "deliveryDay": 5})
@@ -154,6 +185,92 @@ class ScheduleCycleTest(unittest.TestCase):
                 ],
             )
         )
+
+    def test_deduplicates_equal_offset_load_delivery_hit(self):
+        resolution = get_schedule_key_for_delivery_date(
+            "2026-08-31",
+            [
+                {
+                    "orderDay": 2,
+                    "loadDay": 1,
+                    "deliveryDay": 1,
+                    "loadOffsetDays": 6,
+                    "deliveryOffsetDays": 6,
+                }
+            ],
+        )
+        self.assertFalse(resolution["ambiguous"])
+        self.assertEqual(resolution["matchedBy"], "delivery")
+        self.assertEqual(len(resolution["matches"]), 1)
+
+    def test_deduplicates_semantically_identical_duplicate_cycle_rows(self):
+        cycle = {
+            "orderDay": 2,
+            "loadDay": 1,
+            "deliveryDay": 1,
+            "loadOffsetDays": 6,
+            "deliveryOffsetDays": 6,
+        }
+        resolution = get_schedule_key_for_delivery_date(
+            "2026-08-31",
+            [cycle, dict(cycle)],
+        )
+        self.assertFalse(resolution["ambiguous"])
+        self.assertEqual(resolution["matchedBy"], "delivery")
+        self.assertEqual(len(resolution["matches"]), 1)
+
+    def test_distinct_equal_offset_cycles_stay_ambiguous(self):
+        resolution = get_schedule_key_for_delivery_date(
+            "2026-08-31",
+            [
+                {"orderDay": 2, "loadOffsetDays": 6, "deliveryOffsetDays": 6},
+                {"orderDay": 1, "loadOffsetDays": 7, "deliveryOffsetDays": 7},
+            ],
+        )
+        self.assertTrue(resolution["ambiguous"])
+        self.assertEqual(len(resolution["matches"]), 2)
+
+    def test_delivery_only_resolver_rejects_load_only_hit(self):
+        resolution = resolve_order_schedule_for_delivery_date(
+            "2026-03-06",
+            [
+                {
+                    "orderDay": 1,
+                    "loadDay": 5,
+                    "deliveryDay": 3,
+                    "loadOffsetDays": 4,
+                    "deliveryOffsetDays": 9,
+                }
+            ],
+        )
+        self.assertEqual(resolution, {"status": "unresolved", "reason": "off_cycle"})
+
+    def test_delivery_only_resolver_preserves_distinct_reasons(self):
+        self.assertEqual(
+            resolve_order_schedule_for_delivery_date("2026-03-11", []),
+            {"status": "unresolved", "reason": "missing_schedule"},
+        )
+        cycles = [
+            {"orderDay": 1, "loadOffsetDays": 4, "deliveryOffsetDays": 9},
+            {"orderDay": 2, "loadOffsetDays": 3, "deliveryOffsetDays": 8},
+        ]
+        self.assertEqual(
+            resolve_order_schedule_for_delivery_date("2026-03-11", cycles),
+            {"status": "unresolved", "reason": "ambiguous_schedule"},
+        )
+
+    def test_shared_989262_fixture(self):
+        fixture = next(
+            item
+            for item in self.shared_contract["cases"]
+            if item["name"] == "route-989262-tuesday-six-day"
+        )
+        resolution = resolve_order_schedule_for_delivery_date(
+            fixture["deliveryDate"], fixture["cycles"], fixture["scheduleKey"]
+        )
+        self.assertEqual(resolution["status"], "resolved")
+        self.assertEqual(resolution["orderDate"], fixture["expected"]["orderDate"])
+        self.assertEqual(resolution["loadDate"], fixture["expected"]["loadDate"])
 
 
 if __name__ == "__main__":

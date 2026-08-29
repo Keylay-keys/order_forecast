@@ -21,9 +21,23 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from google.cloud import firestore
 from google.cloud.firestore_v1.base_query import FieldFilter
 
+try:
+    from .order_adjustment_schedule import (
+        WindowResolutionError,
+        canonical_source_v2_window,
+        meaningful_lines,
+    )
+except ImportError:
+    from order_adjustment_schedule import (
+        WindowResolutionError,
+        canonical_source_v2_window,
+        meaningful_lines,
+    )
+
 
 EXPO_PUSH_URL = "https://exp.host/--/api/v2/push/send"
 WORKER_ID = f"order-adjustment-reminder-{socket.gethostname()}-{os.getpid()}"
+SCHEDULE_RULE_VERSION = 2
 ORDER_ADJUSTMENT_REMINDERS_ENABLED = os.environ.get("ORDER_ADJUSTMENT_REMINDERS_ENABLED", "true").lower() == "true"
 ORDER_ADJUSTMENT_REMINDER_DRY_RUN = os.environ.get("ORDER_ADJUSTMENT_REMINDER_DRY_RUN", "false").lower() == "true"
 ORDER_ADJUSTMENT_REMINDER_BATCH_LIMIT = int(os.environ.get("ORDER_ADJUSTMENT_REMINDER_BATCH_LIMIT", "100"))
@@ -58,26 +72,7 @@ def _to_millis(value: Any) -> Optional[int]:
     return None
 
 
-def _meaningful_lines(data: Dict[str, Any]) -> bool:
-    raw_lines = data.get("lines") or (data.get("fullOrderWorkingCopy") or {}).get("generatedLines") or []
-    if not isinstance(raw_lines, list):
-        return False
-
-    net_cases: Dict[str, float] = {}
-    for raw_line in raw_lines:
-        if not isinstance(raw_line, dict):
-            continue
-        sap = str(raw_line.get("sap") or "").strip()
-        direction = str(raw_line.get("direction") or "").lower()
-        try:
-            case_quantity = float(raw_line.get("caseQuantity") or 0)
-        except (TypeError, ValueError):
-            continue
-        if not sap or case_quantity <= 0 or direction not in {"add", "remove"}:
-            continue
-        signed_quantity = case_quantity if direction == "add" else -case_quantity
-        net_cases[sap] = net_cases.get(sap, 0) + signed_quantity
-    return any(abs(quantity) > 1e-9 for quantity in net_cases.values())
+_meaningful_lines = meaningful_lines
 
 
 def _local_date(value: Any, route_timezone: ZoneInfo) -> Optional[date]:
@@ -94,18 +89,7 @@ def _local_date(value: Any, route_timezone: ZoneInfo) -> Optional[date]:
     return datetime.fromtimestamp(millis / 1000, timezone.utc).astimezone(route_timezone).date()
 
 
-def _source_order_data(db: firestore.Client, adjustment: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    source_order_id = str(adjustment.get("sourceOrderId") or "").strip()
-    route_number = str(adjustment.get("routeNumber") or "").strip()
-    if not source_order_id:
-        return None
-    if not route_number:
-        return {}
-    snapshot = db.collection("routes").document(route_number).collection("orders").document(source_order_id).get()
-    return snapshot.to_dict() or {} if snapshot.exists else {}
-
-
-def _expected_schedule(
+def _expected_v1_schedule(
     adjustment: Dict[str, Any],
     source_order: Optional[Dict[str, Any]],
 ) -> tuple[Optional[Dict[str, Any]], Optional[str]]:
@@ -159,10 +143,49 @@ def _expected_schedule(
     reminder_at_ms = cutoff_at_ms - lead_minutes * 60_000
     return {
         "adjustmentDate": adjustment_day.isoformat(),
+        "timezone": timezone_name,
         "cutoffAtMs": cutoff_at_ms,
         "reminderAtMs": reminder_at_ms,
         "reminderScheduledForMs": reminder_at_ms,
     }, None
+
+
+def expected_schedule_from_fresh_source(
+    adjustment: Dict[str, Any],
+    source_order: Optional[Dict[str, Any]],
+) -> tuple[Optional[Dict[str, Any]], str, Optional[str]]:
+    source_order_id = str(adjustment.get("sourceOrderId") or "").strip()
+    if source_order_id:
+        if source_order is None:
+            return None, "missing_source_order", "missing_source_order"
+        # Presence of the authority bundle permanently opts the source into the
+        # v2 path. A malformed/null bundle must fail closed; it must never fall
+        # through to submitted-time compatibility and rewrite a v2 adjustment.
+        if "scheduledOrder" in source_order:
+            try:
+                lead_minutes = int(adjustment.get("reminderLeadMinutes") or 0)
+                window = canonical_source_v2_window(
+                    source_order,
+                    cutoff_time_local=str(adjustment.get("cutoffTimeLocal") or "").strip(),
+                    reminder_lead_minutes=lead_minutes,
+                )
+            except (TypeError, ValueError, WindowResolutionError) as exc:
+                reason = exc.code if isinstance(exc, WindowResolutionError) else "window_unresolved"
+                return None, "v2", reason
+            return {
+                "adjustmentDate": window.adjustment_date,
+                "timezone": window.timezone,
+                "cutoffTimeLocal": str(adjustment.get("cutoffTimeLocal") or "").strip(),
+                "reminderLeadMinutes": lead_minutes,
+                "cutoffAtMs": window.cutoff_at_ms,
+                "reminderAtMs": window.reminder_at_ms,
+                "reminderScheduledForMs": window.reminder_at_ms,
+            }, "v2", None
+        schedule, error = _expected_v1_schedule(adjustment, source_order)
+        return schedule, "v1_source", error
+
+    schedule, error = _expected_v1_schedule(adjustment, None)
+    return schedule, "v1_standalone", error
 
 
 def _is_valid_expo_token(token: str) -> bool:
@@ -298,10 +321,18 @@ def _adjustment_ref_from_snapshot(doc: Any) -> Any:
     return ref
 
 
+def _route_from_adjustment_ref(ref: Any) -> Optional[str]:
+    raw_path = getattr(ref, "path", "")
+    parts = list(raw_path) if isinstance(raw_path, tuple) else str(raw_path).split("/")
+    if len(parts) != 4 or parts[0] != "routes" or parts[2] != "orderAdjustments":
+        return None
+    route = str(parts[1]).strip()
+    return route if route.isdigit() and len(route) <= 10 else None
+
+
 def claim_adjustment_reminder(db: firestore.Client, doc: Any, *, now_ms: int) -> Optional[Dict[str, Any]]:
     adjustment_ref = _adjustment_ref_from_snapshot(doc)
-    queried_adjustment = doc.to_dict() or {}
-    source_order = _source_order_data(db, queried_adjustment)
+    path_route_number = _route_from_adjustment_ref(adjustment_ref)
 
     @firestore.transactional
     def _claim(transaction):
@@ -309,6 +340,27 @@ def claim_adjustment_reminder(db: firestore.Client, doc: Any, *, now_ms: int) ->
         if not snap.exists:
             return None
         data = snap.to_dict() or {}
+        source_order_id = str(data.get("sourceOrderId") or "").strip()
+        route_number = str(data.get("routeNumber") or "").strip()
+        if not path_route_number or route_number != path_route_number:
+            logger.error(
+                "Refusing reminder mutation for route mismatch path_route=%s field_route=%s adjustment=%s",
+                path_route_number,
+                route_number,
+                getattr(snap, "id", ""),
+            )
+            return None
+        source_order = None
+        if source_order_id and route_number:
+            source_ref = (
+                db.collection("routes")
+                .document(route_number)
+                .collection("orders")
+                .document(source_order_id)
+            )
+            source_snap = source_ref.get(transaction=transaction)
+            source_order = source_snap.to_dict() or {} if source_snap.exists else None
+
         status = str(data.get("status") or "draft")
         reminder_status = str(data.get("reminderStatus") or "none")
         claimed_at_ms = _to_millis(data.get("reminderClaimedAtMs")) or 0
@@ -327,7 +379,7 @@ def claim_adjustment_reminder(db: firestore.Client, doc: Any, *, now_ms: int) ->
             )
             return None
 
-        expected_schedule, schedule_error = _expected_schedule(data, source_order)
+        expected_schedule, classification, schedule_error = expected_schedule_from_fresh_source(data, source_order)
         if expected_schedule is None:
             transaction.update(
                 adjustment_ref,
@@ -357,7 +409,10 @@ def claim_adjustment_reminder(db: firestore.Client, doc: Any, *, now_ms: int) ->
 
         is_pending_due = reminder_status == "pending"
         is_stale_sending = reminder_status == "sending" and claimed_at_ms <= now_ms - ORDER_ADJUSTMENT_REMINDER_CLAIM_TTL_MS
-        if cutoff_at_ms and now_ms > cutoff_at_ms + ORDER_ADJUSTMENT_REMINDER_CUTOFF_GRACE_MS:
+        allowed_until = cutoff_at_ms + (
+            ORDER_ADJUSTMENT_REMINDER_CUTOFF_GRACE_MS if is_stale_sending else 0
+        )
+        if cutoff_at_ms and now_ms >= allowed_until:
             transaction.update(
                 adjustment_ref,
                 {
@@ -384,22 +439,26 @@ def claim_adjustment_reminder(db: firestore.Client, doc: Any, *, now_ms: int) ->
             return None
 
         attempts = int(data.get("reminderAttemptCount") or 0) + 1
-        transaction.update(
-            adjustment_ref,
-            {
-                **expected_schedule,
-                "reminderStatus": "sending",
-                "reminderClaimedAtMs": now_ms,
-                "reminderWorkerId": WORKER_ID,
-                "reminderAttemptCount": attempts,
-                "updatedAt": firestore.SERVER_TIMESTAMP,
-            },
+        claim_fields = {
+            "reminderStatus": "sending",
+            "reminderClaimedAtMs": now_ms,
+            "reminderWorkerId": WORKER_ID,
+            "reminderAttemptCount": attempts,
+            "reminderSkippedAtMs": None,
+            "reminderSkipReason": None,
+            "updatedAt": firestore.SERVER_TIMESTAMP,
+        }
+        transaction.update(adjustment_ref, {**expected_schedule, **claim_fields})
+        claimed = {**data, **expected_schedule, **claim_fields, "id": snap.id}
+        claimed["sourceScheduleClassification"] = classification
+        claimed["claimAgeMs"] = max(0, now_ms - reminder_at_ms)
+        logger.info(
+            "Claimed order adjustment reminder route=%s adjustment=%s classification=%s claimAgeMs=%s",
+            route_number,
+            snap.id,
+            classification,
+            claimed["claimAgeMs"],
         )
-        claimed = dict(data)
-        claimed["id"] = snap.id
-        claimed["reminderAttemptCount"] = attempts
-        claimed["reminderClaimedAtMs"] = now_ms
-        claimed["reminderWorkerId"] = WORKER_ID
         return {"ref": adjustment_ref, "adjustment": claimed}
 
     return _claim(db.transaction())
@@ -465,9 +524,7 @@ def send_claimed_reminder(db: firestore.Client, claimed: Dict[str, Any], *, now_
     }
 
     if ORDER_ADJUSTMENT_REMINDER_DRY_RUN:
-        logger.info("[dry-run] Would send order adjustment reminder route=%s adjustment=%s uid=%s", payload["routeNumber"], payload["adjustmentId"], uid)
-        finish_adjustment_reminder(db, adjustment_ref, claim=adjustment, now_ms=now_ms, sent=True, push_stats={"sent": 0, "failed": 0, "dryRun": 1})
-        return True
+        raise RuntimeError("Dry-run must use audit_once and may not enter the send path")
 
     try:
         _write_user_notification(
@@ -493,7 +550,136 @@ def send_claimed_reminder(db: firestore.Client, claimed: Dict[str, Any], *, now_
         return False
 
 
-def run_once(db: firestore.Client, *, now_ms: Optional[int] = None, limit: int = ORDER_ADJUSTMENT_REMINDER_BATCH_LIMIT) -> Dict[str, int]:
+def _doc_identity(doc: Any) -> str:
+    ref = getattr(doc, "reference", None)
+    return str(getattr(ref, "path", "") or ref or getattr(doc, "id", ""))
+
+
+def classify_without_writes(db: firestore.Client, doc: Any, *, now_ms: int) -> Dict[str, Any]:
+    data = doc.to_dict() or {}
+    source_order_id = str(data.get("sourceOrderId") or "").strip()
+    route_number = str(data.get("routeNumber") or "").strip()
+    path_route_number = _route_from_adjustment_ref(getattr(doc, "reference", None))
+    if not path_route_number or route_number != path_route_number:
+        return {
+            "id": str(getattr(doc, "id", "")),
+            "path": _doc_identity(doc),
+            "routeNumber": route_number or None,
+            "pathRouteNumber": path_route_number,
+            "sourceOrderId": source_order_id or None,
+            "classification": "route_mismatch",
+            "scheduleError": "route_mismatch",
+            "action": "skip_route_mismatch",
+            "schedule": None,
+            "stamp": None,
+        }
+    source_order = None
+    if source_order_id and route_number:
+        source_snap = (
+            db.collection("routes").document(route_number)
+            .collection("orders").document(source_order_id).get()
+        )
+        source_order = source_snap.to_dict() or {} if source_snap.exists else None
+
+    schedule, classification, schedule_error = expected_schedule_from_fresh_source(data, source_order)
+    status = str(data.get("status") or "draft")
+    reminder_status = str(data.get("reminderStatus") or "none")
+    eligible_for_reminder = (
+        status == "draft"
+        and bool(data.get("reminderEnabled"))
+        and _meaningful_lines(data)
+    )
+    schedule_drift_fields = (
+        [key for key, value in schedule.items() if data.get(key) != value]
+        if schedule is not None
+        else []
+    )
+    stored_reminder_at_ms = _to_millis(data.get("reminderAtMs"))
+    stored_future_schedule_drift = bool(
+        classification == "v2"
+        and eligible_for_reminder
+        and stored_reminder_at_ms is not None
+        and stored_reminder_at_ms > now_ms
+        and schedule_drift_fields
+    )
+    action = "ignore"
+    if status != "draft" or not bool(data.get("reminderEnabled")):
+        action = "ignore"
+    elif not _meaningful_lines(data):
+        action = "skip_no_meaningful_lines"
+    elif schedule is None:
+        action = f"skip_{schedule_error or 'window_unresolved'}"
+    else:
+        reminder_at_ms = int(schedule["reminderAtMs"])
+        cutoff_at_ms = int(schedule["cutoffAtMs"])
+        claimed_at_ms = _to_millis(data.get("reminderClaimedAtMs")) or 0
+        stale_sending = (
+            reminder_status == "sending"
+            and claimed_at_ms <= now_ms - ORDER_ADJUSTMENT_REMINDER_CLAIM_TTL_MS
+        )
+        if reminder_at_ms > now_ms:
+            action = "patch_future" if any(data.get(key) != value for key, value in schedule.items()) else "wait_future"
+        elif now_ms >= cutoff_at_ms + (ORDER_ADJUSTMENT_REMINDER_CUTOFF_GRACE_MS if stale_sending else 0):
+            action = "skip_past_cutoff"
+        elif reminder_status == "pending" or stale_sending:
+            action = "claim_and_send"
+        else:
+            action = "ignore_not_claimable"
+
+    stamp = source_order.get("scheduledOrder") if isinstance(source_order, dict) else None
+    return {
+        "id": str(getattr(doc, "id", "")),
+        "path": _doc_identity(doc),
+        "routeNumber": route_number,
+        "sourceOrderId": source_order_id or None,
+        "classification": classification,
+        "scheduleError": schedule_error,
+        "action": action,
+        "eligibleForReminder": eligible_for_reminder,
+        "storedReminderAtMs": stored_reminder_at_ms,
+        "scheduleDriftFields": schedule_drift_fields,
+        "storedFutureScheduleDrift": stored_future_schedule_drift,
+        "schedule": schedule,
+        "stamp": (
+            {"version": stamp.get("version"), "date": stamp.get("date"), "timezone": stamp.get("timezone")}
+            if isinstance(stamp, dict) else None
+        ),
+    }
+
+
+def audit_once(db: firestore.Client, *, route_number: str, now_ms: Optional[int] = None) -> Dict[str, Any]:
+    route = str(route_number or "").strip()
+    if not route.isdigit() or len(route) > 10:
+        raise ValueError("A 1-10 digit route is required for dry-run audit")
+    now = now_ms or _now_ms()
+    docs = list(
+        db.collection("routes").document(route)
+        .collection("orderAdjustments").stream()
+    )
+    results = [classify_without_writes(db, doc, now_ms=now) for doc in docs]
+    actions: Dict[str, int] = {}
+    classifications: Dict[str, int] = {}
+    for result in results:
+        actions[result["action"]] = actions.get(result["action"], 0) + 1
+        classifications[result["classification"]] = classifications.get(result["classification"], 0) + 1
+        logger.info("[dry-run] %s", json.dumps(result, sort_keys=True, default=str))
+    summary = {
+        "event": "order_adjustment_reminder_audit",
+        "routeNumber": route,
+        "selected": len(results),
+        "actions": actions,
+        "classifications": classifications,
+        "remainingDueIds": [result["id"] for result in results if result["action"] == "claim_and_send"],
+        "workerId": WORKER_ID,
+        "scheduleRuleVersion": SCHEDULE_RULE_VERSION,
+        "dryRun": True,
+        "results": results,
+    }
+    logger.info("%s", json.dumps(summary, sort_keys=True, default=str))
+    return summary
+
+
+def run_once(db: firestore.Client, *, now_ms: Optional[int] = None, limit: int = ORDER_ADJUSTMENT_REMINDER_BATCH_LIMIT) -> Dict[str, Any]:
     if not ORDER_ADJUSTMENT_REMINDERS_ENABLED:
         logger.info("ORDER_ADJUSTMENT_REMINDERS_ENABLED=false; skipping")
         return {"claimed": 0, "sent": 0, "failed": 0, "skipped": 0}
@@ -505,11 +691,21 @@ def run_once(db: firestore.Client, *, now_ms: Optional[int] = None, limit: int =
     if remaining:
         docs.extend(list(_stale_sending_query(db, cutoff, remaining)))
 
-    stats = {"claimed": 0, "sent": 0, "failed": 0, "skipped": 0}
+    stats: Dict[str, Any] = {
+        "event": "order_adjustment_reminder_run",
+        "selected": len(docs),
+        "claimed": 0,
+        "sent": 0,
+        "failed": 0,
+        "skipped": 0,
+        "remainingDueIds": [],
+        "batchLimitReached": len(docs) >= limit,
+        "workerId": WORKER_ID,
+        "scheduleRuleVersion": SCHEDULE_RULE_VERSION,
+    }
     seen: set[str] = set()
     for doc in docs:
-        ref = getattr(doc, "reference", None)
-        doc_key = str(getattr(ref, "path", "") or ref or getattr(doc, "id", ""))
+        doc_key = _doc_identity(doc)
         if doc_key in seen:
             continue
         seen.add(doc_key)
@@ -522,12 +718,16 @@ def run_once(db: firestore.Client, *, now_ms: Optional[int] = None, limit: int =
             stats["sent"] += 1
         else:
             stats["failed"] += 1
+    stats["remainingDueIds"] = [
+        str(getattr(doc, "id", "")) for doc in _pending_query(db, now, limit)
+    ]
+    logger.info("%s", json.dumps(stats, sort_keys=True))
     return stats
 
 
-def run_worker(sa_path: str) -> Dict[str, int]:
+def run_worker(sa_path: str, *, dry_run: bool = False, route_number: Optional[str] = None) -> Dict[str, Any]:
     db = get_firestore_client(sa_path)
-    stats = run_once(db)
+    stats = audit_once(db, route_number=route_number or "") if dry_run else run_once(db)
     logger.info("Order adjustment reminder worker stats: %s", stats)
     return stats
 
@@ -536,19 +736,38 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Order Adjustment reminder worker")
     parser.add_argument("--serviceAccount", required=True, help="Path to Firebase service account JSON")
     parser.add_argument("--once", action="store_true", help="Run one reminder scan/send cycle and exit")
-    return parser.parse_args()
+    parser.add_argument("--dry-run", action="store_true", help="Classify one route without writes or sends")
+    parser.add_argument("--route", help="Route to audit; allowed only with --dry-run")
+    args = parser.parse_args()
+    if args.route and not args.dry_run:
+        parser.error("--route is allowed only with --dry-run")
+    if (args.dry_run or ORDER_ADJUSTMENT_REMINDER_DRY_RUN) and not args.route:
+        parser.error("dry-run requires an explicit --route")
+    return args
 
 
 def main() -> int:
     configure_logging()
     args = parse_args()
+    logger.info(json.dumps({
+        "event": "order_adjustment_reminder_worker_start",
+        "scheduleRuleVersion": SCHEDULE_RULE_VERSION,
+        "dryRun": bool(args.dry_run or ORDER_ADJUSTMENT_REMINDER_DRY_RUN),
+        "batchLimit": ORDER_ADJUSTMENT_REMINDER_BATCH_LIMIT,
+        "claimTtlMs": ORDER_ADJUSTMENT_REMINDER_CLAIM_TTL_MS,
+        "cutoffGraceMs": ORDER_ADJUSTMENT_REMINDER_CUTOFF_GRACE_MS,
+    }, sort_keys=True))
     if not args.once:
         logger.error("This worker is CronJob-bounded and requires --once")
         return 2
     if not os.path.exists(args.serviceAccount):
         logger.error("Service account path does not exist: %s", args.serviceAccount)
         return 2
-    run_worker(args.serviceAccount)
+    run_worker(
+        args.serviceAccount,
+        dry_run=bool(args.dry_run or ORDER_ADJUSTMENT_REMINDER_DRY_RUN),
+        route_number=args.route,
+    )
     return 0
 
 

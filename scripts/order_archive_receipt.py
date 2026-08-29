@@ -9,7 +9,8 @@ from typing import Any
 from google.cloud import firestore  # type: ignore
 
 
-ORDER_ARCHIVE_RECEIPT_SCHEMA_VERSION = 1
+ORDER_ARCHIVE_RECEIPT_SCHEMA_VERSION = 2
+LEGACY_ORDER_ARCHIVE_RECEIPT_SCHEMA_VERSION = 1
 
 
 def evaluate_order_archive_receipt(projection: dict, receipt: dict | None) -> str | None:
@@ -18,7 +19,7 @@ def evaluate_order_archive_receipt(projection: dict, receipt: dict | None) -> st
         return "receipt_missing"
     if receipt.get("status") != "verified":
         return "receipt_not_verified"
-    if receipt.get("schemaVersion") != ORDER_ARCHIVE_RECEIPT_SCHEMA_VERSION:
+    if receipt.get("schemaVersion") != projection.get("schemaVersion"):
         return "receipt_schema_mismatch"
     if (
         receipt.get("orderId") != projection.get("orderId")
@@ -38,6 +39,8 @@ def evaluate_order_archive_receipt(projection: dict, receipt: dict | None) -> st
         return "receipt_projection_mismatch"
     if receipt.get("sourceFingerprint") != projection.get("sourceFingerprint"):
         return "receipt_source_changed"
+    if receipt.get("scheduledOrder") != projection.get("scheduledOrder"):
+        return "receipt_source_changed"
     return None
 
 
@@ -50,6 +53,18 @@ def _integer(value: Any) -> int:
         return int(float(value))
     except (TypeError, ValueError, OverflowError):
         return 0
+
+
+def _canonical_value(value: Any) -> Any:
+    """Normalize map ordering so Python and TypeScript hash the same stamp."""
+    if isinstance(value, dict):
+        return {
+            key: _canonical_value(value[key])
+            for key in sorted(value)
+        }
+    if isinstance(value, list):
+        return [_canonical_value(item) for item in value]
+    return value
 
 
 def build_order_archive_projection(
@@ -86,8 +101,20 @@ def build_order_archive_projection(
         ).encode("utf-8")
     )
 
+    scheduled_order = order_data.get("scheduledOrder")
+    if not (
+        isinstance(scheduled_order, dict)
+        and scheduled_order.get("version") == 2
+    ):
+        scheduled_order = None
+    elif scheduled_order is not None:
+        scheduled_order = _canonical_value(scheduled_order)
     source = {
-        "schemaVersion": ORDER_ARCHIVE_RECEIPT_SCHEMA_VERSION,
+        "schemaVersion": (
+            ORDER_ARCHIVE_RECEIPT_SCHEMA_VERSION
+            if scheduled_order is not None
+            else LEGACY_ORDER_ARCHIVE_RECEIPT_SCHEMA_VERSION
+        ),
         "orderId": _text(order_id),
         "routeNumber": _text(
             order_data.get("routeNumber")
@@ -105,6 +132,7 @@ def build_order_archive_projection(
         "storeCount": len(stores),
         "lineItemCount": len(lines),
         "lines": lines,
+        **({"scheduledOrder": scheduled_order} if scheduled_order is not None else {}),
     }
     canonical = json.dumps(source, ensure_ascii=False, separators=(",", ":"))
     return {
@@ -142,7 +170,7 @@ def write_verified_order_archive_receipt(
         )
 
     receipt = {
-        "schemaVersion": ORDER_ARCHIVE_RECEIPT_SCHEMA_VERSION,
+        "schemaVersion": projection["schemaVersion"],
         "status": "verified",
         "orderId": projection["orderId"],
         "routeNumber": projection["routeNumber"],
@@ -155,6 +183,11 @@ def write_verified_order_archive_receipt(
         "archiveStoreCount": archived[1],
         "archiveLineItemCount": archived[2],
         "sourceFingerprint": projection["sourceFingerprint"],
+        **(
+            {"scheduledOrder": projection["scheduledOrder"]}
+            if "scheduledOrder" in projection
+            else {}
+        ),
         "source": "postgres_order_sync",
         "verifiedAt": firestore.SERVER_TIMESTAMP,
     }

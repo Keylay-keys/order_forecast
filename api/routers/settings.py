@@ -4,10 +4,13 @@ Settings API Router
 User settings including store column order preferences.
 """
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
+from google.cloud import firestore
+from pydantic import BaseModel, Field
 from typing import Dict, List
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from ..dependencies import verify_firebase_token, get_firestore
+from ..errors import StructuredApiError
 
 router = APIRouter(prefix="/settings", tags=["settings"])
 
@@ -21,6 +24,54 @@ class StoreOrderResponse(BaseModel):
     """Response with store order config."""
     config: Dict[str, List[str]]
     updatedAt: str | None = None
+
+
+class ProfileTimezoneRequest(BaseModel):
+    timezone: str = Field(min_length=1, max_length=64)
+
+
+class ProfileTimezoneResponse(BaseModel):
+    timezone: str
+
+
+def validate_iana_timezone(value: str) -> str:
+    normalized = str(value or "").strip()
+    try:
+        ZoneInfo(normalized)
+    except (ZoneInfoNotFoundError, ValueError) as exc:
+        raise StructuredApiError(
+            422,
+            "Select a valid business timezone.",
+            "TIMEZONE_INVALID",
+        ) from exc
+    return normalized
+
+
+@router.put("/profile/timezone", response_model=ProfileTimezoneResponse)
+async def set_profile_timezone(
+    body: ProfileTimezoneRequest,
+    decoded_token: dict = Depends(verify_firebase_token),
+    db = Depends(get_firestore),
+) -> ProfileTimezoneResponse:
+    """Persist a server-validated IANA timezone on the caller's profile."""
+    uid = str(decoded_token.get("uid") or "").strip()
+    if not uid:
+        raise StructuredApiError(401, "Authentication required.", "AUTH_REQUIRED")
+
+    user_ref = db.collection("users").document(uid)
+    user_snapshot = user_ref.get()
+    if not user_snapshot.exists:
+        raise StructuredApiError(404, "User profile not found.", "USER_PROFILE_NOT_FOUND")
+    user_data = user_snapshot.to_dict() or {}
+    if not isinstance(user_data.get("profile"), dict):
+        raise StructuredApiError(409, "User profile is incomplete.", "USER_PROFILE_INCOMPLETE")
+
+    timezone_name = validate_iana_timezone(body.timezone)
+    user_ref.update({
+        "profile.timezone": timezone_name,
+        "timestamps.updatedAt": firestore.SERVER_TIMESTAMP,
+    })
+    return ProfileTimezoneResponse(timezone=timezone_name)
 
 
 @router.get("/store-order", response_model=StoreOrderResponse)

@@ -183,6 +183,84 @@ class NextOrderResolutionTests(unittest.TestCase):
         self.assertEqual(len(transaction.updates), 1)
         self.assertEqual(transaction.updates[0][1]["status"], "finalized")
 
+    def test_finalize_stamps_old_client_draft_exactly_once_when_inputs_match(self):
+        transaction = _Transaction()
+        stamp = {
+            "version": 2,
+            "date": "2026-07-28",
+            "timezone": "America/Denver",
+            "scheduleKey": "tuesday",
+            "orderDay": 2,
+            "loadOffsetDays": 1,
+            "deliveryOffsetDays": 2,
+            "provenance": "cycle",
+        }
+        result = self.finalize(
+            transaction,
+            order_ref=_OrderRef(_order_data(scheduleKey="tuesday")),
+            stores_ref=_StoresRef([]),
+            route_number="988200",
+            now=self.now,
+            resolved_stamp=stamp,
+            resolved_delivery_date="2026-07-30",
+            resolved_schedule_key="tuesday",
+        )
+
+        self.assertEqual(transaction.updates[0][1]["scheduledOrder"], stamp)
+        self.assertEqual(result["scheduledOrder"], stamp)
+
+    def test_finalize_never_overwrites_existing_stamp(self):
+        transaction = _Transaction()
+        existing = {
+            "version": 2,
+            "date": "2026-07-28",
+            "timezone": "America/Denver",
+            "scheduleKey": "tuesday",
+            "orderDay": 2,
+            "loadOffsetDays": 1,
+            "deliveryOffsetDays": 2,
+            "provenance": "cycle",
+        }
+        replacement = {**existing, "date": "2099-01-01"}
+        result = self.finalize(
+            transaction,
+            order_ref=_OrderRef(_order_data(scheduleKey="tuesday", scheduledOrder=existing)),
+            stores_ref=_StoresRef([]),
+            route_number="988200",
+            now=self.now,
+            resolved_stamp=replacement,
+            resolved_delivery_date="2026-07-30",
+            resolved_schedule_key="tuesday",
+        )
+
+        self.assertNotIn("scheduledOrder", transaction.updates[0][1])
+        self.assertEqual(result["scheduledOrder"], existing)
+
+    def test_finalize_does_not_stamp_if_delivery_or_key_changed_after_resolution(self):
+        transaction = _Transaction()
+        stamp = {
+            "version": 2,
+            "date": "2026-07-28",
+            "timezone": "America/Denver",
+            "scheduleKey": "tuesday",
+            "orderDay": 2,
+            "loadOffsetDays": 1,
+            "deliveryOffsetDays": 2,
+            "provenance": "cycle",
+        }
+        self.finalize(
+            transaction,
+            order_ref=_OrderRef(_order_data(scheduleKey="monday")),
+            stores_ref=_StoresRef([]),
+            route_number="988200",
+            now=self.now,
+            resolved_stamp=stamp,
+            resolved_delivery_date="2026-07-30",
+            resolved_schedule_key="tuesday",
+        )
+
+        self.assertNotIn("scheduledOrder", transaction.updates[0][1])
+
 
 if __name__ == "__main__":
     unittest.main()
