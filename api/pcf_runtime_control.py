@@ -127,6 +127,11 @@ class PcfRuntimeControl:
             and self.discovery_mode == "disabled"
         )
 
+    @property
+    def allows_effects(self) -> bool:
+        """Grant the fixed effect worker only at the final write-authority state."""
+        return self.allows_ttl_repair
+
 
 def parse_runtime_control(payload: Any) -> PcfRuntimeControl:
     if not isinstance(payload, Mapping) or frozenset(payload) != _DOCUMENT_KEYS:

@@ -7,6 +7,7 @@ import re
 import socket
 import urllib.error
 import urllib.request
+from collections.abc import Mapping
 from http.client import IncompleteRead, RemoteDisconnected
 from typing import Any, Callable
 
@@ -86,6 +87,8 @@ class TelegramNotificationProvider:
             return NotificationProviderResult("outcome_unknown")
         try:
             payload = json.loads(raw.decode("utf-8"))
+            if not isinstance(payload, Mapping):
+                raise TypeError("Telegram response must be an object")
             message_id = payload["result"]["message_id"]
         except (KeyError, TypeError, UnicodeDecodeError, json.JSONDecodeError):
             return NotificationProviderResult("outcome_unknown")

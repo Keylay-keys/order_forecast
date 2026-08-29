@@ -47,6 +47,7 @@ def test_valid_control_hashes_canonical_document_and_exposes_exact_authority():
     assert control.allows_stage("ingress")
     assert control.allows_stage("projection")
     assert control.allows_ttl_repair
+    assert control.allows_effects
 
 
 def test_mutation_unknown_keys_and_illegal_projection_combinations_fail_closed():
@@ -78,6 +79,7 @@ def test_nonprojection_states_never_grant_ttl_repair():
             control_payload(stage=stage, discovery="disabled", authority="cluster")
         )
         assert not control.allows_ttl_repair
+        assert not control.allows_effects
 
 
 def test_file_reader_rejects_duplicate_keys_invalid_utf8_and_oversize(tmp_path: Path):

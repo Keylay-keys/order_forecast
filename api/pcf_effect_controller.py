@@ -37,6 +37,7 @@ def run_effect_controller_cycle(
     admitted_work_ids: tuple[UUID, ...] | None = None,
     now_fn: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
     effect_fn: Callable[..., EffectCycleReport] = run_one_effect,
+    claim_fn: Callable[..., Any] | None = None,
     ttl_fn: Callable[..., QueueTtlArmCycleReport] = run_queue_ttl_arm_cycle,
 ) -> EffectControllerReport:
     """Run one effect and arm only a newly complete high-confidence workflow.
@@ -46,13 +47,14 @@ def run_effect_controller_cycle(
     sweep; it never turns a successful finalization back into an effect retry.
     Low-confidence work remains held until its durable review alert resolves.
     """
-    effect = effect_fn(
-        conn,
-        handlers,
-        actor_id=actor_id,
-        admitted_work_ids=admitted_work_ids,
-        now_fn=now_fn,
-    )
+    effect_kwargs: dict[str, Any] = {
+        "actor_id": actor_id,
+        "admitted_work_ids": admitted_work_ids,
+        "now_fn": now_fn,
+    }
+    if claim_fn is not None:
+        effect_kwargs["claim_fn"] = claim_fn
+    effect = effect_fn(conn, handlers, **effect_kwargs)
     if effect.next_step is not None or effect.work_id is None:
         return EffectControllerReport(effect, "not_terminal", None)
     if effect.status == "review_scheduled":
