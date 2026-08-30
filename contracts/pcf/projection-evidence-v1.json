@@ -5,8 +5,8 @@
     "D4": "external_drive_evidence_authority"
   },
   "projectionBoundary": {
-    "namespace": "routespark-events",
-    "deployment": "pcf-effect-worker",
+    "namespace": "routespark-edge",
+    "deployment": "pcf-effects",
     "firebaseIdentity": "routespark-pcf-projection-fb@routespark-1f47d.iam.gserviceaccount.com",
     "projectRoles": ["roles/datastore.user"],
     "firestorePathScopeClaimed": false,
@@ -25,6 +25,18 @@
       "direct Mac Firebase writes",
       "effect execution unless PCF_FIREBASE_WRITE_AUTHORITY=cluster",
       "effect execution unless PCF_CLUSTER_STAGE=projection"
+    ]
+  },
+  "verificationBoundary": {
+    "identity": "routespark-pcf-verifier@routespark-1f47d.iam.gserviceaccount.com",
+    "projectRoles": ["roles/datastore.viewer", "roles/storage.objectViewer"],
+    "firestore": "read-only exact-path verification",
+    "storage": "read-only exact-object verification",
+    "writeOrDelete": false,
+    "mustDifferFrom": [
+      "routespark-pcf-projection-fb@routespark-1f47d.iam.gserviceaccount.com",
+      "routespark-pcf-object-projector@routespark-1f47d.iam.gserviceaccount.com",
+      "routespark-pcf-object-cleaner@routespark-1f47d.iam.gserviceaccount.com"
     ]
   },
   "storageBoundaries": {
@@ -70,11 +82,23 @@
     "root": "/Volumes/Extreme SSD/routespark_offload/ocr-agent-review",
     "owner": "Mac OCR/review workflow",
     "clusterReadMount": {
-      "root": "/mnt/routespark-pcf-evidence",
+      "root": "/mnt/archive/pcf/pcf_effect_evidence",
       "mode": "readOnly",
       "requiredFor": ["projecting", "cleaning"],
       "writableByCluster": false,
       "missingBehavior": "block_current_effect_step"
+    },
+    "publication": {
+      "macMount": "/Volumes/RouteSparkArchive",
+      "macPublishRoot": "/Volumes/RouteSparkArchive/pcf/pcf_effect_evidence",
+      "networkClientInWorker": false,
+      "requiredBeforeResultSubmission": true,
+      "directoryIdentity": "{workId}-attempt-{attemptNumber}",
+      "copyScope": "one exact work-attempt directory",
+      "commit": "verified staging directory renamed atomically to an absent final directory",
+      "existingFinal": "accept only after complete file/size/SHA-256 parity",
+      "partialOrConflictingBehavior": "do not submit result; retain exact staging evidence for operator disposition",
+      "remoteOrPrefixDelete": false
     },
     "packageIdentity": ["route", "delivery", "inputHashVersion", "inputHash"],
     "requiredBeforeProjection": [

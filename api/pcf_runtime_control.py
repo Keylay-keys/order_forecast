@@ -16,6 +16,8 @@ CONTROL_DOCUMENT_VERSION = "pcf-runtime-control-document-v1"
 CONTROL_PATH_ENV = "PCF_RUNTIME_CONTROL_PATH"
 DEFAULT_CONTROL_PATH = Path("/app/config/pcf-runtime-control.json")
 MAX_CONTROL_BYTES = 16_384
+MAX_CONTROL_AGE_SECONDS = 300
+MAX_CONTROL_FUTURE_SKEW_SECONDS = 30
 BOOTSTRAP_REVISION = "0" * 64
 EVIDENCE_ROOT = "/Volumes/Extreme SSD/routespark_offload/pcf-migration/firestore-read-redesign/"
 STAGES = ("off", "ingress", "shadow", "claims", "projection")
@@ -118,6 +120,12 @@ class PcfRuntimeControl:
         if minimum not in STAGES:
             raise ValueError("unknown PCF runtime stage")
         return self.stage_index >= STAGES.index(minimum)
+
+    def is_fresh(self, now: datetime) -> bool:
+        if not isinstance(now, datetime) or now.tzinfo is None:
+            raise ValueError("runtime control freshness requires an aware clock")
+        age = (now.astimezone(timezone.utc) - self.updated_at).total_seconds()
+        return -MAX_CONTROL_FUTURE_SKEW_SECONDS <= age <= MAX_CONTROL_AGE_SECONDS
 
     @property
     def allows_ttl_repair(self) -> bool:

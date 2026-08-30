@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from unittest.mock import AsyncMock, Mock
+from datetime import datetime, timezone
 
 import pytest
 
@@ -20,6 +21,9 @@ def _control(stage="off", discovery="legacy", authority="legacy_mac"):
     )
 
 
+CLOCK = lambda: datetime(2026, 8, 29, 18, 0, tzinfo=timezone.utc)
+
+
 async def _capture(messages, message):
     messages.append(message)
 
@@ -33,7 +37,7 @@ async def test_missing_or_denied_control_rejects_before_body_or_downstream():
         downstream = AsyncMock()
         receive = AsyncMock(side_effect=AssertionError("body must not be read"))
         messages = []
-        middleware = PcfRuntimeControlMiddleware(downstream, reader=reader)
+        middleware = PcfRuntimeControlMiddleware(downstream, reader=reader, clock=CLOCK)
         await middleware(
             {"type": "http", "method": "POST", "path": "/internal/v1/pcf/events"},
             receive,
@@ -61,7 +65,9 @@ async def test_allowed_request_attaches_one_complete_observed_revision():
         await send({"type": "http.response.start", "status": 204, "headers": []})
         await send({"type": "http.response.body", "body": b""})
 
-    middleware = PcfRuntimeControlMiddleware(responding_downstream, reader=lambda: control)
+    middleware = PcfRuntimeControlMiddleware(
+        responding_downstream, reader=lambda: control, clock=CLOCK
+    )
     await middleware(scope, AsyncMock(), lambda message: _capture(messages, message))
     assert scope["state"]["pcf_runtime_control"] is control
     assert dict(messages[0]["headers"])[b"x-routespark-pcf-control-revision"] == (
@@ -70,10 +76,30 @@ async def test_allowed_request_attaches_one_complete_observed_revision():
 
 
 @pytest.mark.anyio
+async def test_stale_control_rejects_before_downstream():
+    control = _control("shadow")
+    downstream = AsyncMock()
+    messages = []
+    middleware = PcfRuntimeControlMiddleware(
+        downstream,
+        reader=lambda: control,
+        clock=lambda: datetime(2026, 8, 29, 18, 5, 1, tzinfo=timezone.utc),
+    )
+    await middleware(
+        {"type": "http", "method": "POST", "path": "/internal/v1/pcf/claims"},
+        AsyncMock(side_effect=AssertionError("body must not be read")),
+        lambda message: _capture(messages, message),
+    )
+    downstream.assert_not_called()
+    assert messages[0]["status"] == 503
+    assert b"denied" in messages[1]["body"]
+
+
+@pytest.mark.anyio
 async def test_authentication_remains_outermost_and_rejects_before_control_lookup():
     reader = Mock(side_effect=AssertionError("control must follow authentication"))
     downstream = AsyncMock()
-    controlled = PcfRuntimeControlMiddleware(downstream, reader=reader)
+    controlled = PcfRuntimeControlMiddleware(downstream, reader=reader, clock=CLOCK)
     middleware = InternalMachineAuthMiddleware(controlled, enabled=True)
     receive = AsyncMock(side_effect=AssertionError("body must not be read"))
     messages = []

@@ -69,17 +69,37 @@ def service_account_identity(
 
 
 def validate_service_account_separation(
-    paths: tuple[Path, Path, Path],
+    paths: tuple[Path, ...],
     *,
     expected_project: str,
-) -> tuple[ServiceAccountIdentity, ServiceAccountIdentity, ServiceAccountIdentity]:
+    expected_direct_identities: tuple[str, ...] = (),
+    delegated_identities: tuple[str, ...] = (),
+) -> tuple[ServiceAccountIdentity, ...]:
+    if len(paths) < 2:
+        raise EffectServiceError("pcf_effect_service_accounts_not_separate")
     identities = tuple(
         service_account_identity(path, expected_project=expected_project)
         for path in paths
     )
-    if len({identity.client_email for identity in identities}) != 3:
+    if expected_direct_identities and (
+        len(expected_direct_identities) != len(identities)
+        or tuple(identity.client_email for identity in identities)
+        != expected_direct_identities
+    ):
+        raise EffectServiceError("pcf_effect_service_account_identity_mismatch")
+    expected_suffix = f"@{expected_project}.iam.gserviceaccount.com"
+    if any(
+        not isinstance(email, str)
+        or _EMAIL_RE.fullmatch(email) is None
+        or not email.endswith(expected_suffix)
+        for email in delegated_identities
+    ):
+        raise EffectServiceError("pcf_effect_service_account_identity_mismatch")
+    all_emails = [identity.client_email for identity in identities]
+    all_emails.extend(delegated_identities)
+    if len(set(all_emails)) != len(all_emails):
         raise EffectServiceError("pcf_effect_service_accounts_not_separate")
-    return identities  # type: ignore[return-value]
+    return identities
 
 
 class PostgresSuccessorGuard:
@@ -146,7 +166,7 @@ def run_controlled_effect_cycle(
 ) -> ControlledEffectCycleReport:
     now = now_fn().astimezone(timezone.utc)
     runtime = load_runtime_control(runtime_control_path)
-    if not runtime.allows_effects:
+    if not runtime.is_fresh(now) or not runtime.allows_effects:
         raise EffectServiceError("pcf_effect_runtime_authority_denied")
     control = load_effect_control(effect_control_path)
     admitted = control.admitted_work_ids(now=now)

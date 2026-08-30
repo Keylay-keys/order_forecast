@@ -75,11 +75,13 @@ class TelegramNotificationProvider:
         except urllib.error.URLError as exc:
             if isinstance(exc.reason, (TimeoutError, socket.timeout)):
                 return NotificationProviderResult("outcome_unknown")
-            return NotificationProviderResult("failed_before_acceptance")
+            if isinstance(exc.reason, (socket.gaierror, ConnectionRefusedError)):
+                return NotificationProviderResult("failed_before_acceptance")
+            return NotificationProviderResult("outcome_unknown")
         except (TimeoutError, socket.timeout, IncompleteRead, RemoteDisconnected):
             return NotificationProviderResult("outcome_unknown")
         except OSError:
-            return NotificationProviderResult("failed_before_acceptance")
+            return NotificationProviderResult("outcome_unknown")
 
         if status != 200:
             return NotificationProviderResult("failed_before_acceptance")

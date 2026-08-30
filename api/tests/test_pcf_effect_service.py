@@ -98,8 +98,8 @@ def test_controlled_cycle_passes_only_exact_live_ids_and_guarded_claim(tmp_path:
     assert report.admitted_work_count == 1
 
 
-def test_three_service_accounts_must_be_different_and_same_project(tmp_path: Path):
-    paths = tuple(tmp_path / f"{name}.json" for name in ("writer", "verify", "clean"))
+def test_effect_identities_must_be_different_and_same_project(tmp_path: Path):
+    paths = tuple(tmp_path / f"{name}.json" for name in ("writer", "verify"))
     for index, path in enumerate(paths):
         write_json(
             path,
@@ -108,20 +108,51 @@ def test_three_service_accounts_must_be_different_and_same_project(tmp_path: Pat
                 "client_email": f"pcf-{index}@routespark-test.iam.gserviceaccount.com",
             },
         )
+    expected_direct = (
+        "pcf-0@routespark-test.iam.gserviceaccount.com",
+        "pcf-1@routespark-test.iam.gserviceaccount.com",
+    )
     identities = validate_service_account_separation(
-        paths, expected_project="routespark-test"
+        paths,
+        expected_project="routespark-test",
+        expected_direct_identities=expected_direct,
+        delegated_identities=(
+            "pcf-projector@routespark-test.iam.gserviceaccount.com",
+            "pcf-cleaner@routespark-test.iam.gserviceaccount.com",
+        ),
     )
-    assert len({item.client_email for item in identities}) == 3
+    assert len({item.client_email for item in identities}) == 2
 
-    write_json(
-        paths[2],
-        {
-            "project_id": "routespark-test",
-            "client_email": identities[0].client_email,
-        },
-    )
     with pytest.raises(EffectServiceError, match="not_separate"):
-        validate_service_account_separation(paths, expected_project="routespark-test")
+        validate_service_account_separation(
+            paths,
+            expected_project="routespark-test",
+            expected_direct_identities=expected_direct,
+            delegated_identities=(
+                identities[0].client_email,
+                "pcf-cleaner@routespark-test.iam.gserviceaccount.com",
+            ),
+        )
+
+    with pytest.raises(EffectServiceError, match="identity_mismatch"):
+        validate_service_account_separation(
+            paths,
+            expected_project="routespark-test",
+            expected_direct_identities=expected_direct,
+            delegated_identities=(
+                "pcf-projector@another-project.iam.gserviceaccount.com",
+            ),
+        )
+
+    with pytest.raises(EffectServiceError, match="identity_mismatch"):
+        validate_service_account_separation(
+            paths,
+            expected_project="routespark-test",
+            expected_direct_identities=(
+                "unexpected@routespark-test.iam.gserviceaccount.com",
+                expected_direct[1],
+            ),
+        )
 
 
 class Cursor:

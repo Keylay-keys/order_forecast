@@ -81,6 +81,17 @@ def test_timeout_or_invalid_success_body_is_never_automatically_retried():
     ).disposition == "outcome_unknown"
 
 
+def test_only_definite_connection_failure_is_pre_acceptance():
+    def dns_failed(_request, *, timeout):
+        raise urllib.error.URLError(socket.gaierror())
+
+    def reset(_request, *, timeout):
+        raise urllib.error.URLError(ConnectionResetError())
+
+    assert provider(dns_failed)(ENVELOPE).disposition == "failed_before_acceptance"
+    assert provider(reset)(ENVELOPE).disposition == "outcome_unknown"
+
+
 def test_credentials_and_destination_are_strict():
     for token, chat in (("bad", CHAT), (TOKEN, "abc")):
         with pytest.raises(ValueError, match="configuration"):

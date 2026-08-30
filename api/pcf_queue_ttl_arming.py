@@ -173,6 +173,15 @@ def load_queue_ttl_arm_candidates(
                   WHERE receipt.work_id = work.work_id
                     AND receipt.event_type = 'queue_ttl_armed'
               )
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM pcf_work_items AS successor
+                  WHERE successor.route_number = work.route_number
+                    AND successor.delivery_number = work.delivery_number
+                    AND successor.source_revision COLLATE "C"
+                        > work.source_revision COLLATE "C"
+                    AND successor.status NOT IN ('superseded', 'cancelled')
+              )
             ORDER BY work.completed_at, work.work_id
             LIMIT %s
             """,

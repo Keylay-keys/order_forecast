@@ -48,6 +48,9 @@ def test_valid_control_hashes_canonical_document_and_exposes_exact_authority():
     assert control.allows_stage("projection")
     assert control.allows_ttl_repair
     assert control.allows_effects
+    assert control.is_fresh(datetime(2026, 8, 29, 18, 5, tzinfo=timezone.utc))
+    assert not control.is_fresh(datetime(2026, 8, 29, 18, 5, 1, tzinfo=timezone.utc))
+    assert not control.is_fresh(datetime(2026, 8, 29, 17, 59, 29, tzinfo=timezone.utc))
 
 
 def test_mutation_unknown_keys_and_illegal_projection_combinations_fail_closed():

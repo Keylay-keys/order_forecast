@@ -50,7 +50,7 @@
     "unknown, missing, stale, or malformed control state grants no claim or Firebase effect authority"
   ],
   "distribution": {
-    "cluster": "web-api reads the mounted ConfigMap and is the sole admission authority for ingress, claims, and cluster effects",
+    "cluster": "web-api is the sole API admission authority for ingress and Mac claims; pcf-effects reads the same routespark-edge ConfigMap object before each exact cluster effect cycle",
     "mac": "authenticated Mac worker reads the revision through the internal API; a cached revision is usable only for its signed max age and never grants direct Firebase writes",
     "legacyDiscovery": "legacy Mac discovery receives only the validated discovery value; on invalid or expired state it disables discovery",
     "maxObservedRevisionAgeSeconds": 300

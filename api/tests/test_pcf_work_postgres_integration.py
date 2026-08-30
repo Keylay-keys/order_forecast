@@ -3,13 +3,23 @@
 from __future__ import annotations
 
 import copy
+import grp
+import importlib.util
+import json
 import os
+import pwd
+import select
+import shutil
+import stat
+import subprocess
+import tempfile
 import threading
 import time
 import unittest
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import psycopg2
 from psycopg2.extras import Json, RealDictCursor
@@ -45,6 +55,7 @@ from order_forecast.api.pcf_work_ingress import (
 from order_forecast.api.pcf_queue_ttl_arming import (
     QueueTtlArmError,
     QueueTtlArmProof,
+    load_queue_ttl_arm_candidates,
     prepare_queue_ttl_arm_intent,
     record_queue_ttl_armed,
 )
@@ -61,6 +72,7 @@ from order_forecast.scripts.pcf_work_schema_migration import apply, inspect
 
 
 TEST_DSN = os.environ.get("TEST_PCF_POSTGRES_DSN", "").strip()
+ROOT = Path(__file__).resolve().parents[3]
 
 
 def upload_event(
@@ -702,6 +714,80 @@ class PcfWorkPostgresIntegrationTests(unittest.TestCase):
         self.assertEqual(row["effect_attempt_count"], 1)
         self.assertEqual(row["effect_not_before"], NOW + timedelta(seconds=91))
 
+    def test_effect_claim_exact_allowlist_skips_an_earlier_unlisted_row(self):
+        first_id = self._seed(delivery="1806248060", created_at=NOW)
+        second_id = self._seed(
+            delivery="1806248061",
+            created_at=NOW + timedelta(seconds=1),
+            input_hash="b" * 64,
+        )
+        conn = self.connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE pcf_work_items
+                    SET status = 'effects_pending', attempt_count = 1,
+                        result = %s, confidence = 96,
+                        effect_step = 'projecting', effect_not_before = %s,
+                        updated_at = %s
+                    WHERE work_id = ANY(%s::uuid[])
+                    """,
+                    (
+                        Json({"request": {"proposal": {"confidence": 96}}}),
+                        NOW + timedelta(seconds=2),
+                        NOW + timedelta(seconds=2),
+                        [str(first_id), str(second_id)],
+                    ),
+                )
+            conn.commit()
+            claimed = claim_due_effect(
+                conn,
+                actor_id="pcf-effect-worker-01",
+                now=NOW + timedelta(seconds=3),
+                visibility_seconds=30,
+                admitted_work_ids=(second_id,),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        self.assertIsNotNone(claimed)
+        self.assertEqual(claimed.work_id, second_id)
+
+    def test_listen_notify_wakes_when_result_enters_effects_pending(self):
+        work_id = self._seed()
+        listener = self.connect()
+        writer = self.connect()
+        try:
+            with listener.cursor() as cur:
+                cur.execute("LISTEN pcf_work_available")
+            listener.commit()
+            with writer.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE pcf_work_items
+                    SET status = 'effects_pending', attempt_count = 1,
+                        result = %s, confidence = 96,
+                        effect_step = 'projecting', effect_not_before = %s,
+                        updated_at = %s
+                    WHERE work_id = %s
+                    """,
+                    (
+                        Json({"request": {"proposal": {"confidence": 96}}}),
+                        NOW + timedelta(seconds=1),
+                        NOW + timedelta(seconds=1),
+                        str(work_id),
+                    ),
+                )
+            writer.commit()
+            ready, _, _ = select.select([listener], [], [], 2)
+            self.assertTrue(ready)
+            listener.poll()
+            self.assertIn(str(work_id), [item.payload for item in listener.notifies])
+        finally:
+            listener.close()
+            writer.close()
+
     def test_effect_visibility_reclaim_fences_crashed_worker_and_resets_per_step(self):
         work_id = self._accept_result()
         first_conn = self.connect()
@@ -1032,6 +1118,137 @@ class PcfWorkPostgresIntegrationTests(unittest.TestCase):
                         else None
                     ),
                 )
+
+    def test_ttl_candidates_exclude_terminal_work_shadowed_by_newer_revision(self):
+        older = self._seed(
+            input_hash="1" * 64,
+            source_revision="fsut1|2026-08-29T18:00:00.000000000Z|0",
+        )
+        newer = self._seed(
+            created_at=NOW + timedelta(minutes=1),
+            input_hash="2" * 64,
+            source_revision="fsut1|2026-08-29T18:01:00.000000000Z|0",
+        )
+        conn = self.connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE pcf_work_items
+                    SET status = 'complete', completed_at = created_at,
+                        updated_at = created_at
+                    WHERE work_id IN (%s, %s)
+                    """,
+                    (str(older), str(newer)),
+                )
+            conn.commit()
+            candidates = load_queue_ttl_arm_candidates(conn)
+        finally:
+            conn.close()
+
+        self.assertEqual(tuple(item.work_id for item in candidates), (newer,))
+
+    def test_nightly_backup_records_exact_database_watermarked_manifest(self):
+        script = ROOT / "deploy/runtime/routespark-postgres-nightly-backup.sh"
+        mount = Path("/Volumes/RouteSparkPostgresTests")
+        self.assertTrue(mount.is_mount())
+        with tempfile.TemporaryDirectory(dir=mount) as raw_temp:
+            test_root = Path(raw_temp)
+            backup_dir = test_root / "backups"
+            fake_bin = test_root / "bin"
+            backup_dir.mkdir()
+            fake_bin.mkdir()
+
+            def command(name: str, body: str) -> None:
+                path = fake_bin / name
+                path.write_text(
+                    "#!/bin/bash\nset -euo pipefail\n" + body,
+                    encoding="utf-8",
+                )
+                path.chmod(path.stat().st_mode | stat.S_IXUSR)
+
+            command(
+                "sudo",
+                '[[ "$1" == "-u" && "$2" == "postgres" ]]\n'
+                'shift 2\nexec "$@"\n',
+            )
+            command("flock", "exit 0\n")
+            command(
+                "stat",
+                '[[ "${1:-}" == "-c" && "${2:-}" == "%s" ]]\n'
+                '/usr/bin/wc -c < "$3" | /usr/bin/tr -d " "\n',
+            )
+
+            dsn = psycopg2.extensions.parse_dsn(TEST_DSN)
+            env = dict(os.environ)
+            env.update(
+                {
+                    "PATH": f"{fake_bin}:{env['PATH']}",
+                    "PGHOST": dsn["host"],
+                    "PGPORT": dsn["port"],
+                    "PGUSER": dsn["user"],
+                    "ROUTESPARK_BACKUP_DIR": str(backup_dir),
+                    "ROUTESPARK_BACKUP_DB_NAME": dsn["dbname"],
+                    "ROUTESPARK_BACKUP_LOCK_FILE": str(test_root / "backup.lock"),
+                    "ROUTESPARK_BACKUP_OWNER_USER": pwd.getpwuid(os.getuid()).pw_name,
+                    "ROUTESPARK_BACKUP_OWNER_GROUP": grp.getgrgid(os.getgid()).gr_name,
+                }
+            )
+            completed = subprocess.run(
+                ["bash", str(script)],
+                check=False,
+                capture_output=True,
+                text=True,
+                env=env,
+                timeout=30,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+
+            manifests = list(backup_dir.glob("routespark_nightly_*.dump.manifest.json"))
+            self.assertEqual(len(manifests), 1)
+            manifest = json.loads(manifests[0].read_text(encoding="utf-8"))
+            dump_path = backup_dir / manifest["dumpName"]
+
+            second_target = test_root / "second-target" / manifest["dumpName"]
+            second_target.parent.mkdir()
+            shutil.copyfile(dump_path, second_target)
+            builder_path = ROOT / "deploy/runtime/build-pcf-offbox-backup-receipt.py"
+            specification = importlib.util.spec_from_file_location(
+                "external_pcf_offbox_builder", builder_path
+            )
+            assert specification is not None and specification.loader is not None
+            builder = importlib.util.module_from_spec(specification)
+            specification.loader.exec_module(builder)
+            verified_receipt = builder.verify_and_freeze_receipt(
+                manifests[0],
+                dump_path,
+                second_target,
+                now=datetime.now(timezone.utc),
+                pg_restore=shutil.which("pg_restore") or "pg_restore",
+            )
+            self.assertEqual(verified_receipt["backupId"], manifest["backupId"])
+            self.assertEqual(verified_receipt["coversThrough"], manifest["coversThrough"])
+
+            conn = self.connect()
+            try:
+                with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                    cur.execute(
+                        """
+                        SELECT event_type, actor_type, actor_id, payload
+                        FROM pcf_work_events
+                        WHERE source_event_id = %s
+                        """,
+                        (f"pcf-backup-manifest:{manifest['backupId']}",),
+                    )
+                    row = cur.fetchone()
+            finally:
+                conn.close()
+
+            self.assertEqual(
+                (row["event_type"], row["actor_type"], row["actor_id"]),
+                ("backup_manifest_recorded", "cluster", "nightly-backup-producer"),
+            )
+            self.assertEqual(row["payload"], manifest)
 
     def test_expired_attempt_requeues_then_old_attempt_is_stale(self):
         work_id = self._seed(max_attempts=3)

@@ -158,11 +158,29 @@ class PcfProjectionEvidenceContractTests(unittest.TestCase):
         self.assertFalse(evidence["clusterStorageIsEvidenceAuthority"])
         self.assertFalse(evidence["automaticEvidenceDeletion"])
         mount = evidence["clusterReadMount"]
-        self.assertEqual(mount["root"], "/mnt/routespark-pcf-evidence")
+        self.assertEqual(
+            mount["root"], "/mnt/archive/pcf/pcf_effect_evidence"
+        )
         self.assertEqual(mount["mode"], "readOnly")
         self.assertEqual(mount["requiredFor"], ["projecting", "cleaning"])
         self.assertFalse(mount["writableByCluster"])
         self.assertEqual(mount["missingBehavior"], "block_current_effect_step")
+        publication = evidence["publication"]
+        self.assertEqual(publication["macMount"], "/Volumes/RouteSparkArchive")
+        self.assertTrue(publication["requiredBeforeResultSubmission"])
+        self.assertFalse(publication["networkClientInWorker"])
+        self.assertFalse(publication["remoteOrPrefixDelete"])
+
+        verifier = self.contract["verificationBoundary"]
+        self.assertEqual(
+            verifier["identity"],
+            "routespark-pcf-verifier@routespark-1f47d.iam.gserviceaccount.com",
+        )
+        self.assertEqual(
+            verifier["projectRoles"],
+            ["roles/datastore.viewer", "roles/storage.objectViewer"],
+        )
+        self.assertFalse(verifier["writeOrDelete"])
 
     def test_canonical_copy_has_a_distinct_generation_fenced_identity(self):
         storage = self.contract["storageBoundaries"]

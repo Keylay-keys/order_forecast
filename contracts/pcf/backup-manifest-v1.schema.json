@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://routespark.pro/contracts/pcf/backup-manifest-v1.schema.json",
+  "title": "RouteSpark PCF Backup Manifest v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "backupId",
+    "dumpName",
+    "sha256",
+    "sizeBytes",
+    "postgresVersion",
+    "schemaInventory",
+    "dumpStartedAt",
+    "dumpCompletedAt",
+    "coversThrough"
+  ],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "backupId": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$"
+    },
+    "dumpName": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,249}\\.dump$"
+    },
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "sizeBytes": { "type": "integer", "minimum": 1 },
+    "postgresVersion": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "schemaInventory": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["format", "entries", "sha256"],
+      "properties": {
+        "format": { "const": "pg_restore_list_v1" },
+        "entries": { "type": "integer", "minimum": 1 },
+        "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+      }
+    },
+    "dumpStartedAt": { "type": "string", "format": "date-time" },
+    "dumpCompletedAt": { "type": "string", "format": "date-time" },
+    "coversThrough": { "type": "string", "format": "date-time" }
+  }
+}

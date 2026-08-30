@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable
 
 from ..machine_auth import INTERNAL_PREFIX, endpoint_contract
@@ -33,9 +34,11 @@ class PcfRuntimeControlMiddleware:
         app: Callable[..., Awaitable[None]],
         *,
         reader: Callable[[], PcfRuntimeControl] = load_runtime_control,
+        clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
     ) -> None:
         self.app = app
         self.reader = reader
+        self.clock = clock
 
     async def __call__(self, scope: dict[str, Any], receive: Callable, send: Callable) -> None:
         path = str(scope.get("path", ""))
@@ -52,7 +55,7 @@ class PcfRuntimeControlMiddleware:
             logger.error({"event": "pcf_runtime_control_unavailable", "path": path})
             await self._reject(send, 503, "pcf_runtime_control_unavailable")
             return
-        if not control.allows_stage(minimum):
+        if not control.is_fresh(self.clock()) or not control.allows_stage(minimum):
             logger.warning(
                 {
                     "event": "pcf_runtime_control_denied",

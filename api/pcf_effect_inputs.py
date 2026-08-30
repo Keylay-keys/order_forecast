@@ -25,7 +25,7 @@ from .pcf_worker_contract import (
 from .pcf_work_runtime import EXPECTED_BUCKET
 
 
-EVIDENCE_MOUNT_ROOT = Path("/mnt/routespark-pcf-evidence")
+EVIDENCE_MOUNT_ROOT = Path("/mnt/archive/pcf/pcf_effect_evidence")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _WORKER_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{2,63}$")
 _UTC_RE = re.compile(
