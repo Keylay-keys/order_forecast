@@ -22,7 +22,7 @@ google-cloud-storage>=3.7,<4
 # Web API (FastAPI)
 fastapi>=0.109
 uvicorn[standard]>=0.27
-slowapi>=0.1.9
+slowapi==0.1.9
 pydantic>=2.0
 # Explicit runtime dependency for internal Ed25519 JWT verification and the
 # existing Apple server API signer; do not rely on a transitive install.

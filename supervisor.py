@@ -273,7 +273,8 @@ def create_services(route: str, sa_path: str) -> List[Service]:
             cmd=[
                 python,
                 '-m', 'uvicorn',
-                'api.main:app',
+                'order_forecast.api.main:app',
+                '--app-dir', str(BASE_DIR.parent),
                 '--host', '127.0.0.1',
                 '--port', '8000',
                 '--timeout-keep-alive', '95',
@@ -380,7 +381,7 @@ def cmd_stop(args):
     time.sleep(0.5)
     
     # Now stop individual services
-    patterns = ['order_sync_listener.py', 'config_sync_listener.py', 'order_archive_listener.py', 'archive_export_worker.py', 'archive_purge_worker.py', 'retrain_daemon.py', 'forecast_generation_worker.py', 'delivery_manifest_listener.py', 'promo_email_listener.py', 'low_qty_notification_daemon.py', 'api.main:app', 'pcf_core.runner']
+    patterns = ['order_sync_listener.py', 'config_sync_listener.py', 'order_archive_listener.py', 'archive_export_worker.py', 'archive_purge_worker.py', 'retrain_daemon.py', 'forecast_generation_worker.py', 'delivery_manifest_listener.py', 'promo_email_listener.py', 'low_qty_notification_daemon.py', 'order_forecast.api.main:app', 'pcf_core.runner']
     
     for pattern in patterns:
         try:
@@ -425,7 +426,7 @@ def cmd_status(args):
         ('Forecast Generation Worker', 'forecast_generation_worker.py'),
         ('Delivery Manifest', 'delivery_manifest_listener.py'),
         ('Promo Email', 'promo_email_listener.py'),
-        ('Web Portal API', 'api.main:app'),
+        ('Web Portal API', 'order_forecast.api.main:app'),
         ('PCF OCR Listener', 'pcf_core.runner'),
     ]
     

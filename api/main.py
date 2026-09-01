@@ -6,7 +6,7 @@ Handles order history, creation, forecasts, and system health.
 Security: All endpoints require Firebase Auth except /api/health.
 
 Usage:
-    uvicorn api.main:app --host 127.0.0.1 --port 8000
+    uvicorn order_forecast.api.main:app --app-dir .. --host 127.0.0.1 --port 8000
     
 Production runs through the Kubernetes runtime entrypoint. Local development
 may invoke uvicorn directly.
