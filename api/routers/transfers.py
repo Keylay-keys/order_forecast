@@ -27,7 +27,11 @@ from ..dependencies import (
     has_access_to_route,
     get_firestore,
 )
-from ..middleware.rate_limit import rate_limit_history, rate_limit_write
+from ..middleware.rate_limit import (
+    rate_limit_history,
+    rate_limit_transfer_create,
+    rate_limit_transfer_reserve,
+)
 from ..route_ownership import extract_owned_routes_for_owner, normalize_route
 
 router = APIRouter()
@@ -234,7 +238,7 @@ async def get_transfer_ledger(
 
 
 @router.post("/transfers/reserve")
-@rate_limit_write
+@rate_limit_transfer_reserve
 async def reserve_transfer(
     request: Request,
     payload: TransferReserveRequest,
@@ -311,7 +315,7 @@ async def reserve_transfer(
 
 
 @router.post("/transfers/create")
-@rate_limit_write
+@rate_limit_transfer_create
 async def create_transfer(
     request: Request,
     payload: TransferCreateRequest,

@@ -132,9 +132,17 @@ else:
 # =============================================================================
 # MIDDLEWARE
 # =============================================================================
-# CORS - strict origins only
-# Add CORS before the abuse controls so it does not wrap them.
-# FastAPI/Starlette middleware executes last-added first.
+# Order matters! Outermost middleware runs first.
+# Desired order for browser API traffic:
+#   CORS -> blocklist/enumeration -> honeypots -> brute force -> rate limits
+# We add them in reverse because last-added runs first.
+setup_rate_limiting(app)           # runs after brute force
+setup_brute_force_protection(app)  # tracks auth failures
+setup_honeypots(app)               # detects scanners
+setup_code_protection(app)         # blocklist + enumeration (runs first among abuse controls)
+
+# Strict CORS must wrap SlowAPI so middleware-level 429 responses remain
+# readable by the allowed browser origins.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
@@ -148,18 +156,9 @@ app.add_middleware(
         "X-RouteSpark-Platform",
         "X-RouteSpark-Capabilities",
     ],
-    expose_headers=["X-Request-ID"],
+    expose_headers=["X-Request-ID", "Retry-After"],
     max_age=3600,
 )
-
-# Order matters! Outermost middleware runs first.
-# Desired order for the abuse controls:
-#   blocklist/enumeration -> honeypots -> brute force -> rate limits -> CORS
-# We add them in reverse because last-added runs first.
-setup_rate_limiting(app)           # runs after brute force
-setup_brute_force_protection(app)  # tracks auth failures
-setup_honeypots(app)               # detects scanners
-setup_code_protection(app)         # blocklist + enumeration (runs first among abuse controls)
 
 
 @app.middleware("http")

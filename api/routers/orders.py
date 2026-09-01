@@ -21,9 +21,14 @@ from ..dependencies import (
     get_route_timezone,
 )
 from ..errors import StructuredApiError
-from ..middleware.rate_limit import rate_limit_write
+from ..middleware.rate_limit import (
+    rate_limit_order_read,
+    rate_limit_order_update,
+    rate_limit_write,
+)
 from ..order_attention import build_core_item_issues, build_next_order_store_updates
 from ..order_adjustment_schedule_v2_release import stamp_write_allowed_for_headers
+from ..order_update import merge_order_store_patches
 from ..models import (
     AdjustmentReminderReconcileRequest,
     AdjustmentReminderReconcileResponse,
@@ -1129,7 +1134,7 @@ def _log_order_audit(
         403: {"model": ErrorResponse},
     },
 )
-@rate_limit_write
+@rate_limit_order_read
 async def get_active_order(
     request: Request,
     route: str = Query(..., pattern=r"^\d{1,10}$", description="Route number"),
@@ -1265,6 +1270,53 @@ async def create_order(
     return Order(**order_doc)
 
 
+@firestore.transactional
+def _update_order_document(
+    transaction,
+    *,
+    order_ref,
+    route_number: str,
+    payload: OrderUpdateRequest,
+    now: datetime,
+) -> Dict[str, Any]:
+    """Atomically merge one web draft patch into the latest order."""
+
+    order_doc = order_ref.get(transaction=transaction)
+    if not order_doc.exists:
+        raise HTTPException(404, "Order not found")
+
+    order_data = order_doc.to_dict() or {}
+    if str(order_data.get("routeNumber") or "") != route_number:
+        raise HTTPException(403, "Route mismatch")
+    if order_data.get("status") != "draft":
+        raise HTTPException(400, "Order is not editable")
+
+    update_data: Dict[str, Any] = {
+        "stores": merge_order_store_patches(
+            order_data.get("stores") or [],
+            payload.stores,
+        ),
+        "updatedAt": now,
+    }
+    if payload.notes is not None:
+        update_data["notes"] = payload.notes
+    if payload.inboundTransfersUsed is not None:
+        update_data["inboundTransfersUsed"] = [
+            transfer.model_dump() for transfer in payload.inboundTransfersUsed
+        ]
+    if payload.routeTransfers is not None:
+        update_data["routeTransfers"] = [
+            transfer.model_dump() for transfer in payload.routeTransfers
+        ]
+    if payload.routeSplittingEnabled is not None:
+        update_data["routeSplittingEnabled"] = payload.routeSplittingEnabled
+    if payload.sapOrder is not None:
+        update_data["sapOrder"] = list(payload.sapOrder)
+
+    transaction.update(order_ref, update_data)
+    return {**order_data, **update_data}
+
+
 @router.put(
     "/orders/{order_id}",
     response_model=Order,
@@ -1276,7 +1328,7 @@ async def create_order(
         409: {"model": ErrorResponse},
     },
 )
-@rate_limit_write
+@rate_limit_order_update
 async def update_order(
     request: Request,
     order_id: str,
@@ -1286,100 +1338,22 @@ async def update_order(
     db: firestore.Client = Depends(get_firestore),
 ) -> Order:
     """Merge draft order store/item patches into the current Firestore order."""
-    requester_user_data = await require_route_feature_access(route, "ordering", decoded_token, db)
-
+    await require_route_feature_access(route, "ordering", decoded_token, db)
     order_ref = _order_ref(db, route, order_id)
-    order_doc = order_ref.get()
-    if not order_doc.exists:
-        raise HTTPException(404, "Order not found")
-
-    order_data = order_doc.to_dict() or {}
-    route_number = str(order_data.get("routeNumber", ""))
-    if route_number != route:
-        raise HTTPException(403, "Route mismatch")
-
-    if order_data.get("status") != "draft":
-        raise HTTPException(400, "Order is not editable")
-
     now = datetime.now(timezone.utc)
-
-    # Clients send quantity patches. Because `stores` is stored as an ARRAY of
-    # MAPs in Firestore, merge into the current document instead of replacing the
-    # array; otherwise a web draft save can erase mobile edits from Firebase.
-    existing_stores: List[Dict[str, Any]] = order_data.get("stores") or []
-    existing_store_by_id: Dict[str, Dict[str, Any]] = {
-        str(s.get("storeId")): s for s in existing_stores if s.get("storeId") is not None
-    }
-    merged_store_by_id: Dict[str, Dict[str, Any]] = {
-        store_id: {
-            **store,
-            "items": list(store.get("items") or []),
-        }
-        for store_id, store in existing_store_by_id.items()
-    }
-
-    for store in payload.stores:
-        incoming_store = store.dict(exclude_unset=True)
-        store_id = str(incoming_store.get("storeId", ""))
-        if not store_id:
-            continue
-        existing_store = merged_store_by_id.get(store_id) or existing_store_by_id.get(store_id, {})
-
-        existing_items = existing_store.get("items") or []
-        existing_item_by_sap: Dict[str, Dict[str, Any]] = {
-            str(it.get("sap")): it for it in existing_items if it.get("sap") is not None
-        }
-
-        for item in store.items:
-            incoming_item = item.dict(exclude_unset=True, by_alias=False)
-            sap = str(incoming_item.get("sap", "")).strip()
-            if not sap:
-                continue
-            quantity = int(incoming_item.get("quantity") or 0)
-            if quantity <= 0:
-                existing_item_by_sap.pop(sap, None)
-                continue
-            base = existing_item_by_sap.get(sap, {})
-            existing_item_by_sap[sap] = {**base, **incoming_item}
-
-        merged_store_by_id[store_id] = {
-            **existing_store,
-            **{k: v for k, v in incoming_store.items() if k != "items"},
-            "items": list(existing_item_by_sap.values()),
-        }
-
-    existing_order = [str(s.get("storeId")) for s in existing_stores if s.get("storeId") is not None]
-    incoming_order = [str(s.storeId) for s in payload.stores if s.storeId]
-    ordered_store_ids = list(dict.fromkeys([*existing_order, *incoming_order]))
-    merged_stores = [
-        merged_store_by_id[store_id]
-        for store_id in ordered_store_ids
-        if merged_store_by_id.get(store_id, {}).get("items")
-    ]
-
-    update_data = {
-        "stores": merged_stores,
-        "updatedAt": now,
-    }
-    if payload.notes is not None:
-        update_data["notes"] = payload.notes
-
-    # Transfer metadata (web portal parity)
-    if payload.inboundTransfersUsed is not None:
-        update_data["inboundTransfersUsed"] = [t.dict() for t in payload.inboundTransfersUsed]
-    if payload.routeTransfers is not None:
-        update_data["routeTransfers"] = [t.dict() for t in payload.routeTransfers]
-    if payload.routeSplittingEnabled is not None:
-        update_data["routeSplittingEnabled"] = payload.routeSplittingEnabled
-    if payload.sapOrder is not None:
-        update_data["sapOrder"] = payload.sapOrder
-
-    order_ref.update(update_data)
+    transaction = db.transaction()
+    updated = _update_order_document(
+        transaction,
+        order_ref=order_ref,
+        route_number=route,
+        payload=payload,
+        now=now,
+    )
 
     _log_order_audit(
         db,
         order_id,
-        route_number,
+        route,
         decoded_token["uid"],
         "order_updated",
         {
@@ -1387,8 +1361,6 @@ async def update_order(
             "sapOrderCount": len(payload.sapOrder) if payload.sapOrder is not None else None,
         },
     )
-
-    updated = order_ref.get().to_dict() or {}
     return Order(**updated)
 
 
@@ -1944,7 +1916,7 @@ async def confirm_full_order_adjustment(
         404: {"model": ErrorResponse},
     },
 )
-@rate_limit_write
+@rate_limit_order_read
 async def get_order_audit(
     request: Request,
     order_id: str,
