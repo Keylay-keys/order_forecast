@@ -1,5 +1,11 @@
 # Forecast Tuning Harness
 
+> For the cross-user runner, correctness audit, preserved evidence, and shared
+> Codex/Grok/Claude experiment log, see
+> [`../FORECAST_ENGINE_BACKTEST_COLLABORATION_2026-09-02.md`](../FORECAST_ENGINE_BACKTEST_COLLABORATION_2026-09-02.md).
+> The one-delivery harness is exploratory until the remaining production-replay
+> and historical as-of input blockers in that audit are closed.
+
 Purpose:
 - tweak `scripts/forecast_engine.py`
 - run one exact historical comparison repeatedly

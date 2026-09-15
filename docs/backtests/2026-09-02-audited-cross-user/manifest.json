@@ -1,0 +1,52 @@
+{
+  "schema_version": "routespark-forecast-backtest-manifest-v1-manual",
+  "generated_at_utc": "2026-09-02T19:24:54Z",
+  "execution_location": "routespark-forecast/order-forecast pod",
+  "runtime_image": "promo-disabled-20260825-01",
+  "git_revision": "582372750ae49e0fe294765bacce7eaaa18d3ebd",
+  "backtester_sha256": "3ced004d4c219244dff40274f159dd41d1503e2c353c097b61876a2735c86853",
+  "arguments": {
+    "routes": "auto-discover",
+    "since_days": 365,
+    "min_train_orders": 1,
+    "max_folds": 0,
+    "schedule_keys": null,
+    "temporal_corrections": true,
+    "ignore_band_calibration": true,
+    "store_centric_context": true
+  },
+  "result": {
+    "database_order_count": 159,
+    "database_route_count": 7,
+    "fold_count": 134,
+    "routes_evaluated": ["961767", "988200", "988270", "989262", "989567"],
+    "first_target_delivery_date": "2025-11-06",
+    "last_target_delivery_date": "2026-09-09"
+  },
+  "artifacts": {
+    "folds.csv": {
+      "sha256": "b32cccc4dd1ef6b7c0fdf80899943aee09bc696bec96d2c13f0148ad820edf76"
+    },
+    "scorecard.csv": {
+      "sha256": "7cde18b2162bad380dbf367d364524b9a61bc6c9a7cd4bee4ed90275b0764d81"
+    },
+    "sources.csv": {
+      "sha256": "d9576c44cbe9d81d12486898c2bd5729b69cd2b52ccb605d1d1111304c04443a"
+    },
+    "route_961767_forecast_gate.csv": {
+      "sha256": "a7310ab36a95f38b7fcfe9f8998ae3b39463e831d021e74edaa6cc3fdbd3d905"
+    },
+    "route_989262_recent_repeat_sequence.csv": {
+      "sha256": "e1fc6f9eee9c3b56b98c55791efa822e033693e8a67d032f546bcc3a53665b29"
+    },
+    "route_989262_rejection_cooldown_counterfactual.csv": {
+      "sha256": "7fc0447dab4d1b0fdde13d00337b58df15f4099386cca5f7ff0106ac9b38c7d7"
+    }
+  },
+  "known_limitations": [
+    "model-core scoring does not yet replay all production post-processing",
+    "catalog, schedule, carry, promo, and calibration inputs are not fully versioned as-of each fold",
+    "order_date midnight is a conservative substitute for immutable forecast generated_at",
+    "training-row aggregate features are not yet expanding and shifted"
+  ]
+}

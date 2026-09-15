@@ -1,0 +1,3 @@
+schedule_key,lines,actual_zero_lines,current_abs_error_units,zero_cooldown_abs_error_units,abs_error_improvement_units,lines_improved_by_zero_cooldown,lines_worsened_by_zero_cooldown
+monday,48,28,317,163,154,32,16
+tuesday,48,25,262,195,67,26,22

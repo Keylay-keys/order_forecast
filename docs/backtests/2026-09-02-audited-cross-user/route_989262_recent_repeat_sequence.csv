@@ -1,0 +1,7 @@
+delivery_date,schedule_key,next_delivery_date,removed_now,forecast_again_and_corrected,removed_again,repeated_removed_units
+2026-08-17,tuesday,2026-08-24,58,48,25,152
+2026-08-20,monday,2026-08-27,33,20,9,72
+2026-08-24,tuesday,2026-08-31,44,25,15,104
+2026-08-27,monday,2026-09-03,42,28,19,148
+2026-08-31,tuesday,,42,0,0,
+2026-09-03,monday,,42,0,0,

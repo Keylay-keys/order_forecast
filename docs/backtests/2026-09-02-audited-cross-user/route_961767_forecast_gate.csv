@@ -1,0 +1,6 @@
+schedule_key,finalized_orders,correction_bearing_orders,ml_gate_result
+monday,5,0,blocked_history_and_corrections
+saturday,1,0,blocked_history_and_corrections
+sunday,8,0,blocked_corrections_only
+thursday,16,0,blocked_corrections_only
+tuesday,9,0,blocked_corrections_only

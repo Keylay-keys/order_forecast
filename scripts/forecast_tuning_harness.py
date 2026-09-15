@@ -37,6 +37,7 @@ try:
         _load_source_band_calibration,
         _load_temporal_corrections,
         _order_delivery_dt,
+        _select_as_of_train_orders,
         _order_to_line_map,
         _orders_to_dataframe,
         _resolve_mode_for_fold,
@@ -64,6 +65,7 @@ except ImportError:
         _load_source_band_calibration,
         _load_temporal_corrections,
         _order_delivery_dt,
+        _select_as_of_train_orders,
         _order_to_line_map,
         _orders_to_dataframe,
         _resolve_mode_for_fold,
@@ -119,9 +121,12 @@ def _choose_train_orders(
     schedule_key: str,
     delivery_dt: datetime,
     all_orders,
+    test_order,
     mode_profile: str,
-) -> Tuple[str, str, str, List]:
-    candidate_train_orders = [o for o in all_orders if (_order_delivery_dt(o) or datetime.min) < delivery_dt]
+) -> Tuple[str, str, str, List, datetime]:
+    candidate_train_orders, forecast_as_of = _select_as_of_train_orders(all_orders, test_order)
+    if forecast_as_of is None:
+        raise SystemExit(f"Order {getattr(test_order, 'id', '?')} is missing order_date cutoff")
     order_cycles = _load_order_cycles_for_route(route)
 
     if mode_profile == "official":
@@ -130,9 +135,11 @@ def _choose_train_orders(
             schedule_key=schedule_key,
             train_orders_all=candidate_train_orders,
             order_cycles=order_cycles,
-            cutoff_dt=delivery_dt,
+            cutoff_dt=forecast_as_of,
             since_days=365,
             allow_store_context=True,
+            held_out_order_id=str(getattr(test_order, "id", "") or ""),
+            target_delivery_dt=delivery_dt,
         )
     elif mode_profile == "schedule_only":
         mode, training_scope, mode_reason = ("schedule_aware", "schedule_only", "forced_schedule_only")
@@ -147,7 +154,7 @@ def _choose_train_orders(
         ]
     else:
         train_orders = candidate_train_orders
-    return mode, training_scope, mode_reason, train_orders
+    return mode, training_scope, mode_reason, train_orders, forecast_as_of
 
 
 def _build_compare_rows(
@@ -218,11 +225,12 @@ def main() -> None:
     if not schedule_key:
         raise SystemExit(f"Order {test_order.id} is missing schedule_key")
 
-    mode, training_scope, mode_reason, train_orders = _choose_train_orders(
+    mode, training_scope, mode_reason, train_orders, forecast_as_of = _choose_train_orders(
         route=route,
         schedule_key=schedule_key,
         delivery_dt=delivery_dt,
         all_orders=all_orders,
+        test_order=test_order,
         mode_profile=str(args.modeProfile),
     )
     if not train_orders:
@@ -243,30 +251,44 @@ def main() -> None:
         ignore_band_calibration=False,
     )
 
-    df_orders = _orders_to_dataframe(train_orders)
-    df_orders, default_gap = _inject_training_schedule_features(df_orders)
-    corrections_df = _load_temporal_corrections(route, schedule_key, delivery_dt)
-    feat = _build_features(df_orders, corrections_df)
-    preds_df = _train_and_predict(
-        feat=feat,
-        target_date=delivery_dt,
-        schedule_key=schedule_key,
-        days_until_next=default_gap,
-        active_promos=None,
-        band_scale=band_scale,
-    )
-    preds_df = _apply_live_slow_gate(preds_df, case_pack_by_sap)
-
-    pred_line_map = _build_pred_line_map(preds_df)
     actual_line_map = _order_to_line_map(test_order)
-    naive_line_map = _build_last_value_map(train_orders)
-    pred_band_map = _build_pred_band_map(
-        preds_df,
-        center_offset_units=band_center_offset,
-        source_band_adjustments=source_band_adjustments,
-    )
-    key_source_map = _build_key_source_map(preds_df)
-    key_meta_map = _build_key_meta_map(preds_df)
+    naive_line_map = _build_last_value_map(train_orders, schedule_key=schedule_key)
+    df_orders = _orders_to_dataframe(train_orders)
+    if mode == "copy_last_order":
+        pred_line_map = dict(naive_line_map)
+        key_source_map = {key: "last_order_anchor" for key in pred_line_map}
+        key_meta_map = {}
+        pred_band_map = {
+            key: (max(0.0, float(value) * 0.7), float(value), float(value) * 1.3, 0.72)
+            for key, value in pred_line_map.items()
+        }
+    else:
+        df_orders, default_gap = _inject_training_schedule_features(df_orders)
+        corrections_df = _load_temporal_corrections(
+            route,
+            schedule_key,
+            forecast_as_of,
+            held_out_order_id=str(getattr(test_order, "id", "") or ""),
+            target_delivery_dt=delivery_dt,
+        )
+        feat = _build_features(df_orders, corrections_df)
+        preds_df = _train_and_predict(
+            feat=feat,
+            target_date=delivery_dt,
+            schedule_key=schedule_key,
+            days_until_next=default_gap,
+            active_promos=None,
+            band_scale=band_scale,
+        )
+        preds_df = _apply_live_slow_gate(preds_df, case_pack_by_sap)
+        pred_line_map = _build_pred_line_map(preds_df)
+        pred_band_map = _build_pred_band_map(
+            preds_df,
+            center_offset_units=band_center_offset,
+            source_band_adjustments=source_band_adjustments,
+        )
+        key_source_map = _build_key_source_map(preds_df)
+        key_meta_map = _build_key_meta_map(preds_df)
     cold_start_p90_by_sap = _compute_cold_start_p90_by_sap(df_orders, case_pack_by_sap)
     metrics = _compute_fold_metrics(
         route_number=route,
@@ -296,6 +318,7 @@ def main() -> None:
     summary = {
         "route_number": route,
         "delivery_date": delivery_date,
+        "forecast_as_of": forecast_as_of.isoformat(),
         "order_id": test_order.id,
         "order_date": test_order.order_date,
         "schedule_key": schedule_key,
