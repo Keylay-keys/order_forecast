@@ -1,4 +1,4 @@
-"""Business pilot shell only. No financial records or writes in this slice."""
+"""Accounting pilot access and the authenticated cluster workflow API."""
 
 from fastapi import APIRouter, Depends, Query, Request
 from google.cloud import firestore
@@ -6,8 +6,12 @@ from google.cloud import firestore
 from ..business_access import require_business_access
 from ..dependencies import get_firestore, verify_firebase_token
 from ..middleware.rate_limit import rate_limit_history
+from .accounting import router as accounting_router
+from .accounting_worker import router as accounting_worker_router
 
 router = APIRouter()
+router.include_router(accounting_router)
+router.include_router(accounting_worker_router)
 
 
 @router.get("/business/access")

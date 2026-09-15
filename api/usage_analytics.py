@@ -39,6 +39,7 @@ _DEFAULT_REPORTING_TIME_ZONE = "America/Denver"
 
 
 _FEATURE_PREFIXES: Tuple[Tuple[str, str], ...] = (
+    ("/api/business", "business"),
     ("/api/routes/", "dashboard"),
     ("/api/catalog/starter", "reference_catalog"),
     ("/api/catalog/items/search", "reference_catalog"),
