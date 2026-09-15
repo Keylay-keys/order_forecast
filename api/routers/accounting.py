@@ -17,6 +17,7 @@ from ..middleware.rate_limit import rate_limit_history
 from ..accounting_domain import Accounting, fail, identifier
 from ..accounting_store import accounting_transaction
 from .. import accounting_evidence as evidence
+from .. import accounting_email as email_intake
 
 router = APIRouter()
 logger = logging.getLogger("api.accounting")
@@ -50,6 +51,8 @@ async def bounded_body(request, limit):
 def dispatch(store, route, today, method, path, body, files, refresh):
     domain, _, suffix = path.partition("/")
     accounting = Accounting(store, route, today)
+    if domain == "email-intake" and not suffix:
+        return email_intake.setup(store, route, method, body)
     if domain == "expenses":
         return accounting.expenses(method, suffix, body)
     if domain == "bills":
@@ -193,6 +196,13 @@ async def accounting_request(
                 fail("Invalid JSON request.")
             if type(body) is not dict:
                 fail("An accounting request must be an object.")
+            hash_input = body
+        if path == "email-intake":
+            if body:
+                fail("Email setup takes no client-supplied identity fields.")
+            if not decoded_token.get("email_verified"):
+                fail("Verify your sign-in email before setting up forwarding.", 403)
+            body = {"_verifiedEmail": decoded_token.get("email", "")}
             hash_input = body
         fingerprint = hashlib.sha256(json.dumps([method, path, hash_input], sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 

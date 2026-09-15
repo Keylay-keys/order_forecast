@@ -9,9 +9,12 @@ from ..middleware.rate_limit import rate_limit_history
 from .accounting import router as accounting_router
 from .accounting_worker import router as accounting_worker_router
 
+from .accounting_email import router as accounting_email_router
+
 router = APIRouter()
 router.include_router(accounting_router)
 router.include_router(accounting_worker_router)
+router.include_router(accounting_email_router)
 
 
 @router.get("/business/access")
