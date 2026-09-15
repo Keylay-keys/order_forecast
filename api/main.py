@@ -22,8 +22,9 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 
 from .dependencies import get_firebase_app, get_pg_pool, get_firestore
+from .routers import business
 from .errors import install_api_error_handlers
-from .routers import auth, history, health, orders, forecast, reference, stores, catalog, low_quantity, settings, schedule, credits, pos, deliveries, transfers, team, team_tasks, billing, archive_exports, dashboard, usage, pcf_internal
+from .routers import auth, history, health, orders, forecast, reference, stores, catalog, low_quantity, settings, schedule, credits, pos, deliveries, transfers, team, team_tasks, billing, archive_exports, dashboard, usage, metrics, pcf_internal
 from .middleware.rate_limit import setup_rate_limiting
 from .middleware.honeypots import setup_honeypots
 from .middleware.brute_force import setup_brute_force_protection
@@ -177,6 +178,10 @@ async def add_security_headers(request: Request, call_next):
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["X-XSS-Protection"] = "1; mode=block"
     response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    if request.url.path == "/api/settings/sap-orders/portal" or request.url.path.startswith(("/api/metrics/", "/api/business/")):
+        # Personal preferences must not be cached, including auth, validation,
+        # conflict, rate-limit, and availability error responses.
+        response.headers["Cache-Control"] = "private, no-store"
     
     return response
 
@@ -224,6 +229,8 @@ app.include_router(billing.router, prefix="/api", tags=["Billing"])
 app.include_router(archive_exports.router, prefix="/api", tags=["Archive Exports"])
 app.include_router(dashboard.router, prefix="/api", tags=["Dashboard"])
 app.include_router(usage.router, prefix="/api", tags=["Usage Analytics"])
+app.include_router(business.router, prefix="/api", tags=["Business Pilot"])
+app.include_router(metrics.router, prefix="/api", tags=["Metrics"])
 app.include_router(pcf_internal.router, tags=["Internal PCF"])
 
 

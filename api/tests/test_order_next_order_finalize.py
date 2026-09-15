@@ -262,5 +262,101 @@ class NextOrderResolutionTests(unittest.TestCase):
         self.assertNotIn("scheduledOrder", transaction.updates[0][1])
 
 
+    def test_adjustment_anchor_uses_server_instant_and_owner_timezone(self):
+        anchor = orders._build_adjustment_anchor(
+            datetime(2026, 9, 4, 2, 23, 45, 678000, tzinfo=timezone.utc),
+            "America/Denver",
+        )
+        self.assertEqual(anchor, {
+            "version": 1,
+            "finalizedAtMs": 1788488625678,
+            "finalizedDate": "2026-09-03",
+            "timezone": "America/Denver",
+        })
+
+    def test_finalize_writes_anchor_without_mutating_existing_schedule(self):
+        transaction = _Transaction()
+        scheduled_order = {
+            "version": 2,
+            "date": "2026-09-01",
+            "timezone": "America/Denver",
+            "scheduleKey": "tuesday",
+            "orderDay": 2,
+            "loadOffsetDays": 1,
+            "deliveryOffsetDays": 2,
+            "provenance": "cycle",
+        }
+        original_schedule = dict(scheduled_order)
+        anchor = orders._build_adjustment_anchor(
+            datetime(2026, 9, 4, 2, 23, tzinfo=timezone.utc),
+            "America/Denver",
+        )
+        result = self.finalize(
+            transaction,
+            order_ref=_OrderRef(_order_data(scheduledOrder=scheduled_order)),
+            stores_ref=_StoresRef([]),
+            route_number="988200",
+            now=datetime(2026, 9, 4, 2, 23, tzinfo=timezone.utc),
+            resolved_stamp={**scheduled_order, "date": "2099-01-01"},
+            resolved_adjustment_anchor=anchor,
+        )
+
+        update = transaction.updates[0][1]
+        self.assertNotIn("scheduledOrder", update)
+        self.assertEqual(update["adjustmentAnchor"], anchor)
+        self.assertEqual(result["scheduledOrder"], original_schedule)
+        self.assertEqual(scheduled_order, original_schedule)
+
+    def test_finalize_never_overwrites_existing_anchor(self):
+        transaction = _Transaction()
+        scheduled_order = {
+            "version": 2,
+            "date": "2026-09-01",
+            "timezone": "America/Denver",
+            "scheduleKey": "tuesday",
+            "orderDay": 2,
+            "loadOffsetDays": 1,
+            "deliveryOffsetDays": 2,
+            "provenance": "cycle",
+        }
+        existing_anchor = {
+            "version": 1,
+            "finalizedAtMs": 1788488625678,
+            "finalizedDate": "2026-09-03",
+            "timezone": "America/Denver",
+        }
+        result = self.finalize(
+            transaction,
+            order_ref=_OrderRef(_order_data(
+                scheduledOrder=scheduled_order,
+                adjustmentAnchor=existing_anchor,
+            )),
+            stores_ref=_StoresRef([]),
+            route_number="988200",
+            now=self.now,
+            resolved_adjustment_anchor={**existing_anchor, "finalizedAtMs": 1},
+        )
+
+        self.assertNotIn("adjustmentAnchor", transaction.updates[0][1])
+        self.assertEqual(result["adjustmentAnchor"], existing_anchor)
+
+    def test_finalize_without_schedule_authority_does_not_add_anchor(self):
+        transaction = _Transaction()
+        self.finalize(
+            transaction,
+            order_ref=_OrderRef(_order_data()),
+            stores_ref=_StoresRef([]),
+            route_number="988200",
+            now=self.now,
+            resolved_adjustment_anchor={
+                "version": 1,
+                "finalizedAtMs": 1,
+                "finalizedDate": "1970-01-01",
+                "timezone": "UTC",
+            },
+        )
+        self.assertNotIn("adjustmentAnchor", transaction.updates[0][1])
+
+
 if __name__ == "__main__":
     unittest.main()

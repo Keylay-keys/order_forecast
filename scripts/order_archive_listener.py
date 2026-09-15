@@ -20,9 +20,11 @@ from google.cloud import firestore  # type: ignore
 try:
     from .pg_utils import get_archived_dates, get_order_by_date, get_order_by_id
     from .request_listener_query import pending_request_query
+    from .order_archive_schedule import is_send_archive, require_archive_send_owner
 except ImportError:
     from pg_utils import get_archived_dates, get_order_by_date, get_order_by_id
     from request_listener_query import pending_request_query
+    from order_archive_schedule import is_send_archive, require_archive_send_owner
 
 # Worker ID for this instance
 WORKER_ID = f"archive-{socket.gethostname()}-{__import__('os').getpid()}"
@@ -190,6 +192,16 @@ def handle_request(doc_ref, data: dict, fb_client: firestore.Client) -> bool:
         
         elapsed = time.time() - start_time
         
+        # Ordinary archive access is unchanged. The additional Send record has
+        # the same live owner boundary as its API, including date-based lookups.
+        archived_order = result.get('order')
+        if isinstance(archived_order, dict) and is_send_archive(archived_order.get('id')):
+            try:
+                require_archive_send_owner(fb_client, data.get('userId'), str(route_number))
+            except Exception:
+                _reject_unauthorized_request(doc_ref)
+                return False
+
         # Write result
         if 'error' in result:
             doc_ref.update({

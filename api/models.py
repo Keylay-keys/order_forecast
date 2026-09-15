@@ -6,7 +6,7 @@ to ensure compatibility between mobile app and web portal.
 
 from __future__ import annotations
 
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import List, Optional, Dict, Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 import re
@@ -21,6 +21,34 @@ ROUTE_NUMBER_PATTERN = re.compile(r'^\d{1,10}$')
 SCHEDULE_KEY_PATTERN = re.compile(r'^(monday|tuesday|wednesday|thursday|friday|saturday|sunday)$')
 SAP_PATTERN = re.compile(r'^[\w\-]{1,20}$')
 STORE_ID_PATTERN = re.compile(r'^[\w\-]{1,50}$')
+
+
+def normalize_sap_order(
+    value: Optional[List[str]],
+    *,
+    allow_none: bool = True,
+) -> Optional[List[str]]:
+    """Validate one bounded canonical SAP sequence without coercion.
+
+    This validator is shared by the legacy order compatibility field and the
+    Portal preference endpoint.  ``fullmatch`` is deliberate: ``re.match``
+    accepts a trailing newline and weakens the canonical token boundary.
+    """
+    if value is None:
+        if allow_none:
+            return None
+        raise ValueError('sapOrder is required')
+    if not isinstance(value, list):
+        raise ValueError('sapOrder must be an array')
+    if len(value) > 2000:
+        raise ValueError('sapOrder must contain at most 2000 items')
+    if any(not isinstance(item, str) for item in value):
+        raise ValueError('sapOrder must contain only strings')
+    if len(value) != len(set(value)):
+        raise ValueError('sapOrder must not contain duplicates')
+    if any(SAP_PATTERN.fullmatch(item) is None for item in value):
+        raise ValueError('sapOrder contains an invalid SAP')
+    return list(value)
 
 
 def _parse_firestore_timestamp(value: Any) -> Optional[datetime]:
@@ -73,6 +101,8 @@ class OrderCreateRequest(BaseModel):
     allowUnresolvedHolidaySchedule: bool = False
     notes: Optional[str] = None
     coreItemPolicyVersion: Optional[int] = Field(default=None, ge=1, le=1)
+    requestId: Optional[str] = Field(default=None, pattern=r'^[A-Za-z0-9_-]{16,64}$')
+    expectedScheduleRevision: Optional[int] = Field(default=None, strict=True, ge=1, le=9007199254740991)
     
     @field_validator('routeNumber')
     @classmethod
@@ -417,6 +447,65 @@ class ScheduledOrder(BaseModel):
         return self
 
 
+class ScheduledOrderV3(ScheduledOrder):
+    """Self-contained source evidence. Never reconstructed from current settings."""
+
+    version: Literal[3]
+    provenance: Literal["cycle"]
+    sendDate: str = Field(pattern=r"^[1-9]\d{3}-\d{2}-\d{2}$")
+    sendOffsetDays: int = Field(ge=0, le=60, strict=True)
+    sourceRevision: int = Field(ge=1, le=9007199254740991, strict=True)
+    sourceOwnerUid: str = Field(pattern=r"^[A-Za-z0-9_-]{1,128}$")
+    sourceRouteNumber: str = Field(pattern=r"^[0-9]{1,10}$")
+
+    @model_validator(mode="after")
+    def validate_source_identity(self) -> "ScheduledOrderV3":
+        if self.sendOffsetDays > self.loadOffsetDays:
+            raise ValueError("Send offset must not follow pickup")
+        if not re.fullmatch(r"[1-9]\d{3}-\d{2}-\d{2}", self.date, re.ASCII):
+            raise ValueError("Invalid start date")
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", self.sourceOwnerUid):
+            raise ValueError("Invalid source owner")
+        if not re.fullmatch(r"[0-9]{1,10}", self.sourceRouteNumber):
+            raise ValueError("Invalid source route")
+        try:
+            from .errors import StructuredApiError
+            from .schedule_source_contract import validate_timezone
+            validate_timezone(self.timezone)
+            start = date.fromisoformat(self.date)
+            if (start + timedelta(days=self.sendOffsetDays)).isoformat() != self.sendDate:
+                raise ValueError("Send date does not match saved offset")
+            start + timedelta(days=self.deliveryOffsetDays)
+        except (ValueError, OverflowError, StructuredApiError) as exc:
+            raise ValueError("Invalid V3 schedule evidence") from exc
+        return self
+
+
+class AdjustmentAnchor(BaseModel):
+    """Immutable server finalization authority for an adjustment window."""
+
+    version: Literal[1]
+    finalizedAtMs: int = Field(gt=0, strict=True)
+    finalizedDate: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}$")
+    timezone: str = Field(min_length=1, max_length=64)
+
+    model_config = ConfigDict(extra="forbid")
+
+    @model_validator(mode="after")
+    def validate_finalization_identity(self) -> "AdjustmentAnchor":
+        try:
+            finalized_date = date.fromisoformat(self.finalizedDate)
+            zone = ZoneInfo(self.timezone)
+            instant_date = datetime.fromtimestamp(
+                self.finalizedAtMs / 1000, timezone.utc
+            ).astimezone(zone).date()
+        except (ValueError, OSError, ZoneInfoNotFoundError) as exc:
+            raise ValueError("Adjustment finalization authority is invalid") from exc
+        if instant_date != finalized_date:
+            raise ValueError("Adjustment finalization date is inconsistent")
+        return self
+
+
 class Order(BaseModel):
     """Full order document (mirrors Firestore structure)."""
     id: str
@@ -426,7 +515,16 @@ class Order(BaseModel):
     expectedDeliveryDate: str
     expectedLoadDate: Optional[str] = None
     scheduleKey: Optional[str] = None
-    scheduledOrder: Optional[ScheduledOrder] = None
+    scheduledOrder: Optional[ScheduledOrder | ScheduledOrderV3] = None
+    adjustmentAnchor: Optional[AdjustmentAnchor] = None
+
+    @model_validator(mode="after")
+    def validate_saved_schedule_link(self) -> "Order":
+        if isinstance(self.scheduledOrder, ScheduledOrderV3):
+            from .order_schedule_evidence import validate_order_evidence
+            validate_order_evidence(self.model_dump())
+        return self
+
     status: str = Field(..., pattern='^(draft|finalized)$')
     stores: List[StoreOrder]
     createdAt: datetime
@@ -477,13 +575,7 @@ class OrderUpdateRequest(BaseModel):
     @field_validator('sapOrder')
     @classmethod
     def validate_sap_order(cls, v):
-        if v is None:
-            return v
-        if len(v) != len(set(v)):
-            raise ValueError('sapOrder must not contain duplicates')
-        if any(not SAP_PATTERN.match(value) for value in v):
-            raise ValueError('sapOrder contains an invalid SAP')
-        return v
+        return normalize_sap_order(v)
 
     @field_validator('updatedAt', mode='before')
     @classmethod

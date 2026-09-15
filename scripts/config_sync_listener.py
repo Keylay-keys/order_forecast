@@ -20,6 +20,7 @@ import os
 import socket
 import threading
 import time
+from copy import deepcopy
 from datetime import datetime, timezone
 from typing import Any, Optional, Dict, List, Set
 
@@ -27,6 +28,30 @@ import psycopg2
 from psycopg2.extras import execute_values, RealDictCursor
 from google.cloud import firestore  # type: ignore
 from google.cloud.firestore_v1.base_query import FieldFilter
+from google.cloud.firestore_v1.field_path import FieldPath
+
+def read_route_send_view(db, route):
+    # Daemons run by filename; tests/API also import through the package.
+    try:
+        from order_forecast.api.schedule_send_extension import read_route_legacy_view
+    except ModuleNotFoundError as error:
+        if error.name != 'order_forecast':
+            raise
+        from api.schedule_send_extension import read_route_legacy_view
+    return read_route_legacy_view(db, route)
+
+try:
+    from .config_sync_retry import LatestConfigWork, exception_types
+    from .config_refresh_worker import RefreshWorker
+    from .config_firestore_runtime import from_service_account
+    from .schedule_sync import read_current_schedule, sync_current_v3
+    from .order_send_reminder_refresh import enqueue_current as enqueue_send_reminder_refresh, route_enabled as send_reminder_route_enabled
+except ImportError:
+    from config_sync_retry import LatestConfigWork, exception_types
+    from config_refresh_worker import RefreshWorker
+    from config_firestore_runtime import from_service_account
+    from schedule_sync import read_current_schedule, sync_current_v3
+    from order_send_reminder_refresh import enqueue_current as enqueue_send_reminder_refresh, route_enabled as send_reminder_route_enabled
 
 try:
     from .low_qty_notification_store import (
@@ -546,8 +571,10 @@ def resolve_authoritative_route_owner(
 class ConfigSyncManager:
     """Manages all config sync listeners for multiple routes."""
 
-    def __init__(self, fb_client: firestore.Client):
+    def __init__(self, fb_client: firestore.Client, *, firestore_runtime=None):
         self.fb_client = fb_client
+        self._firestore_runtime = firestore_runtime
+        self._stopping = threading.Event()
         self.watchers: List = []
         self.known_routes: Set[str] = set()
         self._store_signatures: Dict[tuple, str] = {}
@@ -556,6 +583,13 @@ class ConfigSyncManager:
         self._stores_initialized: Set[str] = set()
         self._products_initialized: Set[str] = set()
         self._schedules_initialized: Set[str] = set()
+        self._schedule_failed_routes: Set[str] = set()
+        self._schedule_retry_callbacks: Dict[str, Any] = {}
+        self._schedule_sync_locks: Dict[str, Any] = {}
+        self._send_worker = RefreshWorker(
+            lambda uid, route: enqueue_send_reminder_refresh(self.fb_client, uid, route),
+            lambda route: send_reminder_route_enabled(route))
+        self._config_work = LatestConfigWork()
         self._refresh_timers: Dict[str, threading.Timer] = {}
         self._low_qty_watch = None
         self._low_qty_owner_watchers: Dict[str, Any] = {}
@@ -573,6 +607,13 @@ class ConfigSyncManager:
             "enabled_preferences": 0,
             "disabled_preferences": 0,
         }
+
+    def _watch(self, reference, callback):
+        if self._stopping.is_set():
+            raise RuntimeError('Listener stopping')
+        if self._firestore_runtime is not None:
+            return self._firestore_runtime.watch(reference, callback)
+        return reference(self.fb_client).on_snapshot(callback)
 
     @staticmethod
     def _low_qty_sync_enabled() -> bool:
@@ -772,11 +813,7 @@ class ConfigSyncManager:
                     print(f"  [LowQty] Owner watch error for route {route}: {exc}")
 
             try:
-                watcher = (
-                    self.fb_client.collection("routes")
-                    .document(route_number)
-                    .on_snapshot(on_owner_snapshot)
-                )
+                watcher = self._watch(lambda db: db.collection("routes").document(route_number), on_owner_snapshot)
                 self._low_qty_owner_watchers[route_number] = watcher
             except Exception:
                 self._low_qty_owner_watchers.pop(route_number, None)
@@ -794,7 +831,7 @@ class ConfigSyncManager:
                 print("  [LowQty] Preference schema is not ready; existing config listeners continue")
                 return False
 
-            query = self.fb_client.collection("users").where(
+            query = lambda db: db.collection("users").where(
                 filter=FieldFilter(
                     "userSettings.notifications.orderReminders.enabled",
                     "==",
@@ -810,7 +847,7 @@ class ConfigSyncManager:
                     self._emit_low_qty_metrics("snapshot_error")
                     print(f"  [LowQty] Preference snapshot failed without affecting config-sync: {exc}")
 
-            self._low_qty_watch = query.on_snapshot(on_low_qty_snapshot)
+            self._low_qty_watch = self._watch(query, on_low_qty_snapshot)
             self.watchers.append(self._low_qty_watch)
             self._low_qty_sync_ready = True
             print("  [LowQty] Watching enabled reminder users")
@@ -891,105 +928,133 @@ class ConfigSyncManager:
         timer.start()
         print(f"  [Forecast] Debounced refresh scheduled for {route_number}: {reason}")
 
-    def start_stores_listener(self, route_number: str) -> None:
+    def _queue_config_changes(self, kind, route, changes, initial_batch):
+        signatures = self._store_signatures if kind == 'store' else self._product_signatures
+        signature = _store_forecast_signature if kind == 'store' else _product_forecast_signature
+        for change in changes:
+            if change.type.name not in ('ADDED', 'MODIFIED', 'REMOVED'):
+                continue
+            identifier = change.document.id
+            data = deepcopy(change.document.to_dict() or {})
+            deleted = change.type.name == 'REMOVED'
+            def apply(identifier=identifier, data=data, deleted=deleted):
+                key = (route, identifier)
+                try:
+                    before = signatures.get(key)
+                    after = signature(data)
+                    sync = sync_store_to_pg if kind == 'store' else sync_product_to_pg
+                    if not sync(route, identifier, data, deleted=deleted):
+                        return False
+                    # Retry if scheduling the debounce timer fails. The timer's
+                    # later database enqueue has its own existing error handling.
+                    if not initial_batch and (deleted or before != after):
+                        reason = 'store_or_carry_change' if kind == 'store' else 'product_or_case_pack_change'
+                        self._schedule_forecast_refresh(route, reason)
+                    if deleted:
+                        signatures.pop(key, None)
+                    else:
+                        signatures[key] = after
+                    return True
+                except Exception as error:
+                    print(f'  [ConfigRetry] pending kind={kind} route={route} error_type={type(error).__name__}')
+                    return False
+            self._config_work.put((kind, route), identifier, apply)
+        self.retry_config_documents()
+
+    def retry_config_documents(self):
+        return self._config_work.drain(limit=25)
+
+    def start_stores_listener(self, route_number: str) -> Any:
         """Start listening to stores collection for a route."""
-        stores_ref = self.fb_client.collection('routes').document(route_number).collection('stores')
+        stores_ref = lambda db: db.collection('routes').document(route_number).collection('stores')
 
         def on_stores_snapshot(col_snapshot, changes, read_time):
             initial_batch = route_number not in self._stores_initialized
-            changed = False
-            for change in changes:
-                doc = change.document
-                store_id = doc.id
-                data = doc.to_dict() or {}
-
-                key = (route_number, store_id)
-                previous_signature = self._store_signatures.get(key)
-                next_signature = _store_forecast_signature(data)
-                if change.type.name == 'ADDED' or change.type.name == 'MODIFIED':
-                    synced = sync_store_to_pg(route_number, store_id, data, deleted=False)
-                    self._store_signatures[key] = next_signature
-                elif change.type.name == 'REMOVED':
-                    synced = sync_store_to_pg(route_number, store_id, data, deleted=True)
-                    self._store_signatures.pop(key, None)
-                else:
-                    synced = False
-                changed = changed or bool(
-                    synced and not initial_batch and (
-                        change.type.name == 'REMOVED' or previous_signature != next_signature
-                    )
-                )
+            self._queue_config_changes('store', route_number, changes, initial_batch)
             self._stores_initialized.add(route_number)
-            if changed:
-                self._schedule_forecast_refresh(route_number, "store_or_carry_change")
 
-        watcher = stores_ref.on_snapshot(on_stores_snapshot)
+        watcher = self._watch(stores_ref, on_stores_snapshot)
         self.watchers.append(watcher)
         print(f"  [Listener] Stores for route {route_number}")
+        return watcher
 
-    def start_products_listener(self, route_number: str) -> None:
+    def start_products_listener(self, route_number: str) -> Any:
         """Start listening to masterCatalog products for a route.
 
         NOTE: Uses masterCatalog/{route}/products which is the source of truth
         for casePack and tray fields.
         """
-        products_ref = self.fb_client.collection('masterCatalog').document(route_number).collection('products')
+        products_ref = lambda db: db.collection('masterCatalog').document(route_number).collection('products')
 
         def on_products_snapshot(col_snapshot, changes, read_time):
             initial_batch = route_number not in self._products_initialized
-            changed = False
-            for change in changes:
-                doc = change.document
-                sap = doc.id
-                data = doc.to_dict() or {}
-
-                key = (route_number, sap)
-                previous_signature = self._product_signatures.get(key)
-                next_signature = _product_forecast_signature(data)
-                if change.type.name == 'ADDED' or change.type.name == 'MODIFIED':
-                    synced = sync_product_to_pg(route_number, sap, data, deleted=False)
-                    self._product_signatures[key] = next_signature
-                elif change.type.name == 'REMOVED':
-                    synced = sync_product_to_pg(route_number, sap, data, deleted=True)
-                    self._product_signatures.pop(key, None)
-                else:
-                    synced = False
-                changed = changed or bool(
-                    synced and not initial_batch and (
-                        change.type.name == 'REMOVED' or previous_signature != next_signature
-                    )
-                )
+            self._queue_config_changes('product', route_number, changes, initial_batch)
             self._products_initialized.add(route_number)
-            if changed:
-                self._schedule_forecast_refresh(route_number, "product_or_case_pack_change")
 
-        watcher = products_ref.on_snapshot(on_products_snapshot)
+        watcher = self._watch(products_ref, on_products_snapshot)
         self.watchers.append(watcher)
         print(f"  [Listener] Products for route {route_number}")
+        return watcher
+
+    def enqueue_send_reminder_settings(self, user_id: str, route_number: str) -> None:
+        self._send_worker.submit(user_id, route_number)
+
+    def retry_send_reminder_settings(self) -> None:
+        # Refresh RPCs run only in the independent worker, never this keepalive.
+        # Failed mirrors retry without another edit; restart watches replay the
+        # durable extension. No order/history scan or account-wide write.
+        for route in [key for key in list(self._schedule_retry_callbacks) if key in self._schedule_failed_routes][:10]:
+            retry = self._schedule_retry_callbacks.get(route)
+            if retry:
+                retry()
+                self._schedule_retry_callbacks.pop(route, None)
+                self._schedule_retry_callbacks[route] = retry
+
+    def start_send_member_listener(self, route_number: str) -> Any:
+        if not send_reminder_route_enabled(route_number):
+            return
+
+        def changed(snapshots, changes, read_time):
+            docs = [change.document for change in changes] if changes else snapshots
+            for snapshot in docs:
+                # The event only identifies an actor, never supplies authority.
+                self.enqueue_send_reminder_settings(snapshot.id, route_number)
+
+        query = lambda db: db.collection('users').where(filter=FieldFilter(
+            FieldPath('routeAssignments', route_number, 'role').to_api_repr(), '==', 'team_member'))
+        watcher = self._watch(query, changed)
+        self.watchers.append(watcher)
+        return watcher
 
     def start_schedules_listener(self, user_id: str, route_number: str) -> None:
         """Start listening to user document for schedule changes.
 
         The orderCycles are at: userSettings.notifications.scheduling.orderCycles
         """
-        user_ref = self.fb_client.collection('users').document(user_id)
+        user_ref = lambda db: db.collection('users').document(user_id)
+        lock = self._schedule_sync_locks.setdefault(route_number, threading.RLock())
 
         def on_user_snapshot(doc_snapshots, changes, read_time):
-            try:
-                print(f"  [Schedule] 📥 Snapshot received for user {user_id} (route {route_number}) at {read_time}")
-                
-                # on_snapshot passes a list of snapshots
-                if not doc_snapshots:
-                    print(f"  [Schedule] ⚠️ No snapshots received for user {user_id}")
-                    return
-                
-                doc_snapshot = doc_snapshots[0] if isinstance(doc_snapshots, list) else doc_snapshots
-                
-                if not doc_snapshot.exists:
-                    print(f"  [Schedule] ⚠️ User {user_id} no longer exists")
-                    return
+            with lock:
+                sync_current()
 
-                data = doc_snapshot.to_dict() or {}
+        def sync_current():
+            try:
+                self.enqueue_send_reminder_settings(user_id, route_number)
+
+                # The event is only a wake-up hint. A delayed snapshot cannot
+                # overwrite a newer source or select a former owner's cycles.
+                authority_uid, data, source = read_current_schedule(self.fb_client, route_number, user_id)
+                if not data:
+                    return
+                if source is not None:
+                    result = sync_current_v3(self.fb_client, route_number, source)
+                    if result.ready:
+                        self._schedule_signatures[route_number] = json.dumps(source, sort_keys=True)
+                        self._schedules_initialized.add(route_number)
+                    print(f"  [Schedule] V3 projection {result.status} for {route_number}")
+                    # Durable recovery owns V3 forecast refresh, not a timer.
+                    return
 
                 # Try the correct nested path first
                 order_cycles = (
@@ -1003,6 +1068,10 @@ class ConfigSyncManager:
                 if not order_cycles:
                     order_cycles = data.get('settings', {}).get('orderCycles', [])
 
+                override = read_route_send_view(self.fb_client, route_number)
+                if override is not None:
+                    authority_uid, order_cycles = override['ownerUid'], override['cycles']
+
                 if order_cycles:
                     print(f"  [Schedule] 🔄 Syncing {len(order_cycles)} order cycle(s) for route {route_number}")
                     # Log the cycles for debugging
@@ -1013,21 +1082,43 @@ class ConfigSyncManager:
                         print(f"    Cycle {i}: Order={od} -> Delivery={dd}")
                 else:
                     print(f"  [Schedule] ⚠️ No orderCycles found for user {user_id}")
-                signature = _schedule_forecast_signature(order_cycles)
+                signature = json.dumps([authority_uid, _schedule_forecast_signature(order_cycles)])
                 previous_signature = self._schedule_signatures.get(route_number)
-                synced = sync_user_schedules_to_pg(route_number, user_id, order_cycles)
-                self._schedule_signatures[route_number] = signature
+                if (route_number in self._schedules_initialized and previous_signature == signature
+                        and route_number not in self._schedule_failed_routes):
+                    return
+                synced = sync_user_schedules_to_pg(route_number, authority_uid, order_cycles)
+                if not synced:
+                    self._schedule_failed_routes.add(route_number)
+                    return
                 initialized = route_number in self._schedules_initialized
+                retrying = route_number in self._schedule_failed_routes
+                self._schedule_signatures[route_number] = signature
                 self._schedules_initialized.add(route_number)
-                if synced and initialized and previous_signature != signature:
+                self._schedule_failed_routes.discard(route_number)
+                # A route override may have changed while this process was
+                # down. Refresh its future forecast on first successful mirror;
+                # ordinary legacy bootstrap keeps its existing suppression.
+                if (initialized or retrying or override is not None) and previous_signature != signature:
                     self._schedule_forecast_refresh(route_number, "schedule_change")
             except Exception as e:
+                self._schedule_failed_routes.add(route_number)
                 print(f"  [Schedule] ❌ Error processing snapshot for {user_id}: {e}")
                 import traceback
                 traceback.print_exc()
 
-        watcher = user_ref.on_snapshot(on_user_snapshot)
-        self.watchers.append(watcher)
+        self._schedule_retry_callbacks[route_number] = lambda: on_user_snapshot([], [], None)
+        created = []
+        try:
+            created.append(self._watch(user_ref, on_user_snapshot))
+            created.append(self._watch(lambda db: db.collection('orderScheduleSendExtensions')
+                                      .document(route_number), on_user_snapshot))
+            self.start_send_member_listener(route_number)
+        except Exception:
+            for watcher in created:
+                watcher.unsubscribe()
+            raise
+        self.watchers.extend(created)
         print(f"  [Listener] Schedules for user {user_id} (route {route_number})")
 
     def start_route_listeners(self, route_number: str, user_id: str) -> None:
@@ -1050,12 +1141,19 @@ class ConfigSyncManager:
             )
 
         print(f"\n[+] Starting listeners for route {route_number}")
-        self.start_stores_listener(route_number)
-        self.start_products_listener(route_number)
-        self.start_schedules_listener(authority_user_id, route_number)
+        created = []
+        try:
+            created.append(self.start_stores_listener(route_number))
+            created.append(self.start_products_listener(route_number))
+            self.start_schedules_listener(authority_user_id, route_number)
+        except Exception:
+            for watcher in created:
+                watcher.unsubscribe()
+                self.watchers.remove(watcher)
+            raise
         self.known_routes.add(route_number)
 
-    def discover_and_start_listeners(self) -> None:
+    def discover_and_start_listeners(self, shutdown=None) -> None:
         """Discover existing routes from PG and start listeners for each."""
         print("\n[*] Discovering existing routes from PostgreSQL...")
 
@@ -1078,6 +1176,8 @@ class ConfigSyncManager:
             print(f"  Found {len(routes)} synced routes")
 
             for row in routes:
+                if shutdown is not None and shutdown.requested:
+                    break
                 route_number = row['route_number']
                 user_id = row['user_id']
                 if route_number and user_id:
@@ -1100,6 +1200,19 @@ class ConfigSyncManager:
 
     def stop_all(self) -> None:
         """Stop all watchers."""
+        self._stopping.set()
+        self._send_worker.request_stop()
+        for timer in self._refresh_timers.values():
+            timer.cancel()
+        # Cancel network calls before joining callbacks that may be waiting on
+        # them. No new registrations or refresh submissions are accepted.
+        close_error = None
+        if self._firestore_runtime is not None:
+            try:
+                self._firestore_runtime.close()
+            except Exception as error:
+                close_error = error
+        worker_stopped = self._send_worker.join()
         for watcher in self.watchers:
             try:
                 watcher.unsubscribe()
@@ -1118,6 +1231,10 @@ class ConfigSyncManager:
             timer.cancel()
         self._refresh_timers.clear()
         self.known_routes.clear()
+        if not worker_stopped:
+            raise RuntimeError('Refresh worker did not stop within shutdown deadline')
+        if close_error is not None:
+            raise RuntimeError('Firestore runtime shutdown failed') from close_error
         print("\n[*] All listeners stopped")
 
 
@@ -1125,7 +1242,7 @@ class ConfigSyncManager:
 # Main Entry Point
 # =============================================================================
 
-def main(sa_path: str, *, once_low_qty_preferences: bool = False):
+def main(sa_path: str, *, once_low_qty_preferences: bool = False, shutdown=None):
     """Main entry point for config sync listener."""
     print(f"\n{'='*60}")
     print("Config Sync Listener (Firestore -> PostgreSQL)")
@@ -1135,49 +1252,69 @@ def main(sa_path: str, *, once_low_qty_preferences: bool = False):
     print(f"  PostgreSQL: {os.environ.get('POSTGRES_HOST', 'localhost')}/{os.environ.get('POSTGRES_DB', 'routespark')}")
     print(f"\n  Press Ctrl+C to stop\n")
 
-    # Initialize clients
-    fb_client = get_firestore_client(sa_path)
+    def stopping():
+        return shutdown is not None and shutdown.requested
 
-    # Test PostgreSQL connection
-    conn = None
+    firestore_runtime = None
+    manager = None
     try:
-        conn = get_pg_connection()
-        with conn:
-            with conn.cursor() as cur:
-                cur.execute("SELECT 1")
-        print("  [OK] PostgreSQL connection verified")
-    except Exception as e:
-        print(f"  [!] PostgreSQL connection failed: {e}")
-        return 1
-    finally:
-        close_pg_connection(conn)
-
-    # Create sync manager and start listeners
-    manager = ConfigSyncManager(fb_client)
-
-    if once_low_qty_preferences:
-        try:
-            manager.sync_low_qty_preferences_once()
+        if stopping():
             return 0
-        except Exception as exc:
-            print(f"  [LowQty] One-shot preference reconciliation failed: {exc}")
-            return 2
+        firestore_runtime = from_service_account(sa_path)
+        fb_client = firestore_runtime.rpc
+        if stopping():
+            return 0
 
-    # Low-quantity preference mirroring is independently gated and failure-isolated.
-    manager.start_low_qty_preference_listener()
+        conn = None
+        try:
+            conn = get_pg_connection()
+            if stopping():
+                return 0
+            with conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT 1")
+            print("  [OK] PostgreSQL connection verified")
+        except Exception as e:
+            print(f"  [!] PostgreSQL connection failed: {e}")
+            return 1
+        finally:
+            close_pg_connection(conn)
+        if stopping():
+            return 0
 
-    try:
-        # Discover existing routes and start listeners
-        manager.discover_and_start_listeners()
+        manager = ConfigSyncManager(fb_client, firestore_runtime=firestore_runtime)
+
+        if once_low_qty_preferences:
+            try:
+                manager.sync_low_qty_preferences_once()
+                return 0
+            except Exception as exc:
+                print(f"  [LowQty] One-shot preference reconciliation failed: {exc}")
+                return 2
+
+        manager._send_worker.start()
+        manager.start_low_qty_preference_listener()
+        if stopping():
+            return 0
+        manager.discover_and_start_listeners(shutdown=shutdown)
+        if stopping():
+            return 0
 
         # Keep process alive and periodically check for new routes
         check_interval = 300  # 5 minutes
         last_check = time.time()
+        last_reminder_retry = time.monotonic()
 
         print(f"\n[*] Listening for config changes... (checking for new routes every {check_interval}s)")
 
-        while True:
-            time.sleep(60)
+        while not stopping():
+            time.sleep(1)
+            if stopping():
+                break
+            manager.retry_config_documents()
+            if time.monotonic() - last_reminder_retry >= 60:
+                manager.retry_send_reminder_settings()
+                last_reminder_retry = time.monotonic()
 
             # Periodically check for new routes
             current_time = time.time()
@@ -1198,6 +1335,8 @@ def main(sa_path: str, *, once_low_qty_preferences: bool = False):
                             routes = cur.fetchall()
 
                     for row in routes:
+                        if stopping():
+                            break
                         route_number = row['route_number']
                         user_id = row['user_id']
                         if route_number and user_id and route_number not in manager.known_routes:
@@ -1212,7 +1351,10 @@ def main(sa_path: str, *, once_low_qty_preferences: bool = False):
     except KeyboardInterrupt:
         print("\n\n[*] Shutdown requested...")
     finally:
-        manager.stop_all()
+        if manager is not None:
+            manager.stop_all()
+        elif firestore_runtime is not None:
+            firestore_runtime.close()
 
     return 0
 

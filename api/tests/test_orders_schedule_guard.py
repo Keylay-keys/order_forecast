@@ -74,6 +74,16 @@ class _Database:
 
 
 class OrderScheduleGuardTests(unittest.TestCase):
+    def test_v3_source_cannot_create_or_backfill_a_v2_stamp(self):
+        context = {**_schedule_context([]), 'sourceVersion': 3, 'sourceRevision': 4}
+        with patch.object(orders, 'get_order_schedule_context_from_firestore', return_value=context):
+            with self.assertRaises(StructuredApiError) as caught:
+                orders._resolve_create_schedule(object(), _payload())
+            self.assertEqual(caught.exception.code, 'ORDER_SCHEDULE_UPGRADE_REQUIRED')
+            stamp, _, _ = orders._resolve_finalize_stamp(object(), route_number='989262',
+                         order_data={'expectedDeliveryDate': '2026-09-14', 'scheduleKey': 'tuesday'})
+            self.assertIsNone(stamp)
+
     def test_unique_delivery_result_builds_one_exact_stamp_and_load_date(self):
         payload = _payload("thursday")
         cycle = _matching_cycle(payload)

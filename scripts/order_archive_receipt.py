@@ -7,6 +7,10 @@ import json
 from typing import Any
 
 from google.cloud import firestore  # type: ignore
+try:
+    from .order_archive_schedule import is_send_archive
+except ImportError:
+    from order_archive_schedule import is_send_archive
 
 
 ORDER_ARCHIVE_RECEIPT_SCHEMA_VERSION = 2
@@ -15,6 +19,8 @@ LEGACY_ORDER_ARCHIVE_RECEIPT_SCHEMA_VERSION = 1
 
 def evaluate_order_archive_receipt(projection: dict, receipt: dict | None) -> str | None:
     """Return None only when a receipt is eligible under the cleanup gate."""
+    if is_send_archive(projection.get('orderId')) or projection.get('schemaVersion') not in (1, 2):
+        return 'unsupported_schedule_evidence'
     if not receipt:
         return "receipt_missing"
     if receipt.get("status") != "verified":
@@ -73,6 +79,8 @@ def build_order_archive_projection(
     order_data: dict,
 ) -> dict:
     """Build the same immutable source projection used by the cleanup gate."""
+    if is_send_archive(_text(order_id)) or is_send_archive(order_data.get('id')):
+        raise ValueError('unsupported_schedule_evidence')
     stores = order_data.get("stores") if isinstance(order_data.get("stores"), list) else []
     lines = []
     for raw_store in stores:
@@ -102,6 +110,10 @@ def build_order_archive_projection(
     )
 
     scheduled_order = order_data.get("scheduledOrder")
+    if scheduled_order is not None and (not isinstance(scheduled_order, dict) or scheduled_order.get('version') != 2):
+        # Never certify a new-format order as an unstamped legacy projection.
+        # Full V3 archive/anchor round-trip is a separate activation gate.
+        raise ValueError('unsupported_schedule_evidence')
     if not (
         isinstance(scheduled_order, dict)
         and scheduled_order.get("version") == 2

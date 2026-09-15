@@ -45,6 +45,31 @@ class _Database:
 
 
 class ScheduleDeliveryDateTests(unittest.IsolatedAsyncioTestCase):
+    async def test_v3_preview_preserves_send_day_and_requires_compatible_client(self):
+        from types import SimpleNamespace
+        from order_forecast.api.errors import StructuredApiError
+        cycle = dict(scheduleVersion=3, orderDay=2, sendOffsetDays=2, loadOffsetDays=6,
+                     deliveryOffsetDays=6, loadDay=1, deliveryDay=1, needsScheduleReview=False)
+        context = dict(cycles=[cycle], timezone='America/Denver', status='ready', sourceVersion=3,
+                       sourceRevision=4, ownerUid='owner-a')
+        with patch.object(schedule, 'require_route_access', new=AsyncMock()), \
+                patch.object(schedule, 'get_order_schedule_context_from_firestore', return_value=context), \
+                patch.dict('os.environ', {'ORDER_SCHEDULE_V3_CREATION_ENABLED': 'true',
+                    'ORDER_SCHEDULE_V3_PILOT_ROUTES': '988200',
+                    'ORDER_ADJUSTMENT_SCHEDULE_V3_CONSUMERS_ENABLED': 'true',
+                    'ORDER_ADJUSTMENT_SCHEDULE_V3_CONSUMER_ROUTES': '988200'}):
+            args = dict(route='988200', deliveryDate='2026-09-14', scheduleKey='tuesday',
+                        decoded_token={'uid': 'owner-a'}, db=object())
+            result = await schedule.get_schedule_key_for_date(
+                request=SimpleNamespace(headers={'x-routespark-capabilities': 'order-schedule-v3'}), **args)
+            self.assertTrue(result.matched)
+            self.assertEqual(result.scheduledOrder.version, 3)
+            self.assertEqual(result.scheduledOrder.sendDate, '2026-09-10')
+            self.assertEqual(result.scheduledOrder.sourceRevision, 4)
+            self.assertEqual(result.loadDate, '2026-09-14')
+            with self.assertRaises(StructuredApiError):
+                await schedule.get_schedule_key_for_date(request=SimpleNamespace(headers={}), **args)
+
     def test_schedule_owner_authority_fails_closed_on_legacy_field_conflict(self):
         db = _Database({
             ("routes", "988200"): {"ownerUid": "owner-a", "userId": "owner-b"},

@@ -15,7 +15,7 @@ class ForecastCorrectionSchemaMigrationTests(unittest.TestCase):
     def test_existing_table_adds_prediction_source_idempotently(self):
         cursor = _RecordingCursor()
 
-        pg_schema._create_order_tables(cursor)
+        pg_schema._create_order_tables(cursor, manage_protected_tables=True)
 
         self.assertTrue(any(
             statement.startswith("alter table forecast_corrections")

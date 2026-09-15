@@ -12,6 +12,7 @@ import argparse
 import json
 import logging
 import os
+import re
 import socket
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Optional
@@ -22,15 +23,19 @@ from google.cloud import firestore
 from google.cloud.firestore_v1.base_query import FieldFilter
 
 try:
+    from .order_schedule_v3_release import v3_consumers_allowed
+    from .order_send_reminder_refresh import run_pending as refresh_send_reminders
     from .order_adjustment_schedule import (
         WindowResolutionError,
-        canonical_source_v2_window,
+        canonical_source_window,
         meaningful_lines,
     )
 except ImportError:
+    from order_schedule_v3_release import v3_consumers_allowed
+    from order_send_reminder_refresh import run_pending as refresh_send_reminders
     from order_adjustment_schedule import (
         WindowResolutionError,
-        canonical_source_v2_window,
+        canonical_source_window,
         meaningful_lines,
     )
 
@@ -45,6 +50,53 @@ ORDER_ADJUSTMENT_REMINDER_CLAIM_TTL_MS = int(os.environ.get("ORDER_ADJUSTMENT_RE
 ORDER_ADJUSTMENT_REMINDER_CUTOFF_GRACE_MS = int(os.environ.get("ORDER_ADJUSTMENT_REMINDER_CUTOFF_GRACE_MS", str(2 * 60 * 1000)))
 
 logger = logging.getLogger("order_adjustment_reminder_worker")
+
+
+def _send_helpers():
+    try:
+        from order_forecast.api.order_send_evidence import is_send_order_id, read_send_evidence, order_with_send_evidence
+    except ModuleNotFoundError as error:
+        if error.name != 'order_forecast':
+            raise
+        from api.order_send_evidence import is_send_order_id, read_send_evidence, order_with_send_evidence
+    return is_send_order_id, read_send_evidence, order_with_send_evidence
+
+
+def _send_inputs(db, data, source, transaction=None):
+    """Only reserved new orders incur these reads. Never trust copied evidence."""
+    if not re.fullmatch(r'order-[0-9]{1,10}-send-[a-f0-9]{64}', str(data.get('sourceOrderId') or '')):
+        return data, None
+    _, read_evidence, _ = _send_helpers()
+    try:
+        evidence = read_evidence(db, source or {'id': data['sourceOrderId']}, transaction)
+    except ValueError:
+        evidence = None
+    uid = data.get('userId')
+    if not isinstance(uid, str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,128}', uid):
+        return {**data, 'reminderEnabled': False}, evidence
+    try:
+        from order_forecast.api.order_send_access import read_send_route_access
+    except ModuleNotFoundError as error:
+        if error.name != 'order_forecast':
+            raise
+        from api.order_send_access import read_send_route_access
+    try:
+        access = read_send_route_access(db, transaction, uid, data.get('routeNumber'))
+    except Exception as error:
+        if getattr(error, 'status_code', None) != 403:
+            raise
+        return {**data, 'reminderEnabled': False}, evidence
+    try:
+        raw = access.actor['userSettings']['notifications']['orderAdjustmentSettings']
+        if not isinstance(raw, dict):
+            raise ValueError('Invalid settings')
+        lead = raw.get('reminderLeadMinutes')
+        current = {'reminderEnabled': raw.get('reminderEnabled') is True,
+                   'cutoffTimeLocal': raw.get('cutoffTimeLocal'),
+                   'reminderLeadMinutes': lead if type(lead) is int and lead > 0 else None}
+    except (TypeError, KeyError, ValueError):
+        current = {'reminderEnabled': False, 'cutoffTimeLocal': None, 'reminderLeadMinutes': None}
+    return {**data, **current}, evidence
 
 
 def configure_logging() -> None:
@@ -101,16 +153,9 @@ def _expected_v1_schedule(
 
     source_order_id = str(adjustment.get("sourceOrderId") or "").strip()
     if source_order_id:
-        if not source_order:
-            return None, "missing_source_order"
-        order_day = (
-            _local_date(source_order.get("submittedAt"), route_timezone)
-            or _local_date(source_order.get("createdAt"), route_timezone)
-            or _local_date(source_order.get("orderDate"), route_timezone)
-        )
-        if order_day is None:
-            return None, "window_unresolved"
-        adjustment_day = order_day + timedelta(days=1)
+        # Source-backed adjustments require server-owned timing authority.
+        # This legacy helper is intentionally standalone-only.
+        return None, "window_unresolved"
     else:
         adjustment_day = _local_date(adjustment.get("adjustmentDate"), route_timezone)
         if adjustment_day is None:
@@ -153,25 +198,42 @@ def _expected_v1_schedule(
 def expected_schedule_from_fresh_source(
     adjustment: Dict[str, Any],
     source_order: Optional[Dict[str, Any]],
+    *, now_ms: Optional[int] = None, send_evidence=None,
 ) -> tuple[Optional[Dict[str, Any]], str, Optional[str]]:
     source_order_id = str(adjustment.get("sourceOrderId") or "").strip()
     if source_order_id:
         if source_order is None:
             return None, "missing_source_order", "missing_source_order"
-        # Presence of the authority bundle permanently opts the source into the
-        # v2 path. A malformed/null bundle must fail closed; it must never fall
-        # through to submitted-time compatibility and rewrite a v2 adjustment.
-        if "scheduledOrder" in source_order:
+        additive = bool(re.fullmatch(r'order-[0-9]{1,10}-send-[a-f0-9]{64}', source_order_id))
+        if additive:
+            _, _, with_send = _send_helpers()
             try:
-                lead_minutes = int(adjustment.get("reminderLeadMinutes") or 0)
-                window = canonical_source_v2_window(
+                source_order = with_send(source_order, send_evidence)
+            except ValueError:
+                return None, 'send', 'invalid_send_evidence'
+        # Presence of either server authority field permanently opts the source
+        # into the trusted path. A malformed/null adjustment anchor must fail
+        # closed; it must never fall through to a weaker compatibility calculation.
+        if "adjustmentAnchor" in source_order or "scheduledOrder" in source_order:
+            stamp = source_order.get('scheduledOrder')
+            is_v3 = isinstance(stamp, dict) and type(stamp.get('version')) is int and stamp['version'] == 3
+            classification = 'send' if additive else 'v3' if is_v3 else 'v2'
+            if is_v3 and (source_order.get('routeNumber') != adjustment.get('routeNumber')
+                          or source_order.get('id') != source_order_id):
+                return None, classification, 'source_identity_mismatch'
+            try:
+                lead_minutes = (adjustment.get('reminderLeadMinutes') if is_v3
+                                else int(adjustment.get("reminderLeadMinutes") or 0))
+                window = canonical_source_window(
                     source_order,
                     cutoff_time_local=str(adjustment.get("cutoffTimeLocal") or "").strip(),
                     reminder_lead_minutes=lead_minutes,
+                    now_ms=now_ms,
+                    allow_v3=additive or v3_consumers_allowed(adjustment.get('routeNumber')),
                 )
             except (TypeError, ValueError, WindowResolutionError) as exc:
                 reason = exc.code if isinstance(exc, WindowResolutionError) else "window_unresolved"
-                return None, "v2", reason
+                return None, classification, reason
             return {
                 "adjustmentDate": window.adjustment_date,
                 "timezone": window.timezone,
@@ -180,9 +242,8 @@ def expected_schedule_from_fresh_source(
                 "cutoffAtMs": window.cutoff_at_ms,
                 "reminderAtMs": window.reminder_at_ms,
                 "reminderScheduledForMs": window.reminder_at_ms,
-            }, "v2", None
-        schedule, error = _expected_v1_schedule(adjustment, source_order)
-        return schedule, "v1_source", error
+            }, classification, None
+        return None, "v1_source", "window_unresolved"
 
     schedule, error = _expected_v1_schedule(adjustment, None)
     return schedule, "v1_standalone", error
@@ -361,6 +422,8 @@ def claim_adjustment_reminder(db: firestore.Client, doc: Any, *, now_ms: int) ->
             source_snap = source_ref.get(transaction=transaction)
             source_order = source_snap.to_dict() or {} if source_snap.exists else None
 
+        data, send_evidence = _send_inputs(db, data, source_order, transaction)
+
         status = str(data.get("status") or "draft")
         reminder_status = str(data.get("reminderStatus") or "none")
         claimed_at_ms = _to_millis(data.get("reminderClaimedAtMs")) or 0
@@ -379,7 +442,7 @@ def claim_adjustment_reminder(db: firestore.Client, doc: Any, *, now_ms: int) ->
             )
             return None
 
-        expected_schedule, classification, schedule_error = expected_schedule_from_fresh_source(data, source_order)
+        expected_schedule, classification, schedule_error = expected_schedule_from_fresh_source(data, source_order, now_ms=now_ms, send_evidence=send_evidence)
         if expected_schedule is None:
             transaction.update(
                 adjustment_ref,
@@ -410,7 +473,7 @@ def claim_adjustment_reminder(db: firestore.Client, doc: Any, *, now_ms: int) ->
         is_pending_due = reminder_status == "pending"
         is_stale_sending = reminder_status == "sending" and claimed_at_ms <= now_ms - ORDER_ADJUSTMENT_REMINDER_CLAIM_TTL_MS
         allowed_until = cutoff_at_ms + (
-            ORDER_ADJUSTMENT_REMINDER_CUTOFF_GRACE_MS if is_stale_sending else 0
+            ORDER_ADJUSTMENT_REMINDER_CUTOFF_GRACE_MS if is_stale_sending and classification not in ('v3', 'send') else 0
         )
         if cutoff_at_ms and now_ms >= allowed_until:
             transaction.update(
@@ -513,6 +576,21 @@ def finish_adjustment_reminder(
 def send_claimed_reminder(db: firestore.Client, claimed: Dict[str, Any], *, now_ms: int) -> bool:
     adjustment_ref = claimed["ref"]
     adjustment = claimed["adjustment"]
+    if adjustment.get('sourceScheduleClassification') in ('v3', 'send'):
+        # A claim is not permission to send after cutoff or after gate revocation.
+        route = adjustment.get('routeNumber')
+        source_id = adjustment.get('sourceOrderId')
+        if (adjustment.get('sourceScheduleClassification') == 'v3' and not v3_consumers_allowed(route)
+                or _route_from_adjustment_ref(adjustment_ref) != route):
+            return False
+        source_snap = db.collection('routes').document(route).collection('orders').document(source_id).get()
+        fresh = source_snap.to_dict() if source_snap.exists else None
+        adjustment, evidence = _send_inputs(db, adjustment, fresh)
+        schedule, classification, error = expected_schedule_from_fresh_source(adjustment, fresh, now_ms=now_ms, send_evidence=evidence)
+        if (error or classification not in ('v3', 'send') or schedule is None or not adjustment.get('reminderEnabled')
+                or now_ms < schedule['reminderAtMs'] or now_ms >= schedule['cutoffAtMs']):
+            return False
+        adjustment = {**adjustment, **schedule}
     uid = str(adjustment.get("userId") or "")
     user_data = _user_doc_data(db, uid)
     title = "Order adjustment reminder"
@@ -581,7 +659,8 @@ def classify_without_writes(db: firestore.Client, doc: Any, *, now_ms: int) -> D
         )
         source_order = source_snap.to_dict() or {} if source_snap.exists else None
 
-    schedule, classification, schedule_error = expected_schedule_from_fresh_source(data, source_order)
+    data, evidence = _send_inputs(db, data, source_order)
+    schedule, classification, schedule_error = expected_schedule_from_fresh_source(data, source_order, now_ms=now_ms, send_evidence=evidence)
     status = str(data.get("status") or "draft")
     reminder_status = str(data.get("reminderStatus") or "none")
     eligible_for_reminder = (
@@ -596,7 +675,7 @@ def classify_without_writes(db: firestore.Client, doc: Any, *, now_ms: int) -> D
     )
     stored_reminder_at_ms = _to_millis(data.get("reminderAtMs"))
     stored_future_schedule_drift = bool(
-        classification == "v2"
+        classification in {"v2", "v3", "send"}
         and eligible_for_reminder
         and stored_reminder_at_ms is not None
         and stored_reminder_at_ms > now_ms
@@ -619,7 +698,7 @@ def classify_without_writes(db: firestore.Client, doc: Any, *, now_ms: int) -> D
         )
         if reminder_at_ms > now_ms:
             action = "patch_future" if any(data.get(key) != value for key, value in schedule.items()) else "wait_future"
-        elif now_ms >= cutoff_at_ms + (ORDER_ADJUSTMENT_REMINDER_CUTOFF_GRACE_MS if stale_sending else 0):
+        elif now_ms >= cutoff_at_ms + (ORDER_ADJUSTMENT_REMINDER_CUTOFF_GRACE_MS if stale_sending and classification != 'v3' else 0):
             action = "skip_past_cutoff"
         elif reminder_status == "pending" or stale_sending:
             action = "claim_and_send"
@@ -680,11 +759,14 @@ def audit_once(db: firestore.Client, *, route_number: str, now_ms: Optional[int]
 
 
 def run_once(db: firestore.Client, *, now_ms: Optional[int] = None, limit: int = ORDER_ADJUSTMENT_REMINDER_BATCH_LIMIT) -> Dict[str, Any]:
+    if ORDER_ADJUSTMENT_REMINDER_DRY_RUN:
+        raise RuntimeError('Dry-run must use audit_once and may not mutate reminders')
     if not ORDER_ADJUSTMENT_REMINDERS_ENABLED:
         logger.info("ORDER_ADJUSTMENT_REMINDERS_ENABLED=false; skipping")
         return {"claimed": 0, "sent": 0, "failed": 0, "skipped": 0}
 
     now = now_ms or _now_ms()
+    refresh_results = refresh_send_reminders(db, now_ms=now)
     cutoff = now - ORDER_ADJUSTMENT_REMINDER_CLAIM_TTL_MS
     docs = list(_pending_query(db, now, limit))
     remaining = max(0, limit - len(docs))
@@ -693,6 +775,7 @@ def run_once(db: firestore.Client, *, now_ms: Optional[int] = None, limit: int =
 
     stats: Dict[str, Any] = {
         "event": "order_adjustment_reminder_run",
+        "settingsRefresh": refresh_results,
         "selected": len(docs),
         "claimed": 0,
         "sent": 0,
@@ -709,12 +792,14 @@ def run_once(db: firestore.Client, *, now_ms: Optional[int] = None, limit: int =
         if doc_key in seen:
             continue
         seen.add(doc_key)
-        claimed = claim_adjustment_reminder(db, doc, now_ms=now)
+        # Production samples the clock per stage. Explicit now_ms remains the
+        # deterministic test clock, not a request-controlled runtime setting.
+        claimed = claim_adjustment_reminder(db, doc, now_ms=now if now_ms is not None else _now_ms())
         if not claimed:
             stats["skipped"] += 1
             continue
         stats["claimed"] += 1
-        if send_claimed_reminder(db, claimed, now_ms=now):
+        if send_claimed_reminder(db, claimed, now_ms=now if now_ms is not None else _now_ms()):
             stats["sent"] += 1
         else:
             stats["failed"] += 1

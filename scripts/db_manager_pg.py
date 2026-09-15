@@ -46,8 +46,12 @@ from google.cloud import firestore
 
 try:
     from .order_archive_receipt import write_verified_order_archive_receipt
+    from .order_archive_schedule import (archive_schedule_fields, restore_archive_schedule, is_send_archive,
+                                         load_archive_send_evidence, store_archive_send_evidence, read_archive_send_evidence)
 except ImportError:
     from order_archive_receipt import write_verified_order_archive_receipt
+    from order_archive_schedule import (archive_schedule_fields, restore_archive_schedule, is_send_archive,
+                                        load_archive_send_evidence, store_archive_send_evidence, read_archive_send_evidence)
 
 # Global flag for graceful shutdown
 _shutdown_requested = False
@@ -419,6 +423,12 @@ def handle_sync_order(conn: psycopg2.extensions.connection, db: firestore.Client
             return {'error': f'Order {order_id} not found'}
         
         data = order_doc.to_dict()
+        if is_send_archive(order_id) and (data.get('id') != order_id or data.get('routeNumber') != str(route_number)):
+            raise ValueError('Archive source identity mismatch')
+        send_evidence = load_archive_send_evidence(db, data)
+        archive_evidence = archive_schedule_fields(data, send_evidence)
+        if archive_evidence and (data.get('routeNumber') != str(route_number) or data.get('id') != order_id):
+            raise ValueError('Archive source identity mismatch')
         now = datetime.now(timezone.utc)
         
         delivery_date = data.get('expectedDeliveryDate', '')
@@ -543,6 +553,16 @@ def handle_sync_order(conn: psycopg2.extensions.connection, db: firestore.Client
         
         cur = conn.cursor()
 
+        if send_evidence is not None:
+            cur.execute('SELECT user_id, order_date FROM orders_historical WHERE order_id=%s FOR UPDATE', [order_id])
+            prior = cur.fetchone()
+            if prior:
+                prior_values = list(prior.values()) if isinstance(prior, dict) else list(prior)
+                if prior_values != [data['userId'], datetime.fromisoformat(order_date).date()]:
+                    raise ValueError('Archived Send identity mismatch')
+                # A partial historical row is not permission to attach evidence.
+                store_archive_send_evidence(cur, data, send_evidence, replay=True)
+
         # Revisioned orders are idempotent. Legacy orders intentionally keep the
         # old replay behavior because they have no monotonic version contract.
         if incoming_revision is not None:
@@ -558,6 +578,25 @@ def handle_sync_order(conn: psycopg2.extensions.connection, db: firestore.Client
                     else int(current_row[0] or 0)
                 )
                 if current_revision >= incoming_revision:
+                    if archive_evidence is not None:
+                        # Never relabel an existing revision from a delayed event.
+                        cur.execute('SELECT scheduled_order, expected_load_date, adjustment_anchor, finalized_at '
+                                    'FROM orders_historical WHERE order_id = %s AND route_number = %s',
+                                    [order_id, str(route_number)])
+                        row = cur.fetchone()
+                        values = list(row.values()) if isinstance(row, dict) else row
+                        expected = [archive_evidence['scheduledOrder'],
+                                    datetime.fromisoformat(archive_evidence['expectedLoadDate']).date(),
+                                    archive_evidence['adjustmentAnchor'], archive_evidence['submittedAt']]
+                        if not values or list(values) != expected:
+                            raise ValueError('Archived schedule evidence mismatch')
+                        store_archive_send_evidence(cur, data, send_evidence, replay=True)
+                        conn.commit()
+                        committed = True
+                        cur.close()
+                        return {'success': True, 'orderId': order_id, 'projectedRevision': current_revision,
+                                'alreadyProjected': True, 'archiveReceiptWritten': False,
+                                'archiveCleanupBlocked': 'unsupported_schedule_evidence'}
                     scheduled_order = data.get('scheduledOrder')
                     if (
                         isinstance(scheduled_order, dict)
@@ -606,9 +645,9 @@ def handle_sync_order(conn: psycopg2.extensions.connection, db: firestore.Client
                 delivery_date, order_date, status, total_units, store_count, is_holiday_week,
                 order_revision, last_mutation_kind, last_mutation_id, last_mutation_at,
                 reallocation_count, last_reallocated_at, last_reallocation_id, synced_at
-                , scheduled_order
+                , scheduled_order, expected_load_date, adjustment_anchor, finalized_at
             ) VALUES (%s, %s, %s, %s, %s, %s, 'finalized', %s, %s, %s,
-                      %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                      %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (order_id) DO UPDATE SET
                 route_number = EXCLUDED.route_number,
                 user_id = EXCLUDED.user_id,
@@ -627,6 +666,9 @@ def handle_sync_order(conn: psycopg2.extensions.connection, db: firestore.Client
                 last_reallocated_at = EXCLUDED.last_reallocated_at,
                 last_reallocation_id = EXCLUDED.last_reallocation_id,
                 scheduled_order = EXCLUDED.scheduled_order,
+                expected_load_date = EXCLUDED.expected_load_date,
+                adjustment_anchor = EXCLUDED.adjustment_anchor,
+                finalized_at = COALESCE(EXCLUDED.finalized_at, orders_historical.finalized_at),
                 synced_at = EXCLUDED.synced_at
         """, [
             order_id,
@@ -649,7 +691,12 @@ def handle_sync_order(conn: psycopg2.extensions.connection, db: firestore.Client
             Json(data.get('scheduledOrder'))
                 if isinstance(data.get('scheduledOrder'), dict)
                 else None,
+            archive_evidence['expectedLoadDate'] if archive_evidence else None,
+            Json(archive_evidence['adjustmentAnchor']) if archive_evidence else None,
+            archive_evidence['submittedAt'] if archive_evidence else None,
         ])
+
+        store_archive_send_evidence(cur, data, send_evidence)
 
         # Rebuild the derived snapshot from Firebase order truth. Upsert-only
         # leaves removed items/corrections behind forever, so clear existing
@@ -889,15 +936,13 @@ def handle_sync_order(conn: psycopg2.extensions.connection, db: firestore.Client
         # The receipt is intentionally written only after PostgreSQL commits.
         # Cleanup fails closed when this write is missing or does not exactly
         # match current Firestore order truth.
-        write_verified_order_archive_receipt(
-            db,
-            str(order_id),
-            str(route_number),
-            data,
-            archive_total_units=total_units,
-            archive_store_count=len(stores),
-            archive_line_item_count=len(line_item_rows),
-        )
+        if archive_evidence is None:
+            write_verified_order_archive_receipt(
+                db, str(order_id), str(route_number), data,
+                archive_total_units=total_units,
+                archive_store_count=len(stores),
+                archive_line_item_count=len(line_item_rows),
+            )
         
         return {
             'success': True,
@@ -905,7 +950,8 @@ def handle_sync_order(conn: psycopg2.extensions.connection, db: firestore.Client
             'totalUnits': total_units,
             'storeCount': len(stores),
             'lineItemCount': len(line_item_rows),
-            'archiveReceiptWritten': True,
+            'archiveReceiptWritten': archive_evidence is None,
+            **({'archiveCleanupBlocked': 'unsupported_schedule_evidence'} if archive_evidence else {}),
             'correctionsExtracted': len(correction_rows),
             'deliveryAllocationCount': allocation_count,
             'projectedRevision': incoming_revision or 0,
@@ -938,6 +984,8 @@ def project_scheduled_order_archive_metadata(
     This is the finalized-order backfill path. It intentionally does not run
     forecast extraction, line replacement, allocations, or finalization hooks.
     """
+    if is_send_archive(order_id) or is_send_archive(order_data.get('id')):
+        return {'error': 'unsupported_schedule_evidence'}
     scheduled_order = order_data.get('scheduledOrder')
     if not (
         isinstance(scheduled_order, dict)
@@ -1129,7 +1177,7 @@ def handle_get_order(conn: psycopg2.extensions.connection, payload: Dict) -> Dic
                        finalized_at, synced_at, total_units, store_count,
                        order_revision, last_mutation_kind, last_mutation_id,
                        last_mutation_at, reallocation_count, last_reallocated_at,
-                       last_reallocation_id
+                       last_reallocation_id, scheduled_order, expected_load_date, adjustment_anchor
                 FROM orders_historical
                 WHERE route_number = %s AND order_id = %s
                 LIMIT 1
@@ -1140,7 +1188,7 @@ def handle_get_order(conn: psycopg2.extensions.connection, payload: Dict) -> Dic
                        finalized_at, synced_at, total_units, store_count,
                        order_revision, last_mutation_kind, last_mutation_id,
                        last_mutation_at, reallocation_count, last_reallocated_at,
-                       last_reallocation_id
+                       last_reallocation_id, scheduled_order, expected_load_date, adjustment_anchor
                 FROM orders_historical
                 WHERE route_number = %s AND delivery_date = %s
                 ORDER BY order_date DESC, order_id DESC
@@ -1152,6 +1200,8 @@ def handle_get_order(conn: psycopg2.extensions.connection, payload: Dict) -> Dic
             return {'error': 'No archived order found'}
         
         order_id = order_row['order_id']
+        if is_send_archive(order_id):
+            order_row['send_evidence'] = read_archive_send_evidence(cur, order_id, route_number)
         
         # Get line items grouped by store
         cur.execute("""
@@ -1193,7 +1243,7 @@ def handle_get_order(conn: psycopg2.extensions.connection, payload: Dict) -> Dic
         cur.close()
         
         return {
-            'order': {
+            'order': restore_archive_schedule({
                 'id': order_id,
                 'routeNumber': route_number,
                 'userId': order_row['user_id'] or '',
@@ -1218,7 +1268,7 @@ def handle_get_order(conn: psycopg2.extensions.connection, payload: Dict) -> Dic
                     'lastAdjustmentId': order_row['last_reallocation_id'] or '',
                 } if (order_row['reallocation_count'] or 0) > 0 else None,
                 'stores': list(stores.values()),
-            }
+            }, order_row)
         }
         
     except Exception as e:

@@ -236,9 +236,15 @@ def _build_archived_order(route_number: str, order_row: dict) -> dict:
         } if (order_row.get('reallocation_count') or 0) > 0 else None,
         'stores': list(stores.values()),
     }
-    if isinstance(order_row.get('scheduled_order'), dict):
-        archived['scheduledOrder'] = order_row['scheduled_order']
-    return archived
+    try:
+        from .order_archive_schedule import restore_archive_schedule, is_send_archive
+    except ImportError:
+        from order_archive_schedule import restore_archive_schedule, is_send_archive
+    if is_send_archive(order_id):
+        evidence_row = fetch_one('SELECT evidence FROM order_archive_send_evidence WHERE order_id=%s AND route_number=%s',
+                                 [order_id, str(route_number)])
+        order_row = {**order_row, 'send_evidence': evidence_row.get('evidence') if evidence_row else None}
+    return restore_archive_schedule(archived, order_row)
 
 
 def get_order_by_id(route_number: str, order_id: str) -> Optional[dict]:
@@ -248,7 +254,7 @@ def get_order_by_id(route_number: str, order_id: str) -> Optional[dict]:
                finalized_at, synced_at, total_units, store_count,
                order_revision, last_mutation_kind, last_mutation_id,
                last_mutation_at, reallocation_count, last_reallocated_at,
-               last_reallocation_id, scheduled_order
+               last_reallocation_id, scheduled_order, expected_load_date, adjustment_anchor
         FROM orders_historical
         WHERE route_number = %s AND order_id = %s
         LIMIT 1
@@ -263,7 +269,7 @@ def get_order_by_date(route_number: str, delivery_date: str) -> Optional[dict]:
                finalized_at, synced_at, total_units, store_count,
                order_revision, last_mutation_kind, last_mutation_id,
                last_mutation_at, reallocation_count, last_reallocated_at,
-               last_reallocation_id, scheduled_order
+               last_reallocation_id, scheduled_order, expected_load_date, adjustment_anchor
         FROM orders_historical
         WHERE route_number = %s AND delivery_date = %s
         ORDER BY order_date DESC, order_id DESC

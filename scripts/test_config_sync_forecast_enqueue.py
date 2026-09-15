@@ -54,6 +54,26 @@ class _RouteAuthorityReference(_WatchReference):
 
 
 class ConfigSyncForecastEnqueueTests(unittest.TestCase):
+    def test_member_watch_quotes_numeric_route_segment_in_wire_query(self):
+        from google.auth.credentials import AnonymousCredentials
+        from google.cloud import firestore
+        from google.cloud.firestore_v1.query import Query
+        db = firestore.Client(project='demo-routespark-send-device-test', credentials=AnonymousCredentials())
+        manager = listener.ConfigSyncManager(db)
+        captured = []
+        def watch(query, callback):
+            captured.append(query._to_protobuf().where.field_filter.field.field_path)
+            return MagicMock()
+        with patch.object(listener, 'send_reminder_route_enabled', return_value=True), \
+                patch.object(Query, 'on_snapshot', watch):
+            manager.start_send_member_listener('988200')
+        self.assertEqual(captured, ['routeAssignments.`988200`.role'])
+
+    def setUp(self):
+        patcher = patch.object(listener, 'read_route_send_view', return_value=None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     @staticmethod
     def _schedule_data(cycles):
         return {
@@ -179,7 +199,9 @@ class ConfigSyncForecastEnqueueTests(unittest.TestCase):
         tuesday = [{"orderDay": 2, "loadDay": 4, "deliveryDay": 5}]
         with patch.object(
             listener, "sync_user_schedules_to_pg", return_value=True
-        ) as sync:
+        ) as sync, patch.object(listener, 'read_current_schedule', side_effect=[
+            ('owner-1', self._schedule_data(cycles), None) for cycles in (monday, tuesday, [])
+        ]):
             manager.start_schedules_listener("owner-1", "988200")
             callback = reference.callbacks[-1]
             callback([_Document("owner-1", self._schedule_data(monday))], None, None)
@@ -194,6 +216,42 @@ class ConfigSyncForecastEnqueueTests(unittest.TestCase):
 
         self.assertEqual(manager._schedule_forecast_refresh.call_count, 2)
         self.assertEqual(sync.call_args_list[-1].args, ("988200", "owner-1", []))
+
+    def test_failed_schedule_does_not_advance_checkpoint_and_identical_retry_refreshes(self):
+        reference = _WatchReference()
+        manager = listener.ConfigSyncManager(reference)
+        manager._schedule_forecast_refresh = MagicMock()
+        cycles = [{"orderDay": 1, "loadDay": 3, "deliveryDay": 4}]
+        data = self._schedule_data(cycles)
+        with patch.object(listener, 'read_current_schedule', return_value=('owner-1', data, None)), patch.object(
+            listener, 'sync_user_schedules_to_pg', side_effect=[False, True]
+        ):
+            manager.start_schedules_listener('owner-1', '988200')
+            callback = reference.callbacks[-1]
+            callback([_Document('owner-1', data)], None, None)
+            self.assertNotIn('988200', manager._schedule_signatures)
+            self.assertNotIn('988200', manager._schedules_initialized)
+            callback([_Document('owner-1', data)], None, None)
+        manager._schedule_forecast_refresh.assert_called_once_with('988200', 'schedule_change')
+
+    def test_v3_uses_current_source_and_never_legacy_writer_or_timer(self):
+        from schedule_sync import ScheduleSyncResult
+        reference = _WatchReference()
+        manager = listener.ConfigSyncManager(reference)
+        manager._schedule_forecast_refresh = MagicMock()
+        current = {'control': {'revision': 4}, 'cycles': []}
+        with patch.object(listener, 'read_current_schedule', return_value=('new-owner', {'orderScheduleControl': {}}, current)), patch.object(
+            listener, 'sync_current_v3', side_effect=[ScheduleSyncResult('pending'), ScheduleSyncResult('already_projected', 0, 4)]
+        ) as v3, patch.object(listener, 'sync_user_schedules_to_pg') as legacy:
+            manager.start_schedules_listener('old-owner', '988200')
+            callback = reference.callbacks[-1]
+            callback([_Document('old-owner', self._schedule_data([{'orderDay': 1}]))], None, None)
+            self.assertNotIn('988200', manager._schedules_initialized)
+            callback([_Document('old-owner', {})], None, None)
+            self.assertIn('988200', manager._schedules_initialized)
+            self.assertEqual(v3.call_args.args, (reference, '988200', current))
+            legacy.assert_not_called()
+        manager._schedule_forecast_refresh.assert_not_called()
 
     def test_product_sync_uses_generator_case_pack_default_and_closes_connection(self):
         conn = MagicMock()

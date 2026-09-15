@@ -7,7 +7,7 @@ This module pulls data from Firestore and maps into the shared dataclasses in
 from __future__ import annotations
 
 from dataclasses import asdict
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterable, List, Optional
 import json
@@ -242,6 +242,7 @@ def load_orders_from_postgres(
     schedule_keys: Optional[Iterable[str]] = None,
     status: str = "finalized",
     limit: Optional[int] = None,
+    as_of_date: Optional[date] = None,
 ) -> List[Order]:
     """Load orders for a route from PostgreSQL."""
     conn = _get_pg_connection()
@@ -255,7 +256,8 @@ def load_orders_from_postgres(
         """
 
         if since_days:
-            since_date = (datetime.utcnow() - timedelta(days=since_days)).date()
+            anchor_date = as_of_date or datetime.now(timezone.utc).date()
+            since_date = anchor_date - timedelta(days=since_days)
             sql += " AND delivery_date >= %s"
             params.append(since_date)
 

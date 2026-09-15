@@ -36,6 +36,22 @@ class _FakeDb:
 
 
 class TestOrderArchiveReceipt(unittest.TestCase):
+    def test_send_orders_never_receive_or_pass_cleanup_receipts(self):
+        reserved = 'order-989262-send-' + 'a' * 64
+        for stamp in (None, {'version': 2}):
+            with self.assertRaisesRegex(ValueError, 'unsupported_schedule_evidence'):
+                build_order_archive_projection(reserved, '989262', {'scheduledOrder': stamp})
+        for version in (1, 2):
+            self.assertEqual(evaluate_order_archive_receipt({'orderId': reserved, 'schemaVersion': version}, None),
+                             'unsupported_schedule_evidence')
+
+    def test_stamp_only_backfill_refuses_send_order_before_database_access(self):
+        from .db_manager_pg import project_scheduled_order_archive_metadata
+        reserved = 'order-989262-send-' + 'a' * 64
+        self.assertEqual(project_scheduled_order_archive_metadata(None, None, reserved, '989262',
+                                                                  {'scheduledOrder': {'version': 2}}),
+                         {'error': 'unsupported_schedule_evidence'})
+
     def setUp(self):
         self.order_id = "order-989262-1777988222651"
         self.route_number = "989262"

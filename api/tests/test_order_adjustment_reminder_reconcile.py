@@ -57,7 +57,18 @@ class Transaction:
 
 
 def source():
-    return {"id": "order-v2", "routeNumber": "988200", "scheduledOrder": copy.deepcopy(STAMP)}
+    return {
+        "id": "order-v2",
+        "routeNumber": "988200",
+        "scheduledOrder": copy.deepcopy(STAMP),
+        "submittedAt": "2099-01-01T12:00:00Z",
+        "adjustmentAnchor": {
+            "version": 1,
+            "finalizedAtMs": 1787921220000,
+            "finalizedDate": "2026-08-28",
+            "timezone": "America/Denver",
+        },
+    }
 
 
 def adjustment(**overrides):
@@ -105,7 +116,7 @@ class ReconcileTests(unittest.TestCase):
         adjustment_exists=True,
         source_exists=True,
         settings_exists=True,
-        now_ms=1787763000000,
+        now_ms=1788022200000,
     ):
         transaction = Transaction()
         adjustment_ref = Ref(
@@ -148,8 +159,8 @@ class ReconcileTests(unittest.TestCase):
         self.assertEqual(transaction.events[3], ("write", "adjustment"))
         self.assertTrue(result["changed"])
         self.assertEqual(result["fields"]["timezone"], "America/Denver")
-        self.assertEqual(result["fields"]["adjustmentDate"], "2026-08-26")
-        self.assertEqual(result["fields"]["reminderAtMs"], 1787762700000)
+        self.assertEqual(result["fields"]["adjustmentDate"], "2026-08-29")
+        self.assertEqual(result["fields"]["reminderAtMs"], 1788021900000)
 
     def test_canonical_input_is_true_noop(self):
         first_transaction, first = self.call()
@@ -194,10 +205,10 @@ class ReconcileTests(unittest.TestCase):
         transaction, result = self.call(adjustment_data=adjustment(
             status="processing",
             reminderStatus="pending",
-            reminderAtMs=1787762700000,
+            reminderAtMs=1788021900000,
         ))
         self.assertFalse(result["changed"])
-        self.assertEqual(result["fields"]["reminderAtMs"], 1787762700000)
+        self.assertEqual(result["fields"]["reminderAtMs"], 1788021900000)
         self.assertEqual(transaction.updates, [])
 
     def test_no_meaningful_lines_cannot_be_armed_by_client_context(self):
@@ -212,22 +223,22 @@ class ReconcileTests(unittest.TestCase):
         self.assertIsNone(result["fields"]["reminderAtMs"])
 
     def test_at_cutoff_is_closed_and_never_late_armed(self):
-        _, result = self.call(now_ms=1787763600000)
+        _, result = self.call(now_ms=1788022800000)
         self.assertEqual(result["fields"]["reminderStatus"], "skipped")
         self.assertEqual(result["fields"]["reminderSkipReason"], "past_cutoff")
         self.assertIsNone(result["fields"]["reminderScheduledForMs"])
 
     def test_repeated_past_cutoff_reconcile_preserves_first_skip_time_and_is_noop(self):
-        first_transaction, first = self.call(now_ms=1787763600000)
+        first_transaction, first = self.call(now_ms=1788022800000)
         canonical = {**adjustment(), **first["fields"]}
         second_transaction, second = self.call(
             adjustment_data=canonical,
-            now_ms=1787763660000,
+            now_ms=1788022860000,
         )
 
         self.assertTrue(first_transaction.updates)
         self.assertFalse(second["changed"])
-        self.assertEqual(second["fields"]["reminderSkippedAtMs"], 1787763600000)
+        self.assertEqual(second["fields"]["reminderSkippedAtMs"], 1788022800000)
         self.assertEqual(second_transaction.updates, [])
 
     def test_persisted_requester_settings_override_client_and_draft_author(self):

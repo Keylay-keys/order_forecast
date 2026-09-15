@@ -81,6 +81,16 @@ rate_limit_transfer_create = limiter.limit(
     key_func=authenticated_or_ip_key,
     override_defaults=True,
 )
+rate_limit_portal_sap_order_read = limiter.limit(
+    "60/minute",
+    key_func=authenticated_or_ip_key,
+    override_defaults=True,
+)
+rate_limit_portal_sap_order_write = limiter.limit(
+    "10/minute",
+    key_func=authenticated_or_ip_key,
+    override_defaults=True,
+)
 
 
 def setup_rate_limiting(app):

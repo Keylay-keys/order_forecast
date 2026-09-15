@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import hashlib
 import os
 from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone
@@ -29,6 +30,7 @@ from ..middleware.rate_limit import (
 from ..order_attention import build_core_item_issues, build_next_order_store_updates
 from ..order_adjustment_schedule_v2_release import stamp_write_allowed_for_headers
 from ..order_update import merge_order_store_patches
+from ..order_schedule_evidence import validate_order_evidence
 from ..models import (
     AdjustmentReminderReconcileRequest,
     AdjustmentReminderReconcileResponse,
@@ -63,16 +65,22 @@ except ImportError:
 
 try:
     from ...scripts.finalize_rollout import api_finalize_rollout_enabled_for_route
+    from ...scripts.order_schedule_v3_release import v3_consumers_allowed
 except ImportError:
     from scripts.finalize_rollout import api_finalize_rollout_enabled_for_route
+    from scripts.order_schedule_v3_release import v3_consumers_allowed
 
 from .schedule import (
     get_order_schedule_context_from_firestore,
     get_schedule_timezone_from_firestore,
 )
+from .order_send import router as order_send_router
+from ..order_send_evidence import is_send_order_id, order_with_send_evidence
+from ..order_send_mutations import validate_send_mutation_source, mutation_now as adjustment_mutation_now
 
 
 router = APIRouter()
+router.include_router(order_send_router)
 
 
 @firestore.transactional
@@ -88,6 +96,7 @@ def _reconcile_adjustment_reminder_document(
     authenticated_uid: str,
     payload: AdjustmentReminderReconcileRequest,
     now_ms: int,
+    send_evidence_ref=None,
 ) -> Dict[str, Any]:
     adjustment_snap = adjustment_ref.get(transaction=transaction)
     source_snap = source_ref.get(transaction=transaction)
@@ -102,11 +111,22 @@ def _reconcile_adjustment_reminder_document(
 
     adjustment = adjustment_snap.to_dict() or {}
     source = source_snap.to_dict() or {}
+    additive_send = is_send_order_id(order_id)
+    if additive_send:
+        if send_evidence_ref is None:
+            raise StructuredApiError(409, 'Saved Send evidence is missing.', 'ORDER_SEND_EVIDENCE_INVALID')
+        evidence = send_evidence_ref.get(transaction=transaction)
+        try:
+            source = order_with_send_evidence(source, evidence.to_dict() if evidence.exists else None)
+        except ValueError:
+            raise StructuredApiError(409, 'Saved Send evidence needs review.', 'ORDER_SEND_EVIDENCE_INVALID') from None
     requester = settings_snap.to_dict() or {}
     if adjustment.get("routeNumber") != route_number:
         raise StructuredApiError(409, "Adjustment route changed", "ADJUSTMENT_ROUTE_CHANGED")
     if source.get("routeNumber") != route_number:
         raise StructuredApiError(404, "Adjustment source missing", "MISSING_SOURCE_ORDER")
+    if isinstance(source.get('scheduledOrder'), Mapping) and source['scheduledOrder'].get('version') == 3 and source.get('id') != order_id:
+        raise StructuredApiError(409, "Adjustment source identity changed", "ADJUSTMENT_SOURCE_CHANGED")
     if adjustment.get("sourceOrderId") != order_id:
         raise StructuredApiError(409, "Adjustment source changed", "ADJUSTMENT_SOURCE_CHANGED")
 
@@ -151,6 +171,7 @@ def _reconcile_adjustment_reminder_document(
         has_meaningful_lines=meaningful_lines(adjustment),
         status=str(adjustment.get("status") or "draft"),
         now_ms=now_ms,
+        allow_v3=additive_send or v3_consumers_allowed(route_number),
     )
     existing_skipped_at_ms = adjustment.get("reminderSkippedAtMs")
     if (
@@ -190,6 +211,10 @@ CORE_ITEM_ENFORCEMENT_ENABLED = (
     os.environ.get("CORE_ITEM_ENFORCEMENT_ENABLED", "false").lower() == "true"
 )
 logger = logging.getLogger("api.orders")
+
+
+def _privacy_hash(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:16]
 
 def _normalize_route_number(value: Any) -> str:
     v = str(value or "").strip()
@@ -283,6 +308,19 @@ def _build_scheduled_order(
     }
 
 
+def _build_adjustment_anchor(finalized_at: datetime, timezone_name: str) -> Dict[str, Any]:
+    zone_name = _valid_iana_timezone(timezone_name)
+    if zone_name is None or finalized_at.tzinfo is None:
+        raise ValueError("A timezone-aware finalization instant and valid route timezone are required")
+    finalized_at_ms = int(finalized_at.timestamp()) * 1000 + finalized_at.microsecond // 1000
+    return {
+        "version": 1,
+        "finalizedAtMs": finalized_at_ms,
+        "finalizedDate": finalized_at.astimezone(ZoneInfo(zone_name)).date().isoformat(),
+        "timezone": zone_name,
+    }
+
+
 def _resolve_create_schedule(
     db: firestore.Client,
     payload: OrderCreateRequest,
@@ -297,6 +335,9 @@ def _resolve_create_schedule(
             "Could not load the route order schedule. Try again.",
             "ORDER_SCHEDULE_UNAVAILABLE",
         ) from exc
+    if schedule_context.get('sourceVersion') == 3:
+        raise StructuredApiError(409, 'Order creation for this schedule is not enabled yet.',
+                                 'ORDER_SCHEDULE_UPGRADE_REQUIRED')
     resolution = resolve_order_schedule_for_delivery_date(
         payload.deliveryDate,
         cycles,
@@ -361,6 +402,9 @@ def _resolve_finalize_stamp(
         return None, None, None
     try:
         schedule_context = get_order_schedule_context_from_firestore(db, route_number)
+        if schedule_context.get('sourceVersion') == 3:
+            # Never manufacture a V2 stamp from new schedule authority.
+            return None, delivery_date, schedule_key
         cycles = list(schedule_context["cycles"])
         resolution = resolve_order_schedule_for_delivery_date(
             delivery_date,
@@ -651,6 +695,7 @@ def _confirm_full_order_adjustment_document(
     actor_user_id: str,
     requester_is_owner: bool,
     now: datetime,
+    send_db=None,
 ) -> Dict[str, Any]:
     order_doc = order_ref.get(transaction=transaction)
     adjustment_doc = adjustment_ref.get(transaction=transaction)
@@ -670,6 +715,19 @@ def _confirm_full_order_adjustment_document(
     adjustment_actor = str(adjustment.get("userId") or "")
     if adjustment_actor != actor_user_id and not requester_is_owner:
         raise StructuredApiError(404, "The sent adjustment was not found.", "ADJUSTMENT_BATCH_NOT_FOUND")
+
+    validate_send_mutation_source(send_db, transaction, order=order_data, order_id=str(order_ref.id),
+                                  route=route_number, uid=actor_user_id, now=now)
+    if is_send_order_id(order_ref.id):
+        last_sent = adjustment.get('lastSent') or {}
+        if (adjustment_ref.id != payload.adjustmentId or batch_ref.id != payload.sentBatchId
+                or adjustment.get('id') != payload.adjustmentId or adjustment.get('routeNumber') != route_number
+                or adjustment.get('mode') != 'full_order' or batch.get('id') != payload.sentBatchId
+                or batch.get('adjustmentId') != payload.adjustmentId or batch.get('sourceOrderId') != order_ref.id
+                or batch.get('routeNumber') != route_number or last_sent.get('batchId') != payload.sentBatchId
+                or last_sent.get('cumulativeSignature') != batch.get('cumulativeSignature')
+                or last_sent.get('workingCopySignature') != batch.get('workingCopySignature')):
+            raise StructuredApiError(409, 'The sent adjustment could not be verified.', 'ADJUSTMENT_BATCH_MISMATCH')
 
     prior_confirmation = adjustment.get("confirmation") or {}
     if adjustment.get("status") == "confirmed":
@@ -832,8 +890,10 @@ def _finalize_order_document(
     route_number: str,
     now: datetime,
     resolved_stamp: Optional[Dict[str, Any]] = None,
+    resolved_adjustment_anchor: Optional[Dict[str, Any]] = None,
     resolved_delivery_date: Optional[str] = None,
     resolved_schedule_key: Optional[str] = None,
+    send_evidence_ref=None,
 ) -> Dict[str, Any]:
     order_doc = order_ref.get(transaction=transaction)
     if not order_doc.exists:
@@ -844,6 +904,33 @@ def _finalize_order_document(
         raise HTTPException(403, "Route mismatch")
     if order_data.get("status") != "draft":
         raise HTTPException(409, "Only draft orders can be finalized")
+
+    # V3 authority is immutable at creation. Never consult today's profile or
+    # accept a pre-transaction anchor for these orders.
+    existing_stamp = order_data.get('scheduledOrder')
+    send_view = None
+    if is_send_order_id(order_ref.id):
+        if send_evidence_ref is None:
+            raise StructuredApiError(409, 'Saved Send evidence is missing.', 'ORDER_SEND_EVIDENCE_INVALID')
+        evidence_snap = send_evidence_ref.get(transaction=transaction)
+        try:
+            send_view = order_with_send_evidence(order_data, evidence_snap.to_dict() if evidence_snap.exists else None)
+            if 'adjustmentAnchor' in order_data or 'submittedAt' in order_data:
+                raise ValueError('Draft has finalization evidence')
+            resolved_adjustment_anchor = _build_adjustment_anchor(now, send_view['scheduledOrder']['timezone'])
+            if resolved_adjustment_anchor['finalizedAtMs'] < evidence_snap.to_dict()['createdAtMs']:
+                raise ValueError('Invalid finalization chronology')
+        except ValueError:
+            raise StructuredApiError(409, 'Saved Send evidence needs review.', 'ORDER_SEND_EVIDENCE_INVALID') from None
+    if isinstance(existing_stamp, Mapping) and existing_stamp.get('version') != 2:
+        try:
+            stamp = validate_order_evidence(order_data)
+            if 'adjustmentAnchor' in order_data:
+                raise ValueError('Draft already has finalization evidence')
+            resolved_adjustment_anchor = _build_adjustment_anchor(now, stamp['timezone'])
+        except ValueError as exc:
+            raise StructuredApiError(409, 'Saved order schedule needs review.',
+                                     'ORDER_SCHEDULE_EVIDENCE_INVALID') from exc
 
     store_docs = []
     stores = []
@@ -889,6 +976,18 @@ def _finalize_order_document(
         and str(order_data.get("scheduleKey") or "").strip().lower() == resolved_schedule_key
     ):
         finalize_update["scheduledOrder"] = resolved_stamp
+    if (
+        resolved_adjustment_anchor is not None
+        and "adjustmentAnchor" not in order_data
+        and ("scheduledOrder" in order_data or "scheduledOrder" in finalize_update)
+    ):
+        finalize_update["adjustmentAnchor"] = dict(resolved_adjustment_anchor)
+    if send_view is not None or isinstance(existing_stamp, Mapping) and existing_stamp.get('version') == 3:
+        try:
+            validate_order_evidence({**(send_view or order_data), **finalize_update})
+        except ValueError as exc:
+            raise StructuredApiError(409, 'Finalization does not match the saved schedule.',
+                                     'ORDER_SCHEDULE_EVIDENCE_INVALID') from exc
     transaction.update(order_ref, finalize_update)
     for store_doc in store_docs:
         if store_doc.id not in next_order_updates:
@@ -916,6 +1015,7 @@ def _apply_store_reallocation_document(
     local_date: str,
     timezone_name: str,
     now: datetime,
+    send_db=None,
 ) -> Dict[str, Any]:
     """Atomically materialize a store reallocation into the finalized order."""
     order_doc = order_ref.get(transaction=transaction)
@@ -924,6 +1024,13 @@ def _apply_store_reallocation_document(
     order_data = order_doc.to_dict() or {}
     if str(order_data.get("routeNumber") or "") != route_number:
         raise StructuredApiError(404, "Order not found", "ORDER_NOT_FOUND")
+
+    saved_zone = validate_send_mutation_source(send_db, transaction, order=order_data, order_id=str(order_ref.id),
+                                              route=route_number, uid=actor_user_id, now=now)
+    if saved_zone:
+        from zoneinfo import ZoneInfo
+        timezone_name = saved_zone
+        local_date = now.astimezone(ZoneInfo(saved_zone)).date().isoformat()
 
     signature = moves_signature(payload.moves)
     adjustment_doc = adjustment_ref.get(transaction=transaction)
@@ -938,6 +1045,11 @@ def _apply_store_reallocation_document(
             and str(existing.get("status") or "") == "applied"
         )
         if same_operation:
+            if is_send_order_id(order_ref.id) and (
+                existing.get('id') != payload.reallocationId or existing.get('routeNumber') != route_number
+                or existing.get('mode') != 'store_reallocation'
+            ):
+                raise StructuredApiError(409, 'The saved reallocation could not be verified.', 'REALLOCATION_ID_CONFLICT')
             existing_actor = str(existing_reallocation.get("appliedByUserId") or existing.get("userId") or "")
             if existing_actor != actor_user_id and not requester_is_owner:
                 raise StructuredApiError(404, "Order not found", "ORDER_NOT_FOUND")
@@ -1207,6 +1319,12 @@ async def create_order(
 ) -> Order:
     """Create a new draft order."""
     await require_route_feature_access(payload.routeNumber, "ordering", decoded_token, db)
+    if payload.requestId is not None:
+        from ..order_schedule_create import create_confirmed_order, require_creation_enabled
+        from starlette.concurrency import run_in_threadpool
+        require_creation_enabled(payload.routeNumber, getattr(request, 'headers', {}))
+        saved = await run_in_threadpool(create_confirmed_order, db, decoded_token['uid'], payload)
+        return Order(**saved)
     schedule_resolution, resolved_scheduled_order = _resolve_create_schedule(db, payload)
     request_headers = getattr(request, "headers", {})
     stamp_allowed = stamp_write_allowed_for_headers(request_headers)
@@ -1349,6 +1467,18 @@ async def update_order(
         payload=payload,
         now=now,
     )
+
+    if payload.sapOrder is not None:
+        # Compatibility telemetry only. Never log the preference contents,
+        # raw UID, or raw route number.
+        logger.info(
+            "legacy_order_sap_order_write request_id=%s actor_hash=%s "
+            "route_hash=%s item_count=%s",
+            getattr(request.state, "request_id", "unassigned"),
+            _privacy_hash(str(decoded_token["uid"])),
+            _privacy_hash(route),
+            len(payload.sapOrder),
+        )
 
     _log_order_audit(
         db,
@@ -1506,16 +1636,41 @@ async def finalize_order(
             order_data=pre_transaction_data,
         )
     now = datetime.now(timezone.utc)
-    order_data = _finalize_order_document(
-        db.transaction(),
-        order_ref=order_ref,
-        stores_ref=db.collection("routes").document(route).collection("stores"),
-        route_number=route,
-        now=now,
-        resolved_stamp=resolved_stamp,
-        resolved_delivery_date=resolved_delivery_date,
-        resolved_schedule_key=resolved_schedule_key,
+    has_schedule_authority = (
+        isinstance(pre_transaction_data.get("scheduledOrder"), Mapping)
+        or resolved_stamp is not None
     )
+    resolved_adjustment_anchor = (
+        _build_adjustment_anchor(now, _require_route_owner_timezone(db, route))
+        if has_schedule_authority and not (
+            isinstance(pre_transaction_data.get('scheduledOrder'), Mapping)
+            and pre_transaction_data['scheduledOrder'].get('version') == 3
+            or is_send_order_id(order_id)
+        )  # V3 anchor is derived only from the transaction's immutable evidence.
+        else None
+    )
+    try:
+        order_data = _finalize_order_document(
+            db.transaction(),
+            order_ref=order_ref,
+            stores_ref=db.collection("routes").document(route).collection("stores"),
+            route_number=route,
+            now=now,
+            resolved_stamp=resolved_stamp,
+            resolved_adjustment_anchor=resolved_adjustment_anchor,
+            resolved_delivery_date=resolved_delivery_date,
+            resolved_schedule_key=resolved_schedule_key,
+            send_evidence_ref=db.collection('orderSendEvidence').document(order_id) if is_send_order_id(order_id) else None,
+        )
+    except HTTPException as exc:
+        if not (is_send_order_id(order_id) and exc.status_code == 409
+                and exc.detail == 'Only draft orders can be finalized'):
+            raise
+        from ..order_send_mutations import read_send_finalize_receipt
+        # Handles a lost response and a concurrent Finalize. No new timestamp,
+        # transfer commit, audit event, forecast dispatch or Postgres sync.
+        return read_send_finalize_receipt(db, order_id=order_id, route=route,
+                                          uid=decoded_token['uid'], now=datetime.now(timezone.utc))
     route_number = str(order_data.get("routeNumber", ""))
 
     # Commit outbound transfers (change status from 'planned' to 'committed')
@@ -1758,7 +1913,7 @@ async def create_store_reallocation(
         f"store-reallocation-{reallocation_id}"
     )
     route_ref = db.collection("routes").document(route)
-    now = datetime.now(timezone.utc)
+    now = adjustment_mutation_now()
     result = _apply_store_reallocation_document(
         db.transaction(),
         order_ref=order_ref,
@@ -1777,6 +1932,7 @@ async def create_store_reallocation(
         local_date=_get_local_order_date(db, route),
         timezone_name=get_route_timezone(db, route) or "UTC",
         now=now,
+        send_db=db,
     )
     logger.info(
         "store_reallocation_applied route=%s order_id=%s reallocation_id=%s revision=%s idempotent=%s",
@@ -1833,6 +1989,7 @@ async def reconcile_order_adjustment_reminder(
         authenticated_uid=requester_uid,
         payload=payload,
         now_ms=now_ms,
+        send_evidence_ref=db.collection('orderSendEvidence').document(order_id) if is_send_order_id(order_id) else None,
     )
     logger.info(
         "order_adjustment_reminder_reconciled route=%s order_id=%s adjustment_id=%s changed=%s requester=%s",
@@ -1894,7 +2051,8 @@ async def confirm_full_order_adjustment(
         payload=payload,
         actor_user_id=str(decoded_token["uid"]),
         requester_is_owner=_requester_is_route_owner(requester_user_data, route),
-        now=datetime.now(timezone.utc),
+        now=adjustment_mutation_now(),
+        send_db=db,
     )
     logger.info(
         "full_order_adjustment_confirmed route=%s order_id=%s adjustment_id=%s revision=%s changed=%s idempotent=%s",

@@ -16,8 +16,10 @@ from ..dependencies import (
     require_route_access,
     get_firestore,
 )
-from ..models import ScheduledOrder
+from ..models import ScheduledOrder, ScheduledOrderV3
 from ..order_adjustment_schedule_v2_release import stamp_write_allowed_for_headers
+from .schedule_source import router as source_router
+from .schedule_send import router as send_router
 
 from schedule_cycle import (
     get_cycle_dates,
@@ -27,6 +29,8 @@ from schedule_cycle import (
 
 
 router = APIRouter()
+router.include_router(source_router)
+router.include_router(send_router)
 
 
 class OrderCycle(BaseModel):
@@ -37,6 +41,7 @@ class OrderCycle(BaseModel):
     deliveryOffsetDays: Optional[int] = None
     needsScheduleReview: Optional[bool] = None
     scheduleVersion: Optional[int] = None
+    sendOffsetDays: Optional[int] = None
 
 
 class ScheduleResponse(BaseModel):
@@ -55,7 +60,7 @@ class ScheduleKeyResponse(BaseModel):
     timezone: Optional[str] = None
     matched: bool
     reason: Optional[str] = None
-    scheduledOrder: Optional[ScheduledOrder] = None
+    scheduledOrder: Optional[ScheduledOrder | ScheduledOrderV3] = None
 
 
 DAY_NAMES = ['', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
@@ -153,6 +158,23 @@ def get_order_schedule_context_from_firestore(
             "timezone": None,
         }
     user_data = user_doc.to_dict() or {}
+    if ('orderScheduleControl' in user_data
+            or db.collection('orderScheduleProjectionWork').document(route_number).get().exists):
+        from schedule_sync import read_current_projection
+        from schedule_utils import _get_pg_connection
+        from ..errors import StructuredApiError
+        try:
+            current = read_current_projection(db, route_number, _get_pg_connection, owner_uid)
+        except StructuredApiError:
+            raise
+        except Exception:
+            raise StructuredApiError(503, 'The saved schedule is still syncing. Try again shortly.',
+                                     'SCHEDULE_PROJECTION_UNAVAILABLE') from None
+        if current is None:
+            raise RuntimeError('schedule_source_changed')
+        return {'status': 'ready', 'ownerUid': current['control']['ownerUid'],
+                'cycles': current['cycles'], 'timezone': current['control']['timezone'],
+                'sourceVersion': 3, 'sourceRevision': current['control']['revision']}
     user_settings = user_data.get("userSettings") if isinstance(user_data.get("userSettings"), dict) else {}
     notifications = user_settings.get("notifications") if isinstance(user_settings.get("notifications"), dict) else {}
     scheduling = notifications.get("scheduling") if isinstance(notifications.get("scheduling"), dict) else {}
@@ -160,6 +182,15 @@ def get_order_schedule_context_from_firestore(
     if not isinstance(raw_cycles, list) or not raw_cycles:
         legacy_settings = user_data.get("settings") if isinstance(user_data.get("settings"), dict) else {}
         raw_cycles = legacy_settings.get("orderCycles")
+    # Updated and legacy order selection must agree on the route's three-date
+    # view. Team edits must not mutate the owner's other routes or settings.
+    from ..schedule_send_extension import COLLECTION, _extension, route_legacy_cycles
+    send_snapshot = db.collection(COLLECTION).document(route_number).get()
+    if send_snapshot.exists:
+        extension = _extension(send_snapshot.to_dict(), owner_uid, route_number)
+        if extension['version'] == 2:
+            raw_cycles = scheduling.get('orderCycles')
+        raw_cycles = route_legacy_cycles(raw_cycles, extension)
     cycles = [normalize_order_cycle(cycle) for cycle in raw_cycles] if isinstance(raw_cycles, list) else []
 
     profile = user_data.get("profile") if isinstance(user_data.get("profile"), dict) else {}
@@ -256,7 +287,7 @@ async def get_schedule(
     next_delivery = calculate_next_delivery(cycles, today)
     
     return ScheduleResponse(
-        cycles=[OrderCycle(**normalize_order_cycle(c)) for c in cycles],
+        cycles=[OrderCycle(**(c if c.get('scheduleVersion') == 3 else normalize_order_cycle(c))) for c in cycles],
         todayIsOrderDay=today_is_order_day,
         nextDelivery=next_delivery
     )
@@ -301,10 +332,24 @@ async def get_schedule_key_for_date(
     resolution = resolve_order_schedule_for_delivery_date(deliveryDate, cycles, scheduleKey)
     timezone_name = schedule_context["timezone"]
     timezone_status = schedule_context["status"]
-    stamp_allowed = stamp_write_allowed_for_headers(getattr(request, "headers", {}))
+    stamp_allowed = (schedule_context.get('sourceVersion') != 3
+                     and stamp_write_allowed_for_headers(getattr(request, "headers", {})))
     if resolution['status'] == 'resolved' and timezone_name:
         cycle = resolution['cycle']
         order_day = cycle['orderDay']
+        if schedule_context.get('sourceVersion') == 3:
+            from ..order_schedule_create import require_creation_enabled
+            from ..order_schedule_evidence import build_evidence
+            require_creation_enabled(route, getattr(request, 'headers', {}))
+            stamp = build_evidence({
+                'timezone': timezone_name, 'revision': schedule_context['sourceRevision'],
+                'ownerUid': schedule_context['ownerUid'], 'routeNumber': route,
+            }, cycles, deliveryDate, resolution['scheduleKey'])
+            return ScheduleKeyResponse(
+                scheduleKey=resolution['scheduleKey'], deliveryDate=deliveryDate,
+                orderDayName=get_day_name(order_day), deliveryDayName=get_day_name(delivery_dow),
+                orderDate=stamp['date'], loadDate=resolution['loadDate'], timezone=timezone_name,
+                matched=True, scheduledOrder=ScheduledOrderV3.model_validate(stamp))
         scheduled_order = ScheduledOrder(
             version=2,
             date=resolution['orderDate'],

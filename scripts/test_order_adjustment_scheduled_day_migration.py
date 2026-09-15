@@ -65,6 +65,7 @@ class ScheduledOrderDayMigrationTests(unittest.TestCase):
             "status": "finalized",
             "scheduleKey": "tuesday",
             "expectedDeliveryDate": "2026-08-20",
+            "submittedAt": "2026-08-18T18:00:00Z",
         }
         self.stamp = {
             "version": 2,
@@ -203,7 +204,7 @@ class ScheduledOrderDayMigrationTests(unittest.TestCase):
         self.assertIsNone(fields)
         self.assertIsNone(side)
 
-    def test_989262_incident_resolves_tuesday_then_expires_wednesday(self):
+    def test_early_cycle_draft_finalized_friday_gets_saturday_adjustment_window(self):
         context = {
             "status": "ready",
             "timezone": "America/Denver",
@@ -217,16 +218,17 @@ class ScheduledOrderDayMigrationTests(unittest.TestCase):
             }],
         }
         source = {
-            "routeNumber": "989262",
+            "routeNumber": "988200",
             "status": "finalized",
             "scheduleKey": "tuesday",
             "expectedDeliveryDate": "2026-08-31",
+            "submittedAt": "2026-08-28T12:47:00Z",
         }
         stamp, classification = migration.reconstruct_stamp(source, context)
         self.assertEqual(classification, "reconstructable")
         self.assertEqual(stamp["date"], "2026-08-25")
         now_ms = int(
-            datetime(2026, 8, 28, 6, 47, tzinfo=ZoneInfo("America/Denver")).timestamp()
+            datetime(2026, 8, 29, 10, 50, tzinfo=ZoneInfo("America/Denver")).timestamp()
             * 1000
         )
         candidate, fields, side = migration._adjustment_candidate(
@@ -236,9 +238,9 @@ class ScheduledOrderDayMigrationTests(unittest.TestCase):
             self.settings,
             now_ms,
         )
-        self.assertEqual((candidate, side), ("expired_patched", "expired"))
-        self.assertEqual(fields["adjustmentDate"], "2026-08-26")
-        self.assertEqual(fields["reminderSkipReason"], "past_cutoff")
+        self.assertEqual((candidate, side), ("rearmed", "already_due"))
+        self.assertEqual(fields["adjustmentDate"], "2026-08-29")
+        self.assertEqual(fields["reminderStatus"], "pending")
 
     def test_claimed_failed_sent_and_terminal_rows_are_untouched(self):
         source = {**self.source, "scheduledOrder": self.stamp}

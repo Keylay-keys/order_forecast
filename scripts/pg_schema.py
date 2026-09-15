@@ -32,6 +32,11 @@ from psycopg2.extras import RealDictCursor
 from datetime import datetime
 from typing import Optional
 
+try:
+    from .protected_schedule_schema import validate_protected_table
+except ImportError:
+    from protected_schedule_schema import validate_protected_table
+
 
 # Connection parameters from environment
 PG_HOST = os.environ.get('POSTGRES_HOST', 'localhost')
@@ -73,10 +78,11 @@ def get_connection(
     return conn
 
 
-def create_schema(conn: psycopg2.extensions.connection) -> None:
+def create_schema(conn: psycopg2.extensions.connection, *, manage_protected_tables: bool = False) -> None:
     """Create all tables and indexes in the database.
     
-    Safe to call multiple times - uses IF NOT EXISTS.
+    Schedule/history tables are validated, not changed, by default. Explicit
+    administrative bootstrap may manage them; V3 migrations remain separate.
     
     Args:
         conn: PostgreSQL connection object.
@@ -84,8 +90,8 @@ def create_schema(conn: psycopg2.extensions.connection) -> None:
     cur = conn.cursor()
     
     # Create tables in dependency order
-    _create_order_tables(cur)
-    _create_user_param_tables(cur)
+    _create_order_tables(cur, manage_protected_tables=manage_protected_tables)
+    _create_user_param_tables(cur, manage_protected_tables=manage_protected_tables)
     _create_promo_tables(cur)
     _create_calendar_tables(cur)
     _create_ml_tables(cur)
@@ -100,7 +106,7 @@ def create_schema(conn: psycopg2.extensions.connection) -> None:
     _create_notification_tables(cur)
     _create_usage_analytics_tables(cur)
     _create_security_tables(cur)
-    _create_indexes(cur)
+    _create_indexes(cur, manage_protected_tables=manage_protected_tables)
     
     conn.commit()
     cur.close()
@@ -112,8 +118,8 @@ def create_schema(conn: psycopg2.extensions.connection) -> None:
 # ORDER DATA TABLES
 # =============================================================================
 
-def _create_order_tables(cur) -> None:
-    """Create tables for historical order data."""
+def _create_order_header(cur) -> None:
+    """Administrative bootstrap only; normal workers must not execute this DDL."""
     
     # Main order header table
     cur.execute("""
@@ -138,6 +144,8 @@ def _create_order_tables(cur) -> None:
             last_reallocated_at TIMESTAMP WITH TIME ZONE,
             last_reallocation_id VARCHAR(255),
             scheduled_order JSONB,
+            expected_load_date DATE,
+            adjustment_anchor JSONB,
             synced_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
         )
     """)
@@ -149,7 +157,16 @@ def _create_order_tables(cur) -> None:
     cur.execute("ALTER TABLE orders_historical ADD COLUMN IF NOT EXISTS last_reallocated_at TIMESTAMP WITH TIME ZONE")
     cur.execute("ALTER TABLE orders_historical ADD COLUMN IF NOT EXISTS last_reallocation_id VARCHAR(255)")
     cur.execute("ALTER TABLE orders_historical ADD COLUMN IF NOT EXISTS scheduled_order JSONB")
-    
+    cur.execute("ALTER TABLE orders_historical ADD COLUMN IF NOT EXISTS expected_load_date DATE")
+    cur.execute("ALTER TABLE orders_historical ADD COLUMN IF NOT EXISTS adjustment_anchor JSONB")
+
+
+def _create_order_tables(cur, *, manage_protected_tables=False) -> None:
+    if manage_protected_tables:
+        _create_order_header(cur)
+    else:
+        validate_protected_table(cur, 'orders_historical')
+
     # Individual line items (one row per store/item in each order)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS order_line_items (
@@ -234,7 +251,7 @@ def _create_order_tables(cur) -> None:
 # USER PARAMETER TABLES
 # =============================================================================
 
-def _create_user_param_tables(cur) -> None:
+def _create_user_param_tables(cur, *, manage_protected_tables=False) -> None:
     """Create tables for user configuration data."""
     
     # Store ID aliases
@@ -252,7 +269,16 @@ def _create_user_param_tables(cur) -> None:
         )
     """)
     
-    # User schedule configurations
+    if manage_protected_tables:
+        _create_schedule_table(cur)
+    else:
+        validate_protected_table(cur, 'user_schedules')
+
+    _create_other_user_param_tables(cur)
+
+
+def _create_schedule_table(cur) -> None:
+    """Administrative bootstrap only. No schedule backfill during runtime startup."""
     cur.execute("""
         CREATE TABLE IF NOT EXISTS user_schedules (
             id VARCHAR(255) PRIMARY KEY,
@@ -261,6 +287,7 @@ def _create_user_param_tables(cur) -> None:
             order_day INTEGER NOT NULL,
             load_day INTEGER NOT NULL,
             delivery_day INTEGER NOT NULL,
+            send_offset_days INTEGER,
             load_offset_days INTEGER,
             delivery_offset_days INTEGER,
             schedule_version INTEGER DEFAULT 2,
@@ -276,8 +303,10 @@ def _create_user_param_tables(cur) -> None:
     cur.execute("ALTER TABLE user_schedules ADD COLUMN IF NOT EXISTS delivery_offset_days INTEGER")
     cur.execute("ALTER TABLE user_schedules ADD COLUMN IF NOT EXISTS schedule_version INTEGER DEFAULT 2")
     cur.execute("ALTER TABLE user_schedules ADD COLUMN IF NOT EXISTS needs_schedule_review BOOLEAN DEFAULT FALSE")
-    _backfill_user_schedule_offsets(cur)
-    
+    cur.execute("ALTER TABLE user_schedules ADD COLUMN IF NOT EXISTS send_offset_days INTEGER")
+
+
+def _create_other_user_param_tables(cur) -> None:
     # Store configurations
     cur.execute("""
         CREATE TABLE IF NOT EXISTS stores (
@@ -1341,7 +1370,7 @@ def _create_security_tables(cur) -> None:
 # INDEXES
 # =============================================================================
 
-def _create_indexes(cur) -> None:
+def _create_indexes(cur, *, manage_protected_tables=False) -> None:
     """Create indexes for common query patterns."""
     
     indexes = [
@@ -1427,6 +1456,9 @@ def _create_indexes(cur) -> None:
     ]
     
     for name, table, columns in indexes:
+        if table == 'orders_historical' and not manage_protected_tables:
+            # Managed by the administrator, never attempted/caught at startup.
+            continue
         try:
             cur.execute(f"CREATE INDEX IF NOT EXISTS {name} ON {table}({columns})")
         except Exception as e:
@@ -1524,8 +1556,12 @@ if __name__ == '__main__':
     parser.add_argument('--password', default=os.environ.get('PGPASSWORD', PG_PASSWORD),
                         help='Password (or set PGPASSWORD env var)')
     parser.add_argument('--create', action='store_true', help='Create schema')
+    parser.add_argument('--manage-protected-tables', action='store_true',
+                        help='Explicit administrative bootstrap of schedule/history tables; requires --create')
     parser.add_argument('--summary', action='store_true', help='Print schema summary')
     args = parser.parse_args()
+    if args.manage_protected_tables and not args.create:
+        parser.error('--manage-protected-tables requires --create')
     
     print(f"📁 PostgreSQL: {args.user}@{args.host}:{args.port}/{args.database}")
     
@@ -1539,7 +1575,7 @@ if __name__ == '__main__':
         )
         
         if args.create:
-            create_schema(conn)
+            create_schema(conn, manage_protected_tables=args.manage_protected_tables)
         
         if args.summary or not args.create:
             print_schema_summary(conn)
@@ -1551,3 +1587,4 @@ if __name__ == '__main__':
         print("\nMake sure PostgreSQL is running and the database exists:")
         print(f"  sudo -u postgres createuser -P {args.user}")
         print(f"  sudo -u postgres createdb -O {args.user} {args.database}")
+        raise SystemExit(1)

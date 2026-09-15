@@ -674,8 +674,11 @@ def enqueue_generation_job(
     finalize_key: Optional[str] = None,
     desired_revision: Optional[str] = None,
     refresh_reason: Optional[str] = None,
+    ensure_schema: bool = True,
+    connect=None,
 ) -> Optional[Dict[str, Any]]:
-    ensure_forecast_queue_tables()
+    if ensure_schema:
+        ensure_forecast_queue_tables()
     sk = normalize_schedule_key(schedule_key)
     dd = normalize_delivery_date(delivery_date)
     jt = normalize_job_type(job_type)
@@ -683,7 +686,7 @@ def enqueue_generation_job(
         return None
     job_key = build_job_key(route_number, sk, dd)
     max_attempts = int(os.environ.get("FORECAST_JOB_MAX_ATTEMPTS", "5"))
-    conn = _pg_connect(autocommit=True)
+    conn = connect() if connect is not None else _pg_connect(autocommit=True)
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute(

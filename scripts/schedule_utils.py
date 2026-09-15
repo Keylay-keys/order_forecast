@@ -5,6 +5,12 @@ from __future__ import annotations
 from datetime import datetime, date
 from typing import Optional, Dict
 
+# Match schedule_sync's supported filename-based daemon entry points.
+if not __package__:
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 try:
     from .schedule_cycle import get_schedule_key_for_delivery_date, normalize_order_cycle
 except ImportError:
@@ -161,6 +167,18 @@ def get_order_cycles_from_postgres(route_number: str) -> list:
 def get_order_cycles_from_firebase(db, route_number: str) -> list:
     """Read current schedule authority directly from the owner user document."""
     from google.cloud.firestore_v1.base_query import FieldFilter
+    override = _route_send_view(db, route_number)
+    if override is not None:
+        return [normalize_order_cycle(cycle) for cycle in override['cycles']]
+    try:
+        from .schedule_sync import read_current_schedule
+    except ImportError:
+        from schedule_sync import read_current_schedule
+    # This explicitly source-only reader is used to fingerprint forecast input.
+    # It must not revive legacy cycles for an intentionally empty V3 source.
+    current = read_current_schedule(db, route_number)[2]
+    if current is not None:
+        return current['cycles']
     
     try:
         user_id = None
@@ -219,6 +237,14 @@ def get_order_cycles_from_firebase(db, route_number: str) -> list:
     return []
 
 
+def _route_send_view(db, route_number):
+    try:
+        from ..api.schedule_send_extension import read_route_legacy_view
+    except ImportError:
+        from api.schedule_send_extension import read_route_legacy_view
+    return read_route_legacy_view(db, route_number)
+
+
 def get_order_cycles(db, route_number: str) -> list:
     """Get user's order cycles - tries PostgreSQL first, falls back to Firebase.
 
@@ -230,6 +256,18 @@ def get_order_cycles(db, route_number: str) -> list:
         [{'orderDay': 1, 'loadDay': 3, 'deliveryDay': 4},
          {'orderDay': 2, 'loadDay': 5, 'deliveryDay': 1}]
     """
+    # A route override is authoritative immediately, even if its SQL mirror is
+    # unavailable/behind. In particular, [] must never revive an old SQL cycle.
+    override = _route_send_view(db, route_number)
+    if override is not None:
+        return [normalize_order_cycle(cycle) for cycle in override['cycles']]
+    try:
+        from .schedule_sync import read_current_projection
+    except ImportError:
+        from schedule_sync import read_current_projection
+    current = read_current_projection(db, route_number, _get_pg_connection)
+    if current is not None:
+        return current['cycles']
     cycles = get_order_cycles_from_postgres(route_number)
     return cycles or get_order_cycles_from_firebase(db, route_number)
 

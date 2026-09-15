@@ -16,6 +16,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+from contextlib import closing
 import json
 import os
 import socket
@@ -28,6 +29,11 @@ from typing import Any, Optional, Dict, List
 import psycopg2
 from psycopg2.extras import execute_values, RealDictCursor
 from google.cloud import firestore  # type: ignore
+
+try:
+    from .schedule_sync import ScheduleSyncResult, StructuredApiError, read_current_schedule, sync_current_v3
+except ImportError:
+    from schedule_sync import ScheduleSyncResult, StructuredApiError, read_current_schedule, sync_current_v3
 
 try:
     from .db_manager_pg import handle_sync_order
@@ -634,15 +640,30 @@ def sync_products_from_firebase(fb_client: firestore.Client, route_number: str) 
     return count
 
 
-def sync_schedules_from_firebase(fb_client: firestore.Client, route_number: str, user_id: str) -> int:
+def _new_schedule_connection():
+    """A schedule replacement must not share a transaction with other callbacks."""
+    return psycopg2.connect(
+        host=os.environ.get('POSTGRES_HOST', 'localhost'),
+        port=int(os.environ.get('POSTGRES_PORT', 5432)),
+        database=os.environ.get('POSTGRES_DB', 'routespark'),
+        user=os.environ.get('POSTGRES_USER', 'routespark'),
+        password=os.environ.get('POSTGRES_PASSWORD', ''),
+        connect_timeout=3, options='-c statement_timeout=5000 -c lock_timeout=2000',
+    )
+
+
+def sync_schedules_from_firebase(fb_client: firestore.Client, route_number: str, user_id: str) -> ScheduleSyncResult:
     """Sync order schedules from Firebase to PostgreSQL."""
-    user_ref = fb_client.collection('users').document(user_id)
-    user_doc = user_ref.get()
-    
-    if not user_doc.exists:
-        return 0
-    
-    user_data = user_doc.to_dict() or {}
+    try:
+        user_id, user_data, source = read_current_schedule(fb_client, route_number, user_id)
+        if not user_data:
+            return ScheduleSyncResult('blocked')
+        if source is not None:
+            return sync_current_v3(fb_client, route_number, source)
+    except StructuredApiError:
+        return ScheduleSyncResult('blocked')
+    except Exception:
+        return ScheduleSyncResult('pending')
     
     # Try the correct nested path first (userSettings.notifications.scheduling.orderCycles)
     cycles = (
@@ -693,40 +714,42 @@ def sync_schedules_from_firebase(fb_client: firestore.Client, route_number: str,
             now,
         ))
 
-    if not rows:
-        return 0
-
     try:
-        conn = get_pg_connection()
-        with conn.cursor() as cur:
-            execute_values(
-                cur,
-                """
-                INSERT INTO user_schedules (
-                    id, route_number, user_id, order_day, load_day, delivery_day,
-                    load_offset_days, delivery_offset_days, schedule_version, needs_schedule_review,
-                    schedule_key, is_active, synced_at
+        # Use a fresh legacy-role connection. Sharing the daemon's autocommit
+        # connection could pull unrelated callback writes into this transaction.
+        with closing(_new_schedule_connection()) as conn, conn, conn.cursor() as cur:
+            cur.execute('UPDATE user_schedules SET is_active=FALSE WHERE route_number=%s', (route_number,))
+            if rows:
+                execute_values(
+                    cur,
+                    """
+                    INSERT INTO user_schedules (
+                        id, route_number, user_id, order_day, load_day, delivery_day,
+                        load_offset_days, delivery_offset_days, schedule_version, needs_schedule_review,
+                        schedule_key, is_active, synced_at
+                    )
+                    VALUES %s
+                    ON CONFLICT (id) DO UPDATE SET
+                        user_id = EXCLUDED.user_id,
+                        order_day = EXCLUDED.order_day,
+                        load_day = EXCLUDED.load_day,
+                        delivery_day = EXCLUDED.delivery_day,
+                        load_offset_days = EXCLUDED.load_offset_days,
+                        delivery_offset_days = EXCLUDED.delivery_offset_days,
+                        schedule_version = EXCLUDED.schedule_version,
+                        needs_schedule_review = EXCLUDED.needs_schedule_review,
+                        schedule_key = EXCLUDED.schedule_key,
+                        is_active = EXCLUDED.is_active,
+                        synced_at = EXCLUDED.synced_at
+                    """,
+                    rows,
                 )
-                VALUES %s
-                ON CONFLICT (id) DO UPDATE SET
-                    order_day = EXCLUDED.order_day,
-                    load_day = EXCLUDED.load_day,
-                    delivery_day = EXCLUDED.delivery_day,
-                    load_offset_days = EXCLUDED.load_offset_days,
-                    delivery_offset_days = EXCLUDED.delivery_offset_days,
-                    schedule_version = EXCLUDED.schedule_version,
-                    needs_schedule_review = EXCLUDED.needs_schedule_review,
-                    schedule_key = EXCLUDED.schedule_key,
-                    is_active = EXCLUDED.is_active,
-                    synced_at = EXCLUDED.synced_at
-                """,
-                rows,
-            )
         count = len(rows)
     except Exception as e:
-        print(f"     ⚠️  Error syncing schedules: {e}")
+        print(f"     ⚠️  Error syncing schedules: {type(e).__name__}")
+        return ScheduleSyncResult('pending')
     
-    return count
+    return ScheduleSyncResult('legacy_synced', count)
 
 
 def sync_full_route(fb_client: firestore.Client, 
@@ -745,8 +768,11 @@ def sync_full_route(fb_client: firestore.Client,
         products_count = sync_products_from_firebase(fb_client, route_number)
         print(f"     ✓ Synced {products_count} products")
         
-        schedules_count = sync_schedules_from_firebase(fb_client, route_number, user_id)
-        print(f"     ✓ Synced {schedules_count} schedules")
+        schedules = sync_schedules_from_firebase(fb_client, route_number, user_id)
+        if not schedules.ready:
+            print(f"     Schedule sync is {schedules.status}; route is not ready")
+            return False
+        print(f"     ✓ Synced {schedules.count} schedules")
         
         # Mark as ready
         mark_route_ready(route_number, stores_count, products_count, 0)

@@ -392,7 +392,7 @@ class OrderAdjustmentReminderWorkerTests(unittest.TestCase):
         self.assertEqual(adjustment["reminderStatus"], "skipped")
         self.assertEqual(adjustment["reminderSkipReason"], "no_meaningful_lines")
 
-    def test_source_order_window_corrects_dormant_wrong_day_schedule_without_sending(self):
+    def test_unstamped_source_fails_closed_without_created_or_order_date_fallback(self):
         db = _build_db()
         _add_source_order(db)
         _add_adjustment(
@@ -404,8 +404,7 @@ class OrderAdjustmentReminderWorkerTests(unittest.TestCase):
             cutoffAtMs=1,
             reminderAtMs=1,
         )
-        expected_cutoff = int(datetime(2026, 7, 31, 14, 0, tzinfo=timezone.utc).timestamp() * 1000)
-        now_ms = expected_cutoff - 60 * 60_000
+        now_ms = int(datetime(2026, 7, 31, 13, 0, tzinfo=timezone.utc).timestamp() * 1000)
 
         with patch.object(worker.firestore, "transactional", side_effect=lambda fn: fn), patch.object(
             worker, "_send_expo_push", return_value={"sent": 1, "failed": 0}
@@ -415,9 +414,9 @@ class OrderAdjustmentReminderWorkerTests(unittest.TestCase):
         self.assertEqual(stats["claimed"], 0)
         send_push.assert_not_called()
         adjustment = db.root["routes"]["989567"]["_subcollections"]["orderAdjustments"]["adjustment-a"]
-        self.assertEqual(adjustment["adjustmentDate"], "2026-07-31")
-        self.assertEqual(adjustment["cutoffAtMs"], expected_cutoff)
-        self.assertEqual(adjustment["reminderStatus"], "pending")
+        self.assertEqual(adjustment["adjustmentDate"], "2026-08-02")
+        self.assertEqual(adjustment["reminderStatus"], "skipped")
+        self.assertEqual(adjustment["reminderSkipReason"], "window_unresolved")
 
     def test_missing_source_order_is_skipped_instead_of_using_stale_schedule(self):
         db = _build_db()
@@ -471,10 +470,10 @@ class OrderAdjustmentReminderWorkerTests(unittest.TestCase):
         )
         canonical_reminder = int(datetime(2026, 7, 31, 10, 45, tzinfo=timezone.utc).timestamp() * 1000)
         doc = next(iter(worker._pending_query(db, canonical_reminder, 10)))
-        # Simulate a stale query-era/source snapshot: the authoritative stamp is
-        # changed before the transaction reads it.
+        # Simulate a stale query-era/source snapshot: the server finalization
+        # instant changes before the transaction reads it.
         source_data = db.root["routes"]["989567"]["_subcollections"]["orders"]["order-a"]
-        source_data["scheduledOrder"] = _v2_stamp(date="2026-08-06")
+        source_data["submittedAt"] = datetime(2026, 8, 6, 18, 0, tzinfo=timezone.utc)
         future_reminder = int(datetime(2026, 8, 7, 10, 45, tzinfo=timezone.utc).timestamp() * 1000)
 
         with patch.object(worker.firestore, "transactional", side_effect=lambda fn: fn):
@@ -488,7 +487,7 @@ class OrderAdjustmentReminderWorkerTests(unittest.TestCase):
 
         # Put the source back on the due cycle and prove patch+claim uses one
         # canonical payload in the same transaction.
-        source_data["scheduledOrder"] = _v2_stamp()
+        source_data["submittedAt"] = datetime(2026, 7, 30, 18, 0, tzinfo=timezone.utc)
         adjustment_data["reminderAtMs"] = 1
         adjustment_data["reminderStatus"] = "pending"
         doc = next(iter(worker._pending_query(db, canonical_reminder + 5 * 60_000, 10)))
@@ -542,26 +541,78 @@ class OrderAdjustmentReminderWorkerTests(unittest.TestCase):
         self.assertIsNone(missing_schedule)
         self.assertEqual(missing_classification, "missing_source_order")
         self.assertEqual(missing_error, "missing_source_order")
-        self.assertIsNotNone(v1_schedule)
+        self.assertIsNone(v1_schedule)
         self.assertEqual(v1_classification, "v1_source")
-        self.assertIsNone(v1_error)
+        self.assertEqual(v1_error, "window_unresolved")
+
+    def test_present_malformed_anchor_never_falls_back_to_valid_legacy_authority(self):
+        adjustment_data = _add_adjustment(_build_db(), sourceOrderId="order-a")
+        for malformed_anchor in [None, {}, {"version": 1}, {
+            "version": 1,
+            "finalizedAtMs": 1787921220000,
+            "finalizedDate": "2026-08-29",
+            "timezone": "America/Denver",
+        }]:
+            with self.subTest(anchor=malformed_anchor):
+                schedule, classification, error = worker.expected_schedule_from_fresh_source(
+                    adjustment_data,
+                    {
+                        "adjustmentAnchor": malformed_anchor,
+                        "scheduledOrder": _v2_stamp(),
+                        "submittedAt": datetime(2026, 7, 30, 18, 0, tzinfo=timezone.utc),
+                    },
+                )
+                self.assertIsNone(schedule)
+                self.assertEqual(classification, "v2")
+                self.assertEqual(error, "invalid_adjustment_anchor")
 
     def test_present_malformed_stamp_never_falls_back_to_v1_timestamps(self):
         adjustment_data = _add_adjustment(_build_db(), sourceOrderId="order-a")
-        for malformed_stamp in [None, {}, {"version": 1}, {"version": 2, "date": "bad"}]:
+        # The reader-first version guard distinguishes unsupported evidence from
+        # malformed V2. Both still refuse scheduling without legacy fallback.
+        for malformed_stamp, expected_error in [
+            (None, "unsupported_schedule_version"),
+            ({}, "unsupported_schedule_version"),
+            ({"version": 1}, "unsupported_schedule_version"),
+            ({"version": 3}, "unsupported_schedule_version"),
+            ({"version": 4}, "unsupported_schedule_version"),
+            ({"version": 2, "date": "bad"}, "window_unresolved"),
+        ]:
             with self.subTest(stamp=malformed_stamp):
                 schedule, classification, error = worker.expected_schedule_from_fresh_source(
                     adjustment_data,
                     {
                         "scheduledOrder": malformed_stamp,
+                        "id": "order-a", "routeNumber": "989567",
                         "submittedAt": datetime(2099, 1, 1, tzinfo=timezone.utc),
                         "createdAt": datetime(2099, 1, 1, tzinfo=timezone.utc),
                         "orderDate": "2099-01-01",
                     },
                 )
                 self.assertIsNone(schedule)
-                self.assertEqual(classification, "v2")
-                self.assertEqual(error, "window_unresolved")
+                self.assertEqual(classification, "v3" if malformed_stamp == {"version": 3} else "v2")
+                self.assertEqual(error, expected_error)
+
+    def test_v3_source_is_not_claimed_or_sent_by_existing_worker(self):
+        db = _build_db()
+        _add_source_order(db, scheduledOrder={
+            **_v2_stamp(), "version": 3, "sendDate": "2026-07-30", "sendOffsetDays": 0,
+            "sourceRevision": 7, "sourceOwnerUid": "owner-1", "sourceRouteNumber": "989567",
+        }, scheduleKey="thursday", expectedLoadDate="2026-07-30", expectedDeliveryDate="2026-07-31",
+            adjustmentAnchor={"version": 1, "finalizedAtMs": 1785434400000,
+                              "finalizedDate": "2026-07-30", "timezone": "UTC"})
+        _add_adjustment(db, sourceOrderId="order-a", cutoffTimeLocal="11:00", reminderLeadMinutes=15)
+        now_ms = int(datetime(2026, 7, 31, 10, 50, tzinfo=timezone.utc).timestamp() * 1000)
+        with patch.object(worker.firestore, "transactional", side_effect=lambda fn: fn), patch.object(
+            worker, "_send_expo_push"
+        ) as send:
+            stats = worker.run_once(db, now_ms=now_ms, limit=10)
+        self.assertEqual(stats["claimed"], 0)
+        self.assertEqual(stats["sent"], 0)
+        send.assert_not_called()
+        data = db.root["routes"]["989567"]["_subcollections"]["orderAdjustments"]["adjustment-a"]
+        self.assertEqual(data["reminderStatus"], "skipped")
+        self.assertEqual(data["reminderSkipReason"], "unsupported_schedule_version")
 
     def test_no_lines_path_reads_fresh_source_before_first_write(self):
         db = _build_db()
@@ -635,13 +686,14 @@ class OrderAdjustmentReminderWorkerTests(unittest.TestCase):
         now_ms = int(datetime(2026, 7, 31, 10, 50, tzinfo=timezone.utc).timestamp() * 1000)
         with patch.object(worker, "claim_adjustment_reminder") as claim, patch.object(
             worker, "finish_adjustment_reminder"
-        ) as finish, patch.object(worker, "_send_expo_push") as send:
+        ) as finish, patch.object(worker, "_send_expo_push") as send, patch.object(worker, 'refresh_send_reminders') as refresh:
             summary = worker.audit_once(db, route_number="989567", now_ms=now_ms)
 
         self.assertEqual(before, db.root)
         claim.assert_not_called()
         finish.assert_not_called()
         send.assert_not_called()
+        refresh.assert_not_called()
         self.assertTrue(summary["dryRun"])
         self.assertEqual(summary["actions"]["claim_and_send"], 1)
         self.assertEqual(summary["classifications"]["v2"], 1)
