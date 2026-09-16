@@ -78,6 +78,19 @@ class MimeTests(unittest.TestCase):
         self.assertEqual((again, duplicates), ([], 1))
         self.assertTrue(all(key.startswith('statement-upload:') for key in store.docs))
 
+    def test_gmail_link_only_confirmation_is_restricted_to_google_verification(self):
+        msg = EmailMessage()
+        msg['From'], msg['Subject'] = intake.VERIFIER, '(Gmail Forwarding Confirmation'
+        link = 'https://mail.google.com/mail/vf-%5Btest-token%5D-proof'
+        msg.set_content(f'{ADDRESS}\nowner@gmail.com\n{link}\nhttps://mail.google.com/mail/uf-cancel')
+        self.assertEqual(intake.parse_message(msg.as_bytes(), ADDRESS, 'owner@gmail.com'), ({'verificationUrl':link}, []))
+        with self.assertRaises(ValueError):
+            intake.parse_message(msg.as_bytes(), ADDRESS, 'other@gmail.com')
+        for unsafe in ('https://mail.google.com.evil.test/mail/vf-token', 'https://mail.google.com/mail/uf-cancel', 'https://mail.google.com/mail/vf-token?redirect=https://evil.test'):
+            msg.set_content(f'{ADDRESS}\nowner@gmail.com\n{unsafe}')
+            with self.assertRaises(ValueError):
+                intake.parse_message(msg.as_bytes(), ADDRESS, 'owner@gmail.com')
+
 
 class RelayTests(unittest.TestCase):
     def setUp(self):

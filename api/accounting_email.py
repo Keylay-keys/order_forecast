@@ -77,6 +77,7 @@ def setup(store, route, method, body):
         result = dict(result)
         if time.time() - received.timestamp() > 3600:
             result.pop("verificationCode", None)
+            result.pop("verificationUrl", None)
         messages.append(dict(id=str(mid), receivedAt=received.isoformat(), status=status, **result))
     return dict(route=route, available=True, address=row[0] if row and row[2] else None,
                 forwarderEmail=row[1] if row else None, messages=messages,
@@ -168,9 +169,16 @@ def parse_message(raw, address, forwarder):
     if sender == VERIFIER:
         body = "\n".join(texts)
         match = re.search(r"confirmation code\s*:\s*([0-9]{6,12})\b", body, re.I)
-        if "gmail forwarding confirmation" in str(message.get("Subject", "")).lower() and address in body and forwarder.lower() in body.lower() and match:
-            return {"verificationCode": match[1]}, []
-        raise ValueError("A Gmail setup message arrived, but its code could not be read. Add the forwarding address again in Gmail.")
+        if "gmail forwarding confirmation" in str(message.get("Subject", "")).lower() and address in body and forwarder.lower() in body.lower():
+            if match:
+                return {"verificationCode": match[1]}, []
+            # Gmail also sends link-only confirmations. Never expose arbitrary
+            # email links, cancellation links, alternate hosts or redirects.
+            links = re.findall(r"https://[^\s<>]+", body)
+            for link in links:
+                if len(link) <= 1000 and re.fullmatch(r"https://mail\.google\.com/mail/vf-[A-Za-z0-9_%=-]+", link):
+                    return {"verificationUrl": link}, []
+        raise ValueError("A Gmail setup message arrived, but its confirmation could not be read. Add the forwarding address again in Gmail.")
     if not files:
         raise ValueError("No PDF attachment found. Forward the settlement email with its PDF attached.")
     return {}, files

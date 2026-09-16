@@ -58,7 +58,7 @@ async def process(job, db):
         result = job["result"]
         if not result.get("saved"):
             metadata, files = intake.parse_message(job["raw"], job["address"], job["forwarder"])
-            if metadata.get("verificationCode"):
+            if metadata.get("verificationCode") or metadata.get("verificationUrl"):
                 finish(job, "verification", metadata)
                 return
             with accounting_transaction(job["uid"], job["route"]) as store:
