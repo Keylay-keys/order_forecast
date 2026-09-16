@@ -17,6 +17,7 @@ from .accounting_domain import fail
 from .accounting_store import accounting_transaction
 from .dependencies import get_pg_connection, return_pg_connection
 from . import accounting_evidence as evidence
+from . import accounting_email_sender as inbox
 
 MAX_EMAIL = 25 * 1024 * 1024
 SUPPLIER = "notification@gruma.com"
@@ -56,9 +57,7 @@ def setup(store, route, method, body):
     cur = store.cursor
     if method == "POST":
         # This field is supplied exclusively by the verified Firebase token.
-        email = body.get("_verifiedEmail", "").lower()
-        if not re.fullmatch(r"[^\s@]{1,64}@[^\s@]{1,189}", email) or len(email) > 254:
-            fail("Verify your sign-in email before setting up forwarding.", 403)
+        email = inbox.normalize_email(body.get("_verifiedEmail", ""))
         cur.execute("""INSERT INTO accounting_email_addresses (address,firebase_uid,route_number,forwarder_email)
             VALUES (%s,%s,%s,%s) ON CONFLICT (firebase_uid,route_number) DO NOTHING""",
             ("s-" + secrets.token_hex(16) + "@" + domain(), *store.scope, email))
@@ -69,18 +68,22 @@ def setup(store, route, method, body):
     cur.execute("""SELECT o.message_id,o.received_at,j.status,j.result,j.attempts,j.lease_expires_at<now()
         FROM accounting_email_originals o JOIN accounting_email_jobs j USING(message_id)
         WHERE o.firebase_uid=%s AND o.route_number=%s ORDER BY o.received_at DESC LIMIT 30""", store.scope)
+    message_rows = cur.fetchall()
     messages = []
-    for mid, received, status, result, attempts, expired in cur.fetchall():
+    verified_at = (store.get(inbox.KEY) or {}).get("verifiedAt", 0)
+    for mid, received, status, result, attempts, expired in message_rows:
         if status == "reading" and attempts >= 3 and expired:
             status, result = "needs_attention", {"detail": "Processing stopped. Upload the PDF to continue."}
         # Verification codes expire from the UI, while the original evidence stays intact.
         result = dict(result)
-        if time.time() - received.timestamp() > 3600:
+        if time.time() - received.timestamp() > 3600 or received.timestamp() < verified_at:
             result.pop("verificationCode", None)
             result.pop("verificationUrl", None)
         messages.append(dict(id=str(mid), receivedAt=received.isoformat(), status=status, **result))
     return dict(route=route, available=True, address=row[0] if row and row[2] else None,
                 forwarderEmail=row[1] if row else None, messages=messages,
+                loginEmail=body.get("_loginEmail", body.get("_verifiedEmail", "")),
+                inboxVerificationAvailable=inbox.available(), pendingInbox=inbox.pending(store),
                 gmailFilter=f"from:({SUPPLIER}) subject:(settlement {route}) has:attachment filename:pdf")
 
 
@@ -135,7 +138,7 @@ def parse_message(raw, address, forwarder):
         raise ValueError("The email sender could not be identified.")
     senders = getaddresses(message.get_all("From", []))
     if len(senders) != 1 or senders[0][1].lower() not in (forwarder.lower(), SUPPLIER, VERIFIER):
-        raise ValueError("Forward from your sign-in email or use your settlement forwarding rule.")
+        raise ValueError("Forward from your verified settlement inbox, or change your inbox in Email settlements.")
     # From is a routing restriction, not proof of sender identity. The private,
     # unguessable alias and signed provider relay are the authorization boundary.
     sender = senders[0][1].lower()

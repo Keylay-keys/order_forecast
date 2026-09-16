@@ -18,6 +18,7 @@ from ..accounting_domain import Accounting, fail, identifier
 from ..accounting_store import accounting_transaction
 from .. import accounting_evidence as evidence
 from .. import accounting_email as email_intake
+from .. import accounting_email_sender as email_sender
 
 router = APIRouter()
 logger = logging.getLogger("api.accounting")
@@ -104,6 +105,8 @@ def dispatch(store, route, today, method, path, body, files, refresh):
 
 
 def execute(uid, route, today, method, path, body, files, refresh, request_id, fingerprint):
+    if method == "POST" and path in ("email-intake/sender-code", "email-intake/sender-verify"):
+        return email_sender.configure(uid, route, path.split("/")[1], body, request_id, fingerprint)
     # PDF parsing can take seconds. Release the workspace lock while the bounded
     # reader runs so receipts, bills and other tabs can continue to save.
     prepared_analysis = None
@@ -204,7 +207,16 @@ async def accounting_request(
                 fail("Verify your sign-in email before setting up forwarding.", 403)
             body = {"_verifiedEmail": decoded_token.get("email", "")}
             hash_input = body
+        elif path in ("email-intake/sender-code", "email-intake/sender-verify"):
+            allowed = {"email"} if path.endswith("sender-code") else {"code", "challengeId"}
+            if method != "POST" or set(body) != allowed:
+                fail("Invalid inbox verification request.")
+            body = {**body, "_verifiedEmail": decoded_token.get("email", "") if decoded_token.get("email_verified") else ""}
+            hash_input = body
         fingerprint = hashlib.sha256(json.dumps([method, path, hash_input], sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+    if method == "GET" and path == "email-intake":
+        body = {"_loginEmail": decoded_token.get("email", "")}
 
     def refresh():
         snapshot = db.collection("routes").document(route).collection("stores").select(["name", "number"]).limit(1001).stream()
