@@ -149,9 +149,12 @@ def _query_collection(
         query = query.where("status", "==", status)
 
     if cursor:
+        if not re.fullmatch(r"[A-Za-z0-9_.-]{1,256}", cursor):
+            raise HTTPException(400, "Invalid cursor")
         cursor_doc = collection_ref.document(cursor).get()
-        if cursor_doc.exists:
-            query = query.start_after(cursor_doc)
+        if not cursor_doc.exists:
+            raise HTTPException(400, "Invalid cursor")
+        query = query.start_after(cursor_doc)
 
     return list(query.limit(limit).stream())
 
@@ -168,6 +171,102 @@ def _list_active_docs(
     if status in {"archived", "archived_server"}:
         return []
     return _query_collection(active_ref, status=status, limit=limit, cursor=cursor)
+
+
+def _list_searchable_active_docs(
+    db: firestore.Client,
+    route: str,
+    *,
+    status: Optional[str],
+    cursor: Optional[str],
+    batch_size: int,
+) -> List[firestore.DocumentSnapshot]:
+    """Read the complete active search space in bounded Firestore batches.
+
+    Text filters use normalized substring matching, so Firestore cannot apply
+    them directly. Fetching only the newest page before applying those filters
+    made older invoices impossible to find on high-volume routes.
+    """
+    docs: List[firestore.DocumentSnapshot] = []
+    next_cursor = cursor
+
+    while True:
+        batch = _list_active_docs(
+            db,
+            route,
+            status=status,
+            limit=batch_size,
+            cursor=next_cursor,
+        )
+        if not batch:
+            break
+
+        docs.extend(batch)
+        if len(batch) < batch_size:
+            break
+
+        new_cursor = batch[-1].id
+        if new_cursor == next_cursor:
+            logger.warning("POS search cursor did not advance for route %s", route)
+            break
+        next_cursor = new_cursor
+
+    return docs
+
+
+def _active_items_page(
+    *,
+    route: str,
+    db: firestore.Client,
+    status: Optional[str],
+    store: Optional[str],
+    invoice_number: Optional[str],
+    start_date: Optional[str],
+    end_date: Optional[str],
+    limit: int,
+    cursor: Optional[str],
+) -> Tuple[List[Dict[str, Any]], Optional[str], bool]:
+    """Return one Firebase page, scanning past non-matching documents."""
+    batch_size = max(limit * 2, 100)
+    scan_cursor = cursor
+    items: List[Dict[str, Any]] = []
+
+    while True:
+        batch = _list_active_docs(
+            db,
+            route,
+            status=status,
+            limit=batch_size,
+            cursor=scan_cursor,
+        )
+        if not batch:
+            return items, None, False
+
+        for doc in batch:
+            invoice = _normalize_invoice(doc, collection_name=ACTIVE_COLLECTION)
+            if not _matches_filters(invoice, store, invoice_number, start_date, end_date):
+                continue
+            items.append(invoice)
+            if len(items) >= limit:
+                return items, doc.id, True
+
+        if len(batch) < batch_size:
+            return items, None, False
+
+        new_cursor = batch[-1].id
+        if new_cursor == scan_cursor:
+            logger.warning("POS pagination cursor did not advance for route %s", route)
+            return items, None, False
+        scan_cursor = new_cursor
+
+
+def _offset_from_cursor(cursor: Optional[str], *, prefix: str) -> int:
+    if not cursor:
+        return 0
+    match = re.fullmatch(rf"{re.escape(prefix)}:(\d+)", cursor)
+    if not match:
+        raise HTTPException(400, "Invalid cursor")
+    return int(match.group(1))
 
 
 def _load_archived_metadata(route: str, invoice_id: str) -> Optional[Dict[str, Any]]:
@@ -236,9 +335,28 @@ def _merged_items(
     end_date: Optional[str],
     limit: int,
     cursor: Optional[str],
-) -> List[Dict[str, Any]]:
+) -> Tuple[List[Dict[str, Any]], Optional[str], bool]:
+    if status == "active":
+        return _active_items_page(
+            route=route,
+            db=db,
+            status=status,
+            store=store,
+            invoice_number=invoice_number,
+            start_date=start_date,
+            end_date=end_date,
+            limit=limit,
+            cursor=cursor,
+        )
+
     per_collection_limit = max(limit * 2, 100)
-    active_docs = _list_active_docs(db, route, status=status, limit=per_collection_limit, cursor=cursor)
+    active_docs = _list_searchable_active_docs(
+        db,
+        route,
+        status=status,
+        cursor=None,
+        batch_size=per_collection_limit,
+    )
 
     items: List[Dict[str, Any]] = []
     seen_ids = set()
@@ -259,7 +377,11 @@ def _merged_items(
                 seen_ids.add(invoice["id"])
 
     items.sort(key=lambda item: (_to_epoch_ms(item.get("createdAt")) or 0), reverse=True)
-    return items[:limit]
+    offset = _offset_from_cursor(cursor, prefix=status or "all")
+    page = items[offset:offset + limit]
+    has_more = offset + len(page) < len(items)
+    next_cursor = f"{status or 'all'}:{offset + len(page)}" if has_more else None
+    return page, next_cursor, has_more
 
 
 def _find_active_invoice_doc(db: firestore.Client, invoice_id: str) -> Optional[firestore.DocumentSnapshot]:
@@ -443,7 +565,7 @@ async def list_pos_invoices(
     startDate: Optional[str] = Query(default=None, description="YYYY-MM-DD"),
     endDate: Optional[str] = Query(default=None, description="YYYY-MM-DD"),
     limit: int = Query(default=50, ge=1, le=200),
-    cursor: Optional[str] = Query(default=None, description="Last document ID (active-only compatibility)"),
+    cursor: Optional[str] = Query(default=None, description="Cursor returned by the prior response"),
     decoded_token: dict = Depends(verify_firebase_token),
     db: firestore.Client = Depends(get_firestore),
 ) -> Dict[str, Any]:
@@ -455,7 +577,7 @@ async def list_pos_invoices(
     start_date = _validate_date(startDate)
     end_date = _validate_date(endDate)
 
-    items = _merged_items(
+    items, next_cursor, has_more = _merged_items(
         route=route,
         db=db,
         status=status,
@@ -470,7 +592,8 @@ async def list_pos_invoices(
     return {
         "routeNumber": route,
         "items": items,
-        "nextCursor": None,
+        "nextCursor": next_cursor,
+        "hasMore": has_more,
     }
 
 
