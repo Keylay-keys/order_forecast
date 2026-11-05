@@ -9,8 +9,6 @@ reconciles every printed settlement equation, and writes one local JSON file.
 
 from __future__ import annotations
 
-import argparse
-import csv
 import hashlib
 import json
 import re
@@ -35,6 +33,7 @@ ADJUSTMENT_FIELDS = (
     ("SBT credits", "sbtCredits", "SBT credits"),
     ("SBT Buybacks", "sbtBuybacks", "SBT buybacks"),
     ("Sales Incentives", "salesIncentives", "Sales incentives"),
+    ("Distributor Security Deposits", "distributorSecurityDeposits", "Distributor security deposits"),
     ("Prior Adjustments", "priorAdjustments", "Prior adjustments"),
     ("Current Adjustments", "currentAdjustments", "Current adjustments"),
 )
@@ -66,6 +65,20 @@ def required(pattern: str, text: str, field: str, group: int = 1) -> str:
 def optional_money(pattern: str, text: str, group: int = 1) -> Decimal | None:
     match = re.search(pattern, text, re.IGNORECASE | re.MULTILINE)
     return money(match.group(group)) if match else None
+
+
+def optional_zero_money(pattern: str, label_pattern: str, text: str, field: str) -> Decimal:
+    """Return zero only when an optional printed row is wholly absent.
+
+    A present label with an unreadable amount remains a hard failure. Later
+    statement equations independently verify that an omitted row was truly zero.
+    """
+    value = optional_money(pattern, text)
+    if value is not None:
+        return value
+    if re.search(label_pattern, text, re.IGNORECASE | re.MULTILINE):
+        raise ValueError(f"Missing required settlement field: {field}")
+    return Decimal("0.00")
 
 
 def safe_manifest_pdf(root: Path, relative_value: str) -> Path:
@@ -146,8 +159,11 @@ def extract_statement(row: dict[str, str], root: Path, generated_at: str) -> dic
     non_sbt_gross = money(
         required(r"^\s*Gross Sales - Bybk\s+([-0-9,]+\.\d{2})\s*$", page_one, "gross sales less buyback")
     )
-    sbt_gross = money(
-        required(r"^\s*SBTv1 Gross\s+([-0-9,]+\.\d{2})\s*$", page_one, "SBT gross")
+    sbt_gross = optional_zero_money(
+        r"^\s*SBTv1 Gross\s+([-0-9,]+\.\d{2})\s*$",
+        r"^\s*SBTv1 Gross\b",
+        page_one,
+        "SBT gross",
     )
     margin_credited = money(
         required(r"^\s*Total Margin Discount\s+([-0-9,]+\.\d{2})\s*$", page_one, "total margin discount")
@@ -339,6 +355,9 @@ def select_weekly_rows(rows: list[dict[str, str]], route: str) -> list[dict[str,
 
 
 def build_fixture(manifest: Path, archive_root: Path, output: Path, route: str) -> dict[str, Any]:
+    # Production extraction imports this module without building a CSV fixture.
+    import csv
+
     rows = list(csv.DictReader(manifest.open(encoding="utf-8")))
     if not rows:
         raise ValueError("Settlement manifest is empty")
@@ -391,6 +410,8 @@ def build_fixture(manifest: Path, archive_root: Path, output: Path, route: str) 
 
 
 def main() -> None:
+    import argparse
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--archiveRoot", type=Path, required=True)

@@ -227,6 +227,21 @@ class LowQtyNotificationReliabilityTests(unittest.TestCase):
         self.assertIn('LOW_QTY_NOTIFICATION_DRY_RUN: "false"', config)
         self.assertIn('LOW_QTY_RECIPIENT_SOURCE: "postgres"', config)
         self.assertIn('LOW_QTY_CLAIM_LEASE_SECONDS: "300"', config)
+        self.assertIn('GRPC_DNS_RESOLVER: native', config)
+
+    def test_firestore_worker_manifests_use_native_grpc_dns(self):
+        root = Path(__file__).resolve().parents[3]
+        relative_paths = (
+            "k8s/overlays/lab/order-forecast-configmap.yaml",
+            "k8s/overlays/lab/order-adjustment-reminders-configmap.yaml",
+            "k8s/overlays/lab/team-task-reminders-configmap.yaml",
+            "k8s/overlays/lab/low-qty-notifications-configmap.yaml",
+        )
+
+        for relative_path in relative_paths:
+            with self.subTest(relative_path=relative_path):
+                manifest = (root / relative_path).read_text()
+                self.assertIn("GRPC_DNS_RESOLVER: native", manifest)
 
     def test_scheduled_worker_rejects_dry_run_before_firestore(self):
         with patch.dict(

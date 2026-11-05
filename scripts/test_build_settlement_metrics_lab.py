@@ -1,11 +1,12 @@
 import tempfile
 import unittest
+from decimal import Decimal
 from pathlib import Path
 
 try:
-    from .build_settlement_metrics_lab import safe_manifest_pdf, select_weekly_rows
+    from .build_settlement_metrics_lab import optional_zero_money, safe_manifest_pdf, select_weekly_rows
 except ImportError:
-    from build_settlement_metrics_lab import safe_manifest_pdf, select_weekly_rows
+    from build_settlement_metrics_lab import optional_zero_money, safe_manifest_pdf, select_weekly_rows
 
 
 class SettlementMetricsLabBuilderTests(unittest.TestCase):
@@ -40,6 +41,14 @@ class SettlementMetricsLabBuilderTests(unittest.TestCase):
                 safe_manifest_pdf(root, "../outside.pdf")
             with self.assertRaisesRegex(ValueError, "Unsafe normalized PDF path"):
                 safe_manifest_pdf(root, "/tmp/outside.pdf")
+
+    def test_optional_zero_money_distinguishes_absent_from_unreadable_rows(self):
+        pattern = r"^\s*SBTv1 Gross\s+([-0-9,]+\.\d{2})\s*$"
+        label = r"^\s*SBTv1 Gross\b"
+        self.assertEqual(optional_zero_money(pattern, label, "Gross Sales - Bybk 13,010.85", "SBT gross"), Decimal("0.00"))
+        self.assertEqual(optional_zero_money(pattern, label, "SBTv1 Gross 1,234.56", "SBT gross"), Decimal("1234.56"))
+        with self.assertRaisesRegex(ValueError, "Missing required settlement field: SBT gross"):
+            optional_zero_money(pattern, label, "SBTv1 Gross unreadable", "SBT gross")
 
 
 if __name__ == "__main__":

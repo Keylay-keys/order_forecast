@@ -978,14 +978,18 @@ def _process_claimed_job(
             _retry_or_fail_job(job, f"authority_revision_unavailable:{exc}")
             return "retry_or_error"
 
-    is_fresh, reason = _evaluate_job_freshness(
-        fb_client,
-        route_number,
-        delivery_date,
-        schedule_key,
-        job_type,
-        desired_revision,
-    )
+    try:
+        is_fresh, reason = _evaluate_job_freshness(
+            fb_client,
+            route_number,
+            delivery_date,
+            schedule_key,
+            job_type,
+            desired_revision,
+        )
+    except Exception as exc:
+        _retry_or_fail_job(job, f"freshness_check_failed:{exc}")
+        return "retry_or_error"
     if is_fresh:
         _finish_job(job_key, "skipped_fresh", skipped_reason=reason)
         return "skipped_fresh"

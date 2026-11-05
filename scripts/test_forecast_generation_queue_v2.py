@@ -144,6 +144,32 @@ class ForecastGenerationFreshnessV2Test(unittest.TestCase):
         finish.assert_called_once_with(job["job_key"], "error", error_text=error)
         retry.assert_not_called()
 
+    def test_worker_requeues_when_firestore_freshness_check_fails(self):
+        job = {
+            "job_key": "988200::tuesday::2026-10-05",
+            "route_number": "988200",
+            "schedule_key": "tuesday",
+            "delivery_date": "2026-10-05",
+            "job_type": queue.JOB_TYPE_FORECAST_ONLY,
+            "desired_revision": "revision-1",
+        }
+        with patch.object(
+            queue,
+            "_evaluate_job_freshness",
+            side_effect=RuntimeError("firestore unavailable"),
+        ), patch.object(queue, "_retry_or_fail_job") as retry, patch.object(
+            queue, "generate_forecast"
+        ) as generate:
+            result = queue._process_claimed_job(
+                object(), "/tmp/service-account.json", job
+            )
+
+        self.assertEqual(result, "retry_or_error")
+        retry.assert_called_once_with(
+            job, "freshness_check_failed:firestore unavailable"
+        )
+        generate.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()
