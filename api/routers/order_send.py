@@ -8,7 +8,13 @@ from ..errors import StructuredApiError
 from ..middleware.rate_limit import limiter, authenticated_or_ip_key
 from ..models import OrderCreateRequest
 from ..order_adjustment_schedule_v2_release import request_capabilities
-from ..order_send_evidence import create_send_order, read_send_evidence, resolve_send_order_window
+from ..order_send_evidence import (
+    create_send_order,
+    is_send_order_id,
+    order_with_send_evidence,
+    read_send_evidence,
+    resolve_send_order_window,
+)
 from ..schedule_source_contract import validate_scope
 from ..order_send_rollout import route_enabled
 from .schedule_source import _parse
@@ -18,6 +24,7 @@ logger = logging.getLogger('api.order_send')
 CAPABILITY = 'order-send-v1'
 ENABLED_ENV = 'ORDER_SEND_CREATION_ENABLED'
 ROUTES_ENV = 'ORDER_SEND_PILOT_ROUTES'
+MAX_EVIDENCE_BATCH = 50
 
 
 def _now_ms():
@@ -77,6 +84,60 @@ def read_saved(db, uid, route, order_id):
             raise StructuredApiError(404, 'Order not found.', 'ORDER_NOT_FOUND')
         return read_send_evidence(db, order, transaction)
     return read(db.transaction(max_attempts=3))
+
+
+def parse_batch_body(value):
+    if (
+        type(value) is not dict
+        or set(value) != {'orderIds'}
+        or type(value['orderIds']) is not list
+        or not 1 <= len(value['orderIds']) <= MAX_EVIDENCE_BATCH
+        or any(not is_send_order_id(order_id) for order_id in value['orderIds'])
+        or len(value['orderIds']) != len(set(value['orderIds']))
+    ):
+        raise StructuredApiError(422, 'Invalid order evidence request.', 'ORDER_EVIDENCE_BATCH_INVALID')
+    return value['orderIds']
+
+
+def read_saved_batch(db, uid, route, order_ids):
+    """Authorize once, then bind exact order and evidence snapshots in one read."""
+    from google.cloud import firestore
+    from ..order_send_access import read_send_route_access
+
+    @firestore.transactional
+    def read(transaction):
+        read_send_route_access(db, transaction, uid, route)
+        order_paths = [f'routes/{route}/orders/{order_id}' for order_id in order_ids]
+        evidence_paths = [f'orderSendEvidence/{order_id}' for order_id in order_ids]
+        references = [db.document(path) for path in [*order_paths, *evidence_paths]]
+        snapshots = {snapshot.reference.path: snapshot for snapshot in transaction.get_all(references)}
+        result = []
+        for order_id, order_path, evidence_path in zip(order_ids, order_paths, evidence_paths):
+            order_snapshot = snapshots.get(order_path)
+            order = order_snapshot.to_dict() if order_snapshot and order_snapshot.exists else None
+            if not order or order.get('id') != order_id or order.get('routeNumber') != route:
+                raise StructuredApiError(404, 'Order not found.', 'ORDER_NOT_FOUND')
+            evidence_snapshot = snapshots.get(evidence_path)
+            evidence = evidence_snapshot.to_dict() if evidence_snapshot and evidence_snapshot.exists else None
+            order_with_send_evidence(order, evidence)
+            result.append({'id': order_id, 'sendEvidence': evidence})
+        return result
+
+    return read(db.transaction(max_attempts=3))
+
+
+@router.post('/orders/send-evidence/batch')
+@limiter.limit('30/minute', key_func=authenticated_or_ip_key)
+async def post_send_evidence_batch(request: Request, response: Response,
+                                   route: str = Query(..., pattern=r'^[0-9]{1,10}$'),
+                                   decoded_token: dict = Depends(verify_firebase_token), db=Depends(get_firestore)):
+    await guard(route, decoded_token, db, request.headers)
+    order_ids = await _parse(request, parse_batch_body)
+    if any(order_id.split('-')[1] != route for order_id in order_ids):
+        raise StructuredApiError(422, 'Invalid order evidence request.', 'ORDER_EVIDENCE_BATCH_INVALID')
+    orders = await safe_call(read_saved_batch, db, decoded_token['uid'], route, order_ids)
+    response.headers['Cache-Control'] = 'private, no-store'
+    return {'routeNumber': route, 'orders': orders}
 
 
 @router.get('/orders/{order_id}/send-evidence')

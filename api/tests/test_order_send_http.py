@@ -2,12 +2,79 @@
 import logging
 import os
 import unittest
-from unittest.mock import AsyncMock, patch
+from datetime import date, datetime, timezone
+from unittest.mock import ANY, AsyncMock, patch
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from order_forecast.api.errors import StructuredApiError, install_api_error_handlers
+from order_forecast.api.order_schedule_evidence import build_evidence
+from order_forecast.api.order_send_evidence import legacy_order_stamp
 from order_forecast.api.routers import order_send as api
+
+
+class _BatchSnapshot:
+    def __init__(self, reference, data):
+        self.reference = reference
+        self.exists = data is not None
+        self._data = data
+
+    def to_dict(self):
+        return self._data
+
+
+class _BatchReference:
+    def __init__(self, database, path):
+        self.database = database
+        self.path = path
+
+    def get(self, **_kwargs):
+        raise AssertionError('Batch evidence reads must not fall back to serial document reads.')
+
+
+class _BatchCollection:
+    def __init__(self, database, path):
+        self.database = database
+        self.path = path
+
+    def document(self, name):
+        return _BatchReference(self.database, f'{self.path}/{name}')
+
+
+class _BatchTransaction:
+    def __init__(self, database):
+        self.database = database
+
+    def get_all(self, references):
+        return self.database._get_all(references, self)
+
+
+class _BatchFirestore:
+    def __init__(self, documents):
+        self.documents = documents
+        self.batch_calls = []
+
+    def document(self, path):
+        return _BatchReference(self, path)
+
+    def collection(self, path):
+        return _BatchCollection(self, path)
+
+    def transaction(self, **_kwargs):
+        return _BatchTransaction(self)
+
+    def get_all(self, references, transaction=None):
+        return self._get_all(references, transaction)
+
+    def _get_all(self, references, transaction):
+        paths = [reference.path for reference in references]
+        self.batch_calls.append((paths, transaction))
+        # Firestore does not promise request ordering. Returning the snapshots in
+        # reverse proves the response is rebound by exact document path and ID.
+        return [
+            _BatchSnapshot(reference, self.documents.get(reference.path))
+            for reference in reversed(list(references))
+        ]
 
 
 class SendHttpTests(unittest.TestCase):
@@ -19,17 +86,21 @@ class SendHttpTests(unittest.TestCase):
         app.dependency_overrides[api.verify_firebase_token] = lambda: {'uid': 'owner'}
         app.dependency_overrides[api.get_firestore] = lambda: object()
         self.id = 'order-989262-send-' + 'a' * 64
-        self.body = {'routeNumber': '989262', 'deliveryDate': '2026-09-14', 'scheduleKey': 'tuesday',
+        self.body = {'routeNumber': '989262', 'deliveryDate': date.today().isoformat(), 'scheduleKey': 'tuesday',
                      'expectedScheduleRevision': 1, 'requestId': 'http-send-order-request-0001'}
         self.headers = {'x-routespark-capabilities': api.CAPABILITY}
         self.url = '/api/orders/send?route=989262'
         self.read_url = f'/api/orders/{self.id}/send-evidence?route=989262'
+        self.batch_url = '/api/orders/send-evidence/batch?route=989262'
         patches = [patch.dict(os.environ, {api.ENABLED_ENV: 'true', api.ROUTES_ENV: '989262'}),
                    patch.object(api.limiter, 'enabled', False),
                    patch.object(api, 'require_route_feature_access', new=AsyncMock()),
                    patch.object(api, 'create_send_order', return_value={
                        'order': {'id': self.id}, 'sendEvidence': {'test': True}, 'replayed': False}),
-                   patch.object(api, 'read_saved', return_value={'test': True})]
+                   patch.object(api, 'read_saved', return_value={'test': True}),
+                   patch.object(api, 'read_saved_batch', create=True, return_value=[
+                       {'id': self.id, 'sendEvidence': {'test': True}},
+                   ])]
         self.mocks = [p.start() for p in patches]
         for p in patches: self.addCleanup(p.stop)
         self.client = TestClient(app)
@@ -120,6 +191,129 @@ class SendHttpTests(unittest.TestCase):
             self.mocks[2].side_effect = StructuredApiError(403, 'Denied', 'ROUTE_ACCESS_DENIED')
             self.assertEqual(self.client.get(url, headers=self.headers).status_code, 403)
             read.assert_called_once()
+
+    def test_batch_read_requires_capability_and_one_route_authorization(self):
+        body = {'orderIds': [self.id]}
+        self.assertEqual(self.client.post(self.batch_url, json=body).status_code, 409)
+        self.mocks[5].assert_not_called()
+        self.mocks[2].reset_mock()
+
+        response = self.client.post(self.batch_url, json=body, headers=self.headers)
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.headers['cache-control'], 'private, no-store')
+        self.assertEqual(response.json(), {
+            'routeNumber': '989262',
+            'orders': [{'id': self.id, 'sendEvidence': {'test': True}}],
+        })
+        self.mocks[5].assert_called_once_with(
+            ANY, 'owner', '989262', [self.id],
+        )
+        self.mocks[2].assert_awaited_once()
+
+    def test_batch_read_rejects_unbounded_ambiguous_or_cross_route_input(self):
+        other_route = 'order-111111-send-' + 'b' * 64
+        too_many = [f"order-989262-send-{value:064x}" for value in range(51)]
+        bodies = [
+            {},
+            {'orderIds': []},
+            {'orderIds': [self.id, self.id]},
+            {'orderIds': [other_route]},
+            {'orderIds': too_many},
+            {'orderIds': [self.id], 'extra': True},
+            {'orderIds': 'not-a-list'},
+        ]
+        for body in bodies:
+            with self.subTest(body_type=type(body.get('orderIds')).__name__):
+                response = self.client.post(self.batch_url, json=body, headers=self.headers)
+                self.assertEqual(response.status_code, 422, response.text)
+        self.mocks[5].assert_not_called()
+
+    def test_batch_read_denies_before_parsing_and_sanitizes_reader_failures(self):
+        body = {'orderIds': [self.id]}
+        self.mocks[2].side_effect = StructuredApiError(403, 'Denied', 'ROUTE_ACCESS_DENIED')
+        self.assertEqual(self.client.post(self.batch_url, content='not-json', headers=self.headers).status_code, 403)
+        self.mocks[5].assert_not_called()
+
+        self.mocks[2].side_effect = None
+        self.mocks[5].side_effect = RuntimeError('private database contents')
+        response = self.client.post(self.batch_url, json=body, headers=self.headers)
+        self.assertEqual(response.status_code, 503)
+        self.assertNotIn('private database contents', response.text)
+
+
+class SendBatchStorageTests(unittest.TestCase):
+    def test_batch_reader_uses_one_bounded_firestore_read_and_preserves_request_order(self):
+        reader = getattr(api, 'read_saved_batch', None)
+        self.assertTrue(callable(reader), 'The bounded batch evidence reader is not implemented.')
+
+        route = '989262'
+        owner = 'owner'
+        first_id = f"order-{route}-send-{'1' * 64}"
+        second_id = f"order-{route}-send-{'2' * 64}"
+        created_at = datetime(2026, 9, 11, 13, tzinfo=timezone.utc)
+        created_at_ms = int(created_at.timestamp() * 1000)
+        control = {
+            'version': 3,
+            'revision': 7,
+            'ownerUid': owner,
+            'routeNumber': route,
+            'timezone': 'America/Denver',
+        }
+        cycle = {
+            'scheduleVersion': 3,
+            'orderDay': 2,
+            'sendOffsetDays': 2,
+            'loadOffsetDays': 6,
+            'deliveryOffsetDays': 6,
+            'loadDay': 1,
+            'deliveryDay': 1,
+            'needsScheduleReview': False,
+        }
+        stamp = build_evidence(control, [cycle], '2026-09-14', 'tuesday')
+
+        def records(order_id, request_hash):
+            order = {
+                'id': order_id,
+                'routeNumber': route,
+                'userId': owner,
+                'scheduleKey': 'tuesday',
+                'expectedLoadDate': '2026-09-14',
+                'expectedDeliveryDate': '2026-09-14',
+                'scheduledOrder': legacy_order_stamp(stamp),
+                'createdAt': created_at,
+            }
+            evidence = {
+                'version': 1,
+                'policy': 'send_next_day_v1',
+                'orderId': order_id,
+                'createdAtMs': created_at_ms,
+                'scheduledOrder': stamp,
+                'requestHash': request_hash,
+            }
+            return order, evidence
+
+        first_order, first_evidence = records(first_id, 'a' * 64)
+        second_order, second_evidence = records(second_id, 'b' * 64)
+        documents = {
+            f'routes/{route}/orders/{first_id}': first_order,
+            f'orderSendEvidence/{first_id}': first_evidence,
+            f'routes/{route}/orders/{second_id}': second_order,
+            f'orderSendEvidence/{second_id}': second_evidence,
+        }
+        database = _BatchFirestore(documents)
+
+        with patch('google.cloud.firestore.transactional', side_effect=lambda function: function), patch(
+            'order_forecast.api.order_send_access.read_send_route_access',
+        ) as authorize:
+            result = reader(database, owner, route, [second_id, first_id])
+
+        authorize.assert_called_once()
+        self.assertEqual(result, [
+            {'id': second_id, 'sendEvidence': second_evidence},
+            {'id': first_id, 'sendEvidence': first_evidence},
+        ])
+        self.assertEqual(len(database.batch_calls), 1)
+        self.assertEqual(set(database.batch_calls[0][0]), set(documents))
 
 
 if __name__ == '__main__': unittest.main()
