@@ -18,6 +18,7 @@ CATEGORIES = frozenset("fuel storage vehicle_note vehicle_maintenance vehicle_in
 PAYMENT_METHODS = frozenset("card bank cash check other".split())
 RECEIPT_METHODS = PAYMENT_METHODS - {"card"}
 UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$", re.I)
+EVIDENCE_UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[45][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$", re.I)
 STORE_ID = re.compile(r"^[A-Za-z0-9_-]{1,50}$")
 CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 LIMIT = 100_000_000
@@ -62,6 +63,13 @@ def day(value):
 def identifier(value):
     if not isinstance(value, str) or not UUID.fullmatch(value):
         fail("Invalid record identifier.")
+    return value
+
+
+def evidence_identifier(value):
+    """Accept random v4 IDs and deterministic v5 IDs only for evidence files."""
+    if not isinstance(value, str) or not EVIDENCE_UUID.fullmatch(value):
+        fail("Invalid evidence identifier.")
     return value
 
 
@@ -290,6 +298,8 @@ class Accounting:
                 current = dict(id=str(uuid4()), createdAt=now())
                 ledger["remittances"].append(current)
             current.update(value, updatedAt=now())
+            if current.get("paymentAdvice") and (value["receivedDate"] != current["paymentAdvice"]["paymentDate"] or value["amountCents"] != current["paymentAdvice"]["amountCents"]):
+                current.pop("paymentAdvice")
         else:
             fail()
         return self.save("money-in", ledger)
@@ -310,12 +320,13 @@ class Accounting:
 
     def route_stores(self, method, body, refresh=None):
         ledger = self.load("route-stores")
-        if method == "GET":
-            return ledger
-        fields(body, ("revision", "action", "selectedStoreIds", "handheldStoreIds"), ("action",))
-        if method != "POST":
-            fail()
-        if body["action"] == "refresh" and set(body) == {"action"}:
+        if method != "GET":
+            fields(body, ("revision", "action", "selectedStoreIds", "handheldStoreIds"), ("action",))
+            if method != "POST":
+                fail()
+        # Project the authorized route's current directory without writing on GET.
+        # Only explicit selection/refresh commands persist a snapshot or revision.
+        if refresh is not None and (method == "GET" or method == "POST" and body.get("action") in ("select", "refresh")):
             stores = refresh()
             if type(stores) is not list or len(stores) > 1000:
                 fail("Route stores could not be verified.", 503)
@@ -329,6 +340,11 @@ class Accounting:
                     text(store["number"], 60)
                 ids.add(store["id"])
             ledger.update(stores=sorted(stores, key=lambda s: s["name"].lower()), refreshedAt=now())
+        if method == "GET":
+            return ledger
+        if body["action"] == "refresh" and set(body) == {"action"}:
+            if refresh is None:
+                fail("Route stores could not be verified.", 503)
         elif body["action"] == "select":
             self.revision(ledger, body)
             selected = body.get("selectedStoreIds")

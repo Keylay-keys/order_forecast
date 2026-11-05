@@ -2,6 +2,7 @@
 """Bounded cluster single-PDF reader. Never writes financial records."""
 import importlib.util
 import json
+import os
 import re
 import resource
 import subprocess
@@ -9,6 +10,15 @@ import sys
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
+
+if __package__:
+    from .accounting_statement_timestamp import printed_issued_at
+    from .accounting_pdf_process import run_bounded
+else:
+    # Isolated Python startup omits site hooks and implicit script-path imports.
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from accounting_statement_timestamp import printed_issued_at
+    from accounting_pdf_process import run_bounded
 
 spec = importlib.util.spec_from_file_location("settlements", Path(__file__).resolve().parents[1] / "scripts/build_settlement_metrics_lab.py")
 legacy = importlib.util.module_from_spec(spec)
@@ -20,13 +30,12 @@ def cents(value):
 
 
 def analyze(pdf, route):
-    info = subprocess.run(["pdfinfo", str(pdf)], capture_output=True, text=True, check=True, timeout=10).stdout
+    sandbox = "/usr/local/bin/routespark-pdf-sandbox"
+    info = run_bounded([sandbox, "pdfinfo", str(pdf), str(os.getpid())], stdout_limit=64 * 1024, timeout=10).decode("utf-8")
     pages = int(legacy.required(r"^Pages:\s+(\d+)$", info, "pages"))
     if not 1 <= pages <= 100:
         raise ValueError("Page limit")
-    text = subprocess.run(["pdftotext", "-layout", str(pdf), "-"], capture_output=True, text=True, check=True, timeout=20).stdout
-    if len(text) > 4 * 1024 * 1024:
-        raise ValueError("Text limit")
+    text = run_bounded([sandbox, "pdftotext", str(pdf), str(os.getpid())], stdout_limit=4 * 1024 * 1024, timeout=20).decode("utf-8")
     first = text.split("\f")[0]
     # Printed identity only: the upload name is never a route, date or revision authority.
     billing = legacy.required(r"Billing Period\s+(\d{1,2}/\d{1,2}/\d{4}\s*-\s*\d{1,2}/\d{1,2}/\d{4})", first, "billing period")
@@ -73,7 +82,7 @@ def analyze(pdf, route):
             issues.append(f'{label} could not be read; it has not been treated as zero.')
     if cash_state == "unknown":
         issues.append("Net Cash Sales could not be read. Cash-account setup is unknown.")
-    return dict(schemaVersion=1, route=route, periodStart=result["periodStart"], periodEnd=result["periodEnd"],
+    return dict(schemaVersion=1, route=route, printedIssuedAt=printed_issued_at(first), periodStart=result["periodStart"], periodEnd=result["periodEnd"],
                 _evidence=dict(readerVersion="accounting-pdf-v1", sourceText=text, extracted=result),
                 pageCount=pages, adjustments=adjustments, marginCents=margin["totalMarginDiscount"],
                 inventoryCents=truck, totalAdjustmentsCents=total_adjustments, newSettlementCents=new,
@@ -84,10 +93,11 @@ def analyze(pdf, route):
 
 
 if __name__ == "__main__":
-    # Bound CPU/address space as well as subprocess time. No network, shell, or file writes.
+    # Bound this trusted Python interpreter; each native PDF tool additionally
+    # receives its own enforced filesystem/syscall sandbox and memory/CPU limits.
     resource.setrlimit(resource.RLIMIT_CPU, (30, 30))
     if sys.platform != 'darwin':
-        resource.setrlimit(resource.RLIMIT_AS, (1024 * 1024 * 1024, 1024 * 1024 * 1024))
+        resource.setrlimit(resource.RLIMIT_AS, (192 * 1024 * 1024, 192 * 1024 * 1024))
     try:
         print(json.dumps(analyze(Path(sys.argv[1]).resolve(), sys.argv[2]), allow_nan=False))
     except Exception:

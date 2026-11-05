@@ -37,6 +37,21 @@ def signature(raw, address=ADDRESS, sender='owner@gmail.com', timestamp=None):
 
 
 class MimeTests(unittest.TestCase):
+    def test_payment_advice_is_classified_separately_and_sapadmin_stays_blocked(self):
+        digest = hashlib.sha256(PDF).hexdigest()
+        for sender in ('PaymentAdvices@gruma.com', 'owner@gmail.com'):
+            metadata, files = intake.parse_message(message(sender, [(PDF, 'Payment Advice Note from 09_15_2026.PDF')]), ADDRESS, 'owner@gmail.com')
+            self.assertEqual(metadata['paymentAdviceDigests'], [digest])
+            self.assertEqual(len(files), 1)
+        with self.assertRaises(ValueError):
+            intake.parse_message(message('SAPADMIN@gruma.com'), ADDRESS, 'owner@gmail.com')
+
+    def test_mixed_attached_advice_and_statements_are_not_both_classified_as_advice(self):
+        metadata, files = intake.parse_message(message(attachments=[(PDF, 'Payment Advice Note from 09_15_2026.PDF'),
+            (PDF.replace(b'Sample', b'Distinct'), 'Settlement statement.pdf')]), ADDRESS, 'owner@gmail.com')
+        self.assertEqual(len(files), 2)
+        self.assertEqual(metadata['paymentAdviceDigests'], [hashlib.sha256(PDF).hexdigest()])
+
     def test_manual_and_automatic_forwarding(self):
         for sender in ('owner@gmail.com', 'Notification@gruma.com'):
             _, files = intake.parse_message(message(sender), ADDRESS, 'owner@gmail.com')
@@ -61,6 +76,38 @@ class MimeTests(unittest.TestCase):
         outer.set_content('Attached forward')
         outer.add_attachment(inner)
         self.assertEqual(len(intake.parse_message(outer.as_bytes(), ADDRESS, 'owner@gmail.com')[1]), 1)
+
+    def test_full_year_of_forwarded_preliminary_and_final_emails(self):
+        outer = EmailMessage()
+        outer['From'] = 'owner@gmail.com'
+        outer.set_content('All statements since January 1')
+        for index in range(106):
+            inner = EmailMessage()
+            inner['Subject'] = 'Settlement 123456'
+            inner.set_content('Original body')
+            inner.add_alternative('<p>Original body</p>', subtype='html')
+            inner.add_attachment(b'%PDF-1.4\n' + str(index).encode() + b'\n%%EOF', maintype='application', subtype='pdf', filename='Settlement statement.pdf')
+            outer.add_attachment(inner)
+        _, files = intake.parse_message(outer.as_bytes(), ADDRESS, 'owner@gmail.com')
+        self.assertEqual(len(files), 106)
+        store = MemoryStore()
+        refs, duplicates = intake.save_files(store, '123456', files)
+        self.assertEqual((len(refs), duplicates), (106, 0))
+        self.assertEqual(intake.save_files(store, '123456', files), ([], 106))
+        self.assertTrue(all(key.startswith('statement-upload:') for key in store.docs))
+
+    def test_bulk_intake_keeps_bounded_size_count_and_depth(self):
+        files = [(b'%PDF-1.4\n' + str(i).encode() + b'\n%%EOF', str(i)+'.pdf') for i in range(121)]
+        with self.assertRaisesRegex(ValueError, '120'):
+            intake.parse_message(message(attachments=files), ADDRESS, 'owner@gmail.com')
+        with self.assertRaisesRegex(ValueError, '25 MB'):
+            intake.parse_message(b'0' * (intake.MAX_EMAIL + 1), ADDRESS, 'owner@gmail.com')
+        inner = EmailMessage(); inner.set_content('nested')
+        for _ in range(14):
+            outer = EmailMessage(); outer.set_content('body'); outer.add_attachment(inner); inner = outer
+        inner['From'] = 'owner@gmail.com'
+        with self.assertRaisesRegex(ValueError, 'too complex'):
+            intake.parse_message(inner.as_bytes(), ADDRESS, 'owner@gmail.com')
 
     def test_gmail_code_requires_matching_address_and_owner(self):
         msg = EmailMessage()

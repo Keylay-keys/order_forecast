@@ -4,7 +4,7 @@ from copy import deepcopy
 import hashlib
 import unittest
 from unittest.mock import patch
-from uuid import uuid4
+from uuid import UUID, uuid4, uuid5
 
 from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
@@ -18,7 +18,7 @@ from order_forecast.api.tests.test_business_access import fixture
 
 class MemoryStore:
     def __init__(self):
-        self.docs, self.originals, self.attempts, self.history = {}, {}, {}, []
+        self.docs, self.originals, self.attempts, self.history, self.agent_jobs = {}, {}, {}, [], {}
 
     def get(self, key):
         return deepcopy(self.docs.get(key))
@@ -29,6 +29,9 @@ class MemoryStore:
 
     def documents(self, prefix):
         return deepcopy([v for k, v in self.docs.items() if k.startswith(prefix)])
+
+    def queue_payment_advice_cleanup(self, document_number):
+        self.queued_advice_cleanup = [*getattr(self, 'queued_advice_cleanup', []), document_number]
 
     def has_original(self, kind, digest):
         return any(k[0] == kind and v["sha256"] == digest for k, v in self.originals.items())
@@ -51,6 +54,15 @@ class MemoryStore:
 
     def receipt_jobs(self):
         return {}
+
+    def queue_receipt_agent(self, upload, ocr_attempt):
+        self.agent_jobs.setdefault((upload, ocr_attempt), {"status": "queued", "review": None})
+
+    def receipt_agent_review(self, upload, ocr_attempt):
+        return deepcopy(self.agent_jobs.get((upload, ocr_attempt)))
+
+    def receipt_agent_reviews(self):
+        return deepcopy(self.agent_jobs)
 
 
 def expense(**changes):
@@ -123,6 +135,40 @@ class AccountingBehaviorTests(unittest.TestCase):
     def confirm(self, attempt, revision, version="preliminary", **extra):
         return evidence.confirm_statement(self.domain, dict(revision=revision, uploadId=attempt["uploadId"], fileId=attempt["fileId"], attemptId=attempt["id"], version=version, **extra))
 
+    def test_performance_projection_does_not_expose_evidence_or_change_stored_attempt(self):
+        from order_forecast.api.tests.test_accounting_performance import attempt as metric_fixture
+        def reader(*_):
+            source = metric_fixture()
+            source['_evidence']['extracted'].update(routeNumber='123456', periodStart='2026-09-03', periodEnd='2026-09-09')
+            value = analysis(_evidence=source['_evidence'])
+            value['adjustments'].append(dict(key='salesReturns', label='Returns', cents=-500))
+            value['adjustments'][1]['cents'] += 500
+            value['checks'][7] = dict(label='Net sales', printedCents=9000, calculatedCents=9000)
+            return value
+        _, reading = self.add_statement('projection', reader)
+        # Bind the fixture to the actual original, as the real extractor does.
+        stored = next(iter(self.store.attempts.values()))
+        stored['_evidence']['extracted']['source']['documentId'] = 'sha256:' + reading['sha256']
+        before = deepcopy(self.store.attempts)
+        history = deepcopy(self.store.history)
+        public = evidence.latest_statement(self.store, reading['uploadId'], reading['fileId'])
+        self.assertEqual(public['analysis']['grossSalesCents'], 10000)
+        self.assertNotIn('_evidence', public)
+        self.assertNotIn('PRIVATE PDF TEXT', str(public))
+        self.assertEqual(self.store.attempts, before)
+        self.assertEqual(self.store.history, history)
+        self.confirm(reading, 0)  # additive projection retains the existing review contract
+
+    def test_printed_time_projects_old_readings_without_changing_evidence_or_ledger(self):
+        _, reading = self.add_statement('printed-time', lambda *_: analysis(_evidence={'sourceText': 'Gruma Corporation 09/14/26 19:25\nPrivate source text'}))
+        before, history = deepcopy(self.store.attempts), deepcopy(self.store.history)
+        public = evidence.latest_statement(self.store, reading['uploadId'], reading['fileId'])
+        self.assertEqual(public['analysis']['printedIssuedAt'], '2026-09-14T19:25')
+        self.assertNotIn('_evidence', public)
+        self.assertNotIn('Private source text', str(public))
+        self.assertEqual(self.store.attempts, before)
+        self.assertEqual(self.store.history, history)
+
     def test_preliminary_final_is_one_period_and_does_not_record_income(self):
         _, preliminary = self.add_statement("monday")
         first = self.confirm(preliminary, 0)
@@ -192,9 +238,14 @@ class AccountingBehaviorTests(unittest.TestCase):
         files = [(f"statement-{i}.pdf", "application/pdf", f"%PDF-1.7\n{i}\n%%EOF".encode()) for i in range(104)]
         result = evidence.upload(self.store, "123456", "statement", files)
         self.assertEqual(len(result["files"]), 104)
-        with self.assertRaises(HTTPException) as error:
-            evidence.upload(self.store, "123456", "statement", files[:1])
-        self.assertEqual(error.exception.status_code, 409)
+        before = deepcopy(self.store.docs)
+        duplicate = evidence.upload(self.store, "123456", "statement", files[:1])
+        self.assertEqual(duplicate['duplicateCount'], 1)
+        self.assertEqual(duplicate['files'], [])
+        self.assertEqual(self.store.docs, before)
+        mixed = evidence.upload(self.store, "123456", "statement", files[:1] + [('new.pdf', 'application/pdf', b'%PDF-1.7\nNew version\n%%EOF')])
+        self.assertEqual(mixed['duplicateCount'], 1)
+        self.assertEqual(len(mixed['files']), 1)
         self.assertEqual(self.domain.load("money-in")["settlements"], [])
 
     def test_receipt_review_links_only_existing_expense_and_retains_original(self):
@@ -230,6 +281,54 @@ class AccountingBehaviorTests(unittest.TestCase):
         self.assertEqual(inbox["items"][0]["ocrStatus"], "needs_attention")
         self.assertEqual(self.domain.load("expenses")["items"], [])
 
+    def test_app_scan_uuid5_file_identity_is_valid_only_as_evidence(self):
+        packet_id = str(uuid4())
+        file_id = str(uuid5(UUID(packet_id), "page_0.jpg"))
+        content = b"app scan evidence"
+        file = dict(id=file_id, originalName="Scan page 1.jpg", storedName=file_id + ".jpg",
+                    mediaType="image/jpeg", bytes=len(content), sha256=hashlib.sha256(content).hexdigest())
+        manifest = dict(schemaVersion=1, id=packet_id, route="123456", source="app_scan",
+                        status="received", createdAt="2026-11-04T20:00:00Z", files=[file])
+        self.store.add_original("receipt", packet_id, file, content)
+        self.store.put("receipt-upload:" + packet_id, manifest)
+        report = dict(schemaVersion=1, route="123456", packetId=packet_id,
+                      attemptId=str(uuid4()), createdAt="2026-11-04T20:01:00Z",
+                      pipelineVersion="fixture", status="needs_attention",
+                      documents=[dict(fileId=file_id, sha256=file["sha256"], status="unsupported",
+                                      extraction={"documentType": "unknown", "fields": {}})], proposal=None)
+        inbox = evidence.accept_receipt_attempt(self.store, "123456", packet_id, report)
+        self.assertEqual(inbox["items"][0]["files"][0]["id"], file_id)
+
+    def test_receipt_agent_review_requires_exact_file_coverage_and_stays_advisory(self):
+        packet = evidence.upload(self.store, "123456", "receipt", [
+            ("receipt.pdf", "application/pdf", b"%PDF-1.7\nreceipt\n%%EOF")])
+        file = packet["files"][0]
+        ocr_id = str(uuid4())
+        report = dict(schemaVersion=1, route="123456", packetId=packet["id"], attemptId=ocr_id,
+                      createdAt="2026-11-04T20:01:00Z", pipelineVersion="fixture", status="needs_attention",
+                      documents=[dict(fileId=file["id"], sha256=file["sha256"], status="unsupported",
+                                      extraction={"documentType": "unknown", "fields": {}})], proposal=None)
+        evidence.accept_receipt_attempt(self.store, "123456", packet["id"], report)
+        review = dict(schemaVersion=1, reviewId=str(uuid4()), route="123456", packetId=packet["id"],
+                      ocrAttemptId=ocr_id, createdAt="2026-11-04T20:02:00Z", model="fixture-model",
+                      confidence=80, confidenceTier="medium", confidenceReasons=["The paid date is not visible."],
+                      fileReviews=[dict(fileId=file["id"], sha256=file["sha256"], documentType="invoice",
+                                        evidence=["Invoice heading is visible."], issues=["No payment proof is visible."])],
+                      proposal=dict(status="needs_review", purchaseCount=1, relationship="invoice_only",
+                                    vendor="Example Vendor", amountCents=12500, currency="USD", paymentDate=None,
+                                    category="other", paymentMethod=None, invoiceNumber="INV-1", checks={},
+                                    issues=["An invoice alone does not prove payment."], agentReview="complete"))
+        bad = deepcopy(review)
+        bad["fileReviews"][0]["sha256"] = "0" * 64
+        with self.assertRaises(HTTPException):
+            evidence.accept_receipt_agent_attempt(self.store, "123456", packet["id"], ocr_id, bad)
+        evidence.accept_receipt_agent_attempt(self.store, "123456", packet["id"], ocr_id, review)
+        self.store.agent_jobs[packet["id"], ocr_id] = {"status": "complete", "review": review}
+        inbox = evidence.receipt_inbox(self.store, "123456")
+        self.assertEqual(inbox["items"][0]["proposal"]["agentReview"], "complete")
+        self.assertEqual(inbox["items"][0]["files"][0]["documentType"], "invoice")
+        self.assertEqual(self.domain.load("expenses")["items"], [])
+
 
 class AccountingHttpTests(unittest.TestCase):
     def setUp(self):
@@ -253,6 +352,24 @@ class AccountingHttpTests(unittest.TestCase):
     def request(self, method, path, body=None, rid=None):
         return self.client.request(method, "/api/business/accounting/" + path + "?route=989262", json=body,
             headers={"Idempotency-Key": rid or str(uuid4()), "X-Accounting-Timezone": "America/Denver"})
+
+    def test_legacy_system_payment_notes_are_neutral_on_read_without_writes(self):
+        self.request("GET", "money-in")
+        store = self.stores[("owner", "989262")]
+        legacy = "Confirmed by Gruma payment advice 2600012345. Date is the company payment date."
+        payment = dict(id="saved", periodEnd="2026-09-02", amountCents=125025, receivedDate="2026-09-15", method="other", note=legacy, paymentAdvice={"documentNumber": "2600012345"})
+        custom = {**payment, "id": "custom", "note": "My Gruma payment note"}
+        manual = {k: v for k, v in payment.items() if k != "paymentAdvice"}
+        store.put("money-in", dict(schemaVersion=1, route="989262", revision=4, settlements=[], remittances=[payment, custom, manual]))
+        before = deepcopy(store.docs)
+        history = deepcopy(store.history)
+        response = self.request("GET", "money-in")
+        self.assertEqual(response.status_code, 200, response.text)
+        payments = response.json()["remittances"]
+        self.assertEqual(payments[0], {**payment, "note": legacy.replace("Gruma", "company")})
+        self.assertEqual(payments[1:], [custom, manual])
+        self.assertEqual(self.stores[("owner", "989262")].docs, before)
+        self.assertEqual(self.stores[("owner", "989262")].history, history)
 
     def test_owner_create_replay_and_changed_request_conflict(self):
         rid = str(uuid4())
@@ -292,7 +409,8 @@ class AccountingHttpTests(unittest.TestCase):
         self.assertEqual(original.content, pdf)
         self.assertEqual(original.headers["cache-control"], "private, no-store")
         duplicate = self.client.post(url, files={"files": ("renamed.pdf", pdf, "application/pdf")}, headers={"Idempotency-Key": str(uuid4())})
-        self.assertEqual(duplicate.status_code, 409)
+        self.assertEqual(duplicate.status_code, 201)
+        self.assertEqual(duplicate.json()['duplicateCount'], 1)
         self.assertEqual(self.request("GET", "money-in").json()["remittances"], [])
 
 

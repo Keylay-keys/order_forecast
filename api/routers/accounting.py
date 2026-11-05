@@ -14,8 +14,9 @@ from starlette.datastructures import UploadFile
 from ..business_access import require_business_access
 from ..dependencies import get_firestore, verify_firebase_token
 from ..middleware.rate_limit import rate_limit_history
-from ..accounting_domain import Accounting, fail, identifier
+from ..accounting_domain import Accounting, fail, identifier, now
 from ..accounting_store import accounting_transaction
+from ..accounting_pdf_capacity import request_capacity
 from .. import accounting_evidence as evidence
 from .. import accounting_email as email_intake
 from .. import accounting_email_sender as email_sender
@@ -24,6 +25,11 @@ router = APIRouter()
 logger = logging.getLogger("api.accounting")
 HEADERS = {"Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff", "Referrer-Policy": "no-referrer"}
 UPLOAD_SLOTS = asyncio.Semaphore(1)
+
+
+def upload_hashes(files):
+    return [[name, media, files.digest(content) if isinstance(files, evidence.UploadFiles)
+             else hashlib.sha256(content).hexdigest()] for name, media, content in files]
 
 
 async def upload_capacity(request: Request):
@@ -54,6 +60,8 @@ def dispatch(store, route, today, method, path, body, files, refresh):
     accounting = Accounting(store, route, today)
     if domain == "email-intake" and not suffix:
         return email_intake.setup(store, route, method, body)
+    if domain == "email-intake" and suffix == "handle" and method == "POST":
+        return email_intake.handle_arrival(store, body)
     if domain == "expenses":
         return accounting.expenses(method, suffix, body)
     if domain == "bills":
@@ -61,8 +69,14 @@ def dispatch(store, route, today, method, path, body, files, refresh):
     if domain == "payees":
         return accounting.payees(method, suffix, body)
     if domain == "money-in":
+        if method == "POST" and suffix == "sync-statements":
+            if body:
+                fail("Statement updates take no client-supplied facts.")
+            from ..accounting_payment_advice import reconcile
+            return reconcile(accounting, evidence.sync_statement_updates(accounting))
         if method == "POST" and suffix == "confirm-statement":
-            return evidence.confirm_statement(accounting, body)
+            from ..accounting_payment_advice import reconcile
+            return reconcile(accounting, evidence.confirm_statement(accounting, body))
         return accounting.remittances(method, suffix, body)
     if domain == "cash-accounts":
         return accounting.cash(method, suffix, body)
@@ -105,6 +119,19 @@ def dispatch(store, route, today, method, path, body, files, refresh):
 
 
 def execute(uid, route, today, method, path, body, files, refresh, request_id, fingerprint):
+    parts = path.split("/")
+    if method == "POST" and len(parts) == 4 and parts[0] == "statement-reviews" and parts[3] == "analyze":
+        identifier(parts[1])
+        identifier(parts[2])
+        started = now()
+        # Bound requests and serialize only duplicate originals through commit.
+        # Native reader slots belong to parsing, not database lock waits.
+        with request_capacity(route, parts[1] + ':' + parts[2]):
+            return _execute(uid, route, today, method, path, body, files, refresh, request_id, fingerprint, started)
+    return _execute(uid, route, today, method, path, body, files, refresh, request_id, fingerprint)
+
+
+def _execute(uid, route, today, method, path, body, files, refresh, request_id, fingerprint, analysis_started=None):
     if method == "POST" and path in ("email-intake/sender-code", "email-intake/sender-verify"):
         return email_sender.configure(uid, route, path.split("/")[1], body, request_id, fingerprint)
     # PDF parsing can take seconds. Release the workspace lock while the bounded
@@ -120,6 +147,10 @@ def execute(uid, route, today, method, path, body, files, refresh, request_id, f
                     fail("A request identifier was reused for different work.", 409)
                 return saved["response"]
             source = evidence.original(store, "statement", parts[1], parts[2])
+            prior = evidence.latest_statement(store, parts[1], parts[2], verified_source=source)
+            if prior and analysis_started and prior["analyzedAt"] >= analysis_started:
+                store.put("request:" + request_id, {"fingerprint": fingerprint, "response": prior})
+                return prior
         try:
             prepared_analysis = evidence.analyze_bytes(source["content"], route)
         except (OSError, ValueError, evidence.subprocess.SubprocessError):
@@ -158,7 +189,7 @@ async def accounting_request(
         fail("Invalid accounting timezone.")
     today = datetime.now(zone).date().isoformat()
     method = request.method
-    body, files, fingerprint, request_id = {}, [], "", None
+    body, files, fingerprint, request_id = {}, evidence.UploadFiles(), "", None
     if method != "GET":
         request_id = identifier(request.headers.get("Idempotency-Key"))
         upload_kind = path in ("receipts", "statements") and method == "POST"
@@ -186,7 +217,10 @@ async def accounting_request(
                     if len(content) > 15 * 1024 * 1024:
                         fail("The file exceeds the size limit.", 413)
                     files.append((file.filename or "", file.content_type or "", content))
-            hash_input = [[name, media, hashlib.sha256(content).hexdigest()] for name, media, content in files]
+            # Keep small uploads direct; a catch-up batch must not block screen reads.
+            hash_input = (await run_in_threadpool(upload_hashes, files)
+                          if sum(len(content) for _, _, content in files) > 1024 * 1024
+                          else upload_hashes(files))
         else:
             raw = await bounded_body(request, 5 * 1024 * 1024 if path.endswith("/ocr") else 8192)
             if raw and not request.headers.get("content-type", "").lower().startswith("application/json"):
@@ -237,5 +271,8 @@ async def accounting_request(
         extension = {"image/jpeg": "jpg", "image/png": "png", "application/pdf": "pdf"}[result["mediaType"]]
         return Response(result["content"], media_type=result["mediaType"], headers={**HEADERS,
             "Content-Disposition": f'inline; filename="original.{extension}"', "Content-Security-Policy": "sandbox; default-src 'none'"})
+    if path.split("/", 1)[0] == "money-in":
+        from ..accounting_payment_advice import public_payment_notes
+        result = public_payment_notes(result)
     return Response(json.dumps(result, allow_nan=False), media_type="application/json", headers=HEADERS,
                     status_code=201 if method == "POST" and path in ("receipts", "statements", "bills") else 200)

@@ -13,6 +13,10 @@ OWNER = "owner-uid"
 MEMBER = "member-uid"
 BUCKET = "routespark-1f47d.firebasestorage.app"
 JPEG = bytes.fromhex("ffd8ffc00008000000000000ffda0002ffd9")
+FIREBASE_MANIFEST_KEYS = {
+    "bytes", "contentType", "md5Hash", "packetId", "pageId", "pageIndex",
+    "routeNumber", "storageBucket", "storageGeneration", "storagePath", "uploadedByUid",
+}
 
 
 def jpeg_for(index):
@@ -25,6 +29,8 @@ def ready_upload(uploader=OWNER, pages=1):
         page_id = f"page_{index}.jpg"
         content = jpeg_for(index)
         objects.append({
+            "routeNumber": ROUTE,
+            "packetId": PACKET_ID,
             "pageId": page_id,
             "pageIndex": index,
             "storageBucket": BUCKET,
@@ -155,6 +161,14 @@ class FakeFirestore:
 
 
 class PurchaseImportTests(unittest.TestCase):
+    def test_firebase_completion_manifest_contract_has_exact_expected_shape(self):
+        data = ready_upload()
+        self.assertEqual(set(data["storageManifest"][0]), FIREBASE_MANIFEST_KEYS)
+        packet = worker.parse_ready_upload(
+            f"routes/{ROUTE}/accounting_purchase_uploads/{PACKET_ID}", data, BUCKET,
+        )
+        self.assertEqual(set(packet["objects"][0]), FIREBASE_MANIFEST_KEYS)
+
     def test_completed_packet_becomes_existing_receipt_packet_and_ocr_job(self):
         data = ready_upload(pages=2)
         packet = worker.parse_ready_upload(
@@ -247,6 +261,23 @@ class PurchaseImportTests(unittest.TestCase):
         wrong_page["storageManifestHash"] = worker._manifest_hash(wrong_page["storageManifest"])
         with self.assertRaisesRegex(worker.PermanentImportError, "INVALID_STORAGE_MANIFEST"):
             worker.parse_ready_upload(path, wrong_page, BUCKET)
+
+        wrong_route_identity = ready_upload()
+        wrong_route_identity["storageManifest"][0]["routeNumber"] = "111111"
+        with self.assertRaisesRegex(worker.PermanentImportError, "INVALID_STORAGE_MANIFEST"):
+            worker.parse_ready_upload(path, wrong_route_identity, BUCKET)
+
+        wrong_packet_identity = ready_upload()
+        wrong_packet_identity["storageManifest"][0]["packetId"] = (
+            "223e4567-e89b-42d3-a456-426614174000"
+        )
+        with self.assertRaisesRegex(worker.PermanentImportError, "INVALID_STORAGE_MANIFEST"):
+            worker.parse_ready_upload(path, wrong_packet_identity, BUCKET)
+
+        missing_identity = ready_upload()
+        del missing_identity["storageManifest"][0]["packetId"]
+        with self.assertRaisesRegex(worker.PermanentImportError, "INVALID_STORAGE_MANIFEST"):
+            worker.parse_ready_upload(path, missing_identity, BUCKET)
 
     def test_storage_metadata_and_jpeg_content_are_reverified(self):
         data = ready_upload()

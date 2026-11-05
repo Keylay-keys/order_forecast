@@ -37,6 +37,18 @@ class AccountingStore:
         self.cursor.execute("SELECT 1 FROM accounting_originals WHERE firebase_uid=%s AND route_number=%s AND kind=%s AND sha256=%s", (*self.scope, kind, digest))
         return self.cursor.fetchone() is not None
 
+    def queue_payment_advice_cleanup(self, document_number):
+        # Reuse the durable email queue. The worker removes only matched advice
+        # attachments; MIME parsing and byte rewriting stay off API requests.
+        self.cursor.execute("""UPDATE accounting_email_jobs j SET status='queued',attempts=0,
+            lease_token=NULL,lease_expires_at=NULL,updated_at=now()
+            FROM accounting_email_originals o
+            WHERE j.message_id=o.message_id AND o.firebase_uid=%s AND o.route_number=%s
+            AND j.status IN ('ready','duplicate','needs_attention')
+            AND j.result->'paymentAdviceDocuments' ? %s
+            AND NOT (coalesce(j.result->'paymentAdviceRemovedDocuments','[]'::jsonb) ? %s)""",
+            (*self.scope, document_number, document_number))
+
     def add_original(self, kind, upload, file, content):
         self.cursor.execute("""INSERT INTO accounting_originals
             (firebase_uid,route_number,kind,upload_id,file_id,sha256,media_type,original_name,content)
@@ -78,6 +90,29 @@ class AccountingStore:
             WHERE firebase_uid=%s AND route_number=%s""", self.scope)
         return {str(upload): "needs_attention" if status == "running" and attempts >= 3 and expired else status
                 for upload, status, attempts, expired in self.cursor.fetchall()}
+
+    def queue_receipt_agent(self, upload, ocr_attempt):
+        self.cursor.execute("""INSERT INTO accounting_receipt_agent_jobs
+            (job_id,firebase_uid,route_number,upload_id,ocr_attempt_id)
+            VALUES (%s,%s,%s,%s,%s)
+            ON CONFLICT (firebase_uid,route_number,upload_id,ocr_attempt_id) DO NOTHING""",
+            (str(uuid4()), *self.scope, upload, ocr_attempt))
+
+    def receipt_agent_reviews(self):
+        self.cursor.execute("""SELECT j.upload_id,j.ocr_attempt_id,j.status,j.attempts,
+            j.lease_expires_at<now(),a.payload
+            FROM accounting_receipt_agent_jobs j
+            LEFT JOIN accounting_attempts a ON a.firebase_uid=j.firebase_uid
+                AND a.route_number=j.route_number AND a.kind='receipt'
+                AND a.upload_id=j.upload_id AND a.file_id=j.upload_id
+                AND a.attempt_id=j.completed_review_id
+            WHERE j.firebase_uid=%s AND j.route_number=%s""", self.scope)
+        result = {}
+        for upload, ocr_attempt, status, attempts, expired, review in self.cursor.fetchall():
+            if status == "running" and attempts >= 3 and expired:
+                status = "blocked"
+            result[str(upload), str(ocr_attempt)] = {"status": status, "review": review}
+        return result
 
 
 @contextmanager

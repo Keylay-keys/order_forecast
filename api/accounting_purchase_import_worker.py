@@ -96,8 +96,9 @@ def parse_ready_upload(document_path: str, data: Any, expected_bucket: str) -> d
     if type(raw_objects) is not list or len(raw_objects) != len(page_ids):
         _fail("INVALID_STORAGE_MANIFEST")
     expected_keys = {
-        "pageId", "pageIndex", "storageBucket", "storagePath", "storageGeneration",
-        "bytes", "contentType", "md5Hash", "uploadedByUid",
+        "routeNumber", "packetId", "pageId", "pageIndex", "storageBucket",
+        "storagePath", "storageGeneration", "bytes", "contentType", "md5Hash",
+        "uploadedByUid",
     }
     objects: list[dict[str, Any]] = []
     packet_bytes = 0
@@ -108,7 +109,9 @@ def parse_ready_upload(document_path: str, data: Any, expected_bucket: str) -> d
         expected_path = f"routes/{route}/accounting_purchase_uploads/{packet_id}/{page_id}"
         size = raw.get("bytes")
         if (
-            raw.get("pageId") != page_id
+            raw.get("routeNumber") != route
+            or raw.get("packetId") != packet_id
+            or raw.get("pageId") != page_id
             or raw.get("pageIndex") != index
             or raw.get("storageBucket") != expected_bucket
             or raw.get("storagePath") != expected_path

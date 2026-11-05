@@ -1,7 +1,7 @@
-"""Private settlement addresses and durable MIME intake; never posts accounting money."""
+"""Private settlement addresses and durable MIME intake; financial matching is worker-only."""
 from contextlib import contextmanager
 from email import policy
-from email.parser import BytesParser
+from email.parser import BytesHeaderParser, BytesParser
 from email.utils import getaddresses
 import hashlib
 import hmac
@@ -13,14 +13,17 @@ from uuid import uuid4
 
 from psycopg2.extras import Json
 
-from .accounting_domain import fail
+from .accounting_domain import fail, identifier, now
 from .accounting_store import accounting_transaction
 from .dependencies import get_pg_connection, return_pg_connection
 from . import accounting_evidence as evidence
 from . import accounting_email_sender as inbox
 
 MAX_EMAIL = 25 * 1024 * 1024
+MAX_STATEMENT_PDFS = 120  # Includes both preliminary and final for a full year.
+MAX_MIME_PARTS = 2048  # Attached .eml messages contain their own MIME trees.
 SUPPLIER = "notification@gruma.com"
+PAYMENT_SUPPLIER = "paymentadvices@gruma.com"
 VERIFIER = "forwarding-noreply@google.com"
 
 
@@ -65,17 +68,31 @@ def setup(store, route, method, body):
         fail("Email intake endpoint not found.", 404)
     cur.execute("SELECT address,forwarder_email,enabled FROM accounting_email_addresses WHERE firebase_uid=%s AND route_number=%s", store.scope)
     row = cur.fetchone()
-    cur.execute("""SELECT o.message_id,o.received_at,j.status,j.result,j.attempts,j.lease_expires_at<now()
+    cur.execute("""SELECT o.message_id,o.received_at,j.status,j.result,j.attempts,j.lease_expires_at<now(),
+        CASE WHEN j.status IN ('needs_attention','blocked') OR (j.status='reading' AND j.attempts>=3 AND j.lease_expires_at<now())
+            THEN substring(o.content FROM 1 FOR 65536) END, d.payload
         FROM accounting_email_originals o JOIN accounting_email_jobs j USING(message_id)
+        LEFT JOIN accounting_documents d ON d.firebase_uid=o.firebase_uid AND d.route_number=o.route_number
+            AND d.document_key='email-handled:' || o.message_id::text
         WHERE o.firebase_uid=%s AND o.route_number=%s ORDER BY o.received_at DESC LIMIT 30""", store.scope)
     message_rows = cur.fetchall()
+    advice_records = {}
+    if any("paymentAdviceDocuments" in result for _, _, _, result, *_ in message_rows):
+        from . import accounting_payment_advice as payment_advice
+        advice_records = {record["documentNumber"]: record for record in store.documents(payment_advice.PREFIX)}
     messages = []
     verified_at = (store.get(inbox.KEY) or {}).get("verifiedAt", 0)
-    for mid, received, status, result, attempts, expired in message_rows:
+    for mid, received, status, result, attempts, expired, header, handled in message_rows:
         if status == "reading" and attempts >= 3 and expired:
             status, result = "needs_attention", {"detail": "Processing stopped. Upload the PDF to continue."}
         # Verification codes expire from the UI, while the original evidence stays intact.
         result = dict(result)
+        if "paymentAdviceDocuments" in result and status not in ("queued", "reading", "blocked"):
+            from .accounting_payment_advice import arrival_status
+            status, result = arrival_status(result, advice_records)
+        if status in ("needs_attention", "blocked"):
+            result.update(arrival_headers(header))
+            result["handledAt"] = (handled or {}).get("handledAt")
         if time.time() - received.timestamp() > 3600 or received.timestamp() < verified_at:
             result.pop("verificationCode", None)
             result.pop("verificationUrl", None)
@@ -84,7 +101,44 @@ def setup(store, route, method, body):
                 forwarderEmail=row[1] if row else None, messages=messages,
                 loginEmail=body.get("_loginEmail", body.get("_verifiedEmail", "")),
                 inboxVerificationAvailable=inbox.available(), pendingInbox=inbox.pending(store),
-                gmailFilter=f"from:({SUPPLIER}) subject:(settlement {route}) has:attachment filename:pdf")
+                gmailFilter=f"from:({SUPPLIER}) subject:(settlement {route}) has:attachment filename:pdf",
+                paymentAdviceGmailFilter=f'from:({PAYMENT_SUPPLIER}) subject:("Payment Advice Note from") has:attachment filename:pdf')
+
+
+def arrival_headers(raw):
+    """Bounded plain-text labels only. Never expose message bodies or HTML."""
+    if not raw:
+        return {}
+    try:
+        headers = BytesHeaderParser(policy=policy.default).parsebytes(bytes(raw)[:65536])
+        clean = lambda value, limit: re.sub(r"[\x00-\x1f\x7f\u202a-\u202e\u2066-\u2069]", " ", str(value or ""))[:limit].strip()
+        senders = getaddresses(headers.get_all("From", []))
+        return {"subject": clean(headers.get("Subject"), 200),
+                "sender": clean(senders[0][1], 254) if len(senders) == 1 else ""}
+    except (ValueError, IndexError):
+        return {}
+
+
+def handle_arrival(store, body):
+    if set(body) != {"id", "handled"} or type(body.get("handled")) is not bool:
+        fail("Choose whether this email still needs attention.")
+    mid = identifier(body.get("id"))
+    store.cursor.execute("""SELECT j.status,j.attempts,j.lease_expires_at<now()
+        FROM accounting_email_originals o JOIN accounting_email_jobs j USING(message_id)
+        WHERE o.firebase_uid=%s AND o.route_number=%s AND o.message_id=%s FOR UPDATE OF j""", (*store.scope, mid))
+    row = store.cursor.fetchone()
+    if not row:
+        fail("Email arrival not found.", 404)
+    status, attempts, expired = row
+    if status not in ("needs_attention", "blocked") and not (status == "reading" and attempts >= 3 and expired):
+        fail("This email no longer needs attention. Refresh its status.", 409)
+    key = "email-handled:" + mid
+    previous = store.get(key) or {}
+    handled_at = (previous.get("handledAt") or now()) if body["handled"] else None
+    result = {"id": mid, "handledAt": handled_at}
+    if previous != result:
+        store.put(key, result)
+    return result
 
 
 def verify_signature(timestamp, recipient, sender, digest, signature):
@@ -118,8 +172,9 @@ def accept(address, uid, route, sender, raw):
         prior = cur.fetchone()
         if prior:
             return {"accepted": True, "duplicate": True, "id": str(prior[0])}
-        cur.execute("""SELECT count(*),coalesce(sum(octet_length(content)),0) FROM accounting_email_originals
-            WHERE firebase_uid=%s AND route_number=%s AND received_at>now()-interval '1 day'""", store.scope)
+        cur.execute("""SELECT count(*),coalesce(sum(coalesce((j.result->>'originalContentBytes')::bigint,octet_length(o.content))),0)
+            FROM accounting_email_originals o JOIN accounting_email_jobs j USING(message_id)
+            WHERE o.firebase_uid=%s AND o.route_number=%s AND o.received_at>now()-interval '1 day'""", store.scope)
         count, size = cur.fetchone()
         if count >= 100 or size + len(raw) > 250 * 1024 * 1024:
             fail("Today's email intake limit was reached. Upload the PDF or try again tomorrow.", 429)
@@ -137,7 +192,7 @@ def parse_message(raw, address, forwarder):
     if len(message.get_all("From", [])) != 1:
         raise ValueError("The email sender could not be identified.")
     senders = getaddresses(message.get_all("From", []))
-    if len(senders) != 1 or senders[0][1].lower() not in (forwarder.lower(), SUPPLIER, VERIFIER):
+    if len(senders) != 1 or senders[0][1].lower() not in (forwarder.lower(), SUPPLIER, PAYMENT_SUPPLIER, VERIFIER):
         raise ValueError("Forward from your verified settlement inbox, or change your inbox in Email settlements.")
     # From is a routing restriction, not proof of sender identity. The private,
     # unguessable alias and signed provider relay are the authorization boundary.
@@ -146,7 +201,7 @@ def parse_message(raw, address, forwarder):
     while stack:
         part, depth = stack.pop()
         parts += 1
-        if parts > 80 or depth > 8:
+        if parts > MAX_MIME_PARTS or depth > 12:
             raise ValueError("The email is too complex. Forward the PDF attachment directly.")
         if part.is_multipart():
             stack.extend((child, depth + 1) for child in part.iter_parts())
@@ -165,8 +220,8 @@ def parse_message(raw, address, forwarder):
             if not name.lower().endswith(".pdf"):
                 name += ".pdf"
             files.append((name, "application/pdf", data))
-            if len(files) > 10:
-                raise ValueError("Forward up to 10 PDFs at a time.")
+            if len(files) > MAX_STATEMENT_PDFS:
+                raise ValueError("This email contains more than 120 different PDFs. Send the remaining statements in another email.")
         elif part.get_content_type() == "text/plain" and len(data) <= 100_000:
             texts.append(data.decode(part.get_content_charset() or "utf-8", errors="replace"))
     if sender == VERIFIER:
@@ -184,7 +239,10 @@ def parse_message(raw, address, forwarder):
         raise ValueError("A Gmail setup message arrived, but its confirmation could not be read. Add the forwarding address again in Gmail.")
     if not files:
         raise ValueError("No PDF attachment found. Forward the settlement email with its PDF attached.")
-    return {}, files
+    advice_subject = re.match(r"^(?:(?:re|fwd?):\s*)*Payment Advice Note from\b", str(message.get("Subject", "")), re.I)
+    advice_hashes = [hashlib.sha256(data).hexdigest() for name, _, data in files
+                     if sender == PAYMENT_SUPPLIER or advice_subject or re.match(r"^Payment Advice Note from\b", name, re.I)]
+    return ({"paymentAdviceDigests": advice_hashes} if advice_hashes else {}), files
 
 
 def save_files(store, route, files):
