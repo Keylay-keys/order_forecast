@@ -546,6 +546,10 @@ def _build_entitlement_from_apple_transaction(
         tx_data.get("expires_date_ms"),
         renewal_data.get("expiresDate"),
     )
+    subscription_start_ms = _parse_epoch_millis(
+        tx_data.get("originalPurchaseDate"),
+        tx_data.get("purchaseDate"),
+    )
     now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
     is_active = expires_ms is None or expires_ms > now_ms
 
@@ -566,6 +570,7 @@ def _build_entitlement_from_apple_transaction(
         "signedTransactionInfo": signed_tx or None,
         "signedRenewalInfo": signed_renewal or None,
         "environment": str(apple_payload.get("environment") or "").strip() or None,
+        "subscriptionStartMs": subscription_start_ms,
     }
     return {"entitlement": entitlement, "meta": meta}
 
@@ -957,6 +962,16 @@ def _is_apple_sandbox_document(doc_data: Dict[str, Any]) -> bool:
     return provider == "apple" and _normalize_apple_environment(doc_data.get("appleEnvironment")) == "Sandbox"
 
 
+def _is_expired_apple_sandbox_document(doc_data: Dict[str, Any], *, now_ms: Optional[int] = None) -> bool:
+    if not _is_apple_sandbox_document(doc_data):
+        return False
+    current_period_end_ms = _to_epoch_millis(doc_data.get("currentPeriodEnd"))
+    if current_period_end_ms is None:
+        return False
+    effective_now_ms = now_ms if now_ms is not None else int(datetime.now(timezone.utc).timestamp() * 1000)
+    return current_period_end_ms <= effective_now_ms
+
+
 def _is_apple_sandbox_billing_allowed(*, owner_uid: str, route_number: str) -> bool:
     return (
         bool(owner_uid and owner_uid in APPLE_SANDBOX_BILLING_ALLOWED_UIDS)
@@ -989,6 +1004,9 @@ def _check_entitlement_provider_conflict(
 
     ent_data = ent_doc.to_dict() or {}
     existing_active = bool(ent_data.get("active"))
+    expired_apple_sandbox = existing_active and _is_expired_apple_sandbox_document(ent_data)
+    if expired_apple_sandbox:
+        existing_active = False
     existing_provider = _normalize_provider(ent_data.get("provider")) or _normalize_provider(ent_data.get("source"))
     normalized_incoming = _normalize_provider(incoming_provider) or incoming_provider
 
@@ -997,7 +1015,7 @@ def _check_entitlement_provider_conflict(
             "conflict": False,
             "existingProvider": existing_provider,
             "existingActive": existing_active,
-            "reason": "compatible",
+            "reason": "expired_apple_sandbox" if expired_apple_sandbox else "compatible",
         }
 
     if ENTITLEMENT_PROVIDER_OVERRIDE:
@@ -1199,6 +1217,12 @@ def _write_route_entitlement_from_legacy(
     owner_uid: str,
 ) -> None:
     route_ref = db.collection("routeEntitlements").document(route_number)
+    provider = _normalize_provider(entitlement.provider)
+    apple_metadata = {} if provider == "apple" else {
+        "appStoreTransactionId": firestore.DELETE_FIELD,
+        "appleOriginalTransactionId": firestore.DELETE_FIELD,
+        "appleEnvironment": firestore.DELETE_FIELD,
+    }
     route_ref.set(
         {
             "active": entitlement.active,
@@ -1212,7 +1236,8 @@ def _write_route_entitlement_from_legacy(
             ),
             "features": entitlement.features,
             "ownerUid": owner_uid,
-            "source": _normalize_provider(entitlement.provider) or "legacy",
+            "source": provider or "legacy",
+            **apple_metadata,
             "updatedAt": firestore.SERVER_TIMESTAMP,
         },
         merge=True,
@@ -1228,6 +1253,12 @@ def _write_route_entitlement_from_apple(
     meta: Dict[str, Any],
 ) -> None:
     route_ref = db.collection("routeEntitlements").document(route_number)
+    subscription_start = (
+        datetime.fromtimestamp(meta["subscriptionStartMs"] / 1000, tz=timezone.utc)
+        if isinstance(meta.get("subscriptionStartMs"), (int, float))
+        else None
+    )
+    subscription_start_field = {"subscribedAt": subscription_start} if subscription_start else {}
     route_ref.set(
         {
             "active": entitlement.active,
@@ -1245,6 +1276,7 @@ def _write_route_entitlement_from_apple(
             "appStoreTransactionId": meta.get("appStoreTransactionId"),
             "appleOriginalTransactionId": meta.get("appleOriginalTransactionId"),
             "appleEnvironment": meta.get("environment"),
+            **subscription_start_field,
             "updatedAt": firestore.SERVER_TIMESTAMP,
         },
         merge=True,
@@ -1265,6 +1297,12 @@ def _write_legacy_subscription_shadow_from_apple(
         if entitlement.currentPeriodEndMs
         else None
     )
+    subscription_start = (
+        datetime.fromtimestamp(meta["subscriptionStartMs"] / 1000, tz=timezone.utc)
+        if isinstance(meta.get("subscriptionStartMs"), (int, float))
+        else None
+    )
+    subscription_start_field = {"subscribedAt": subscription_start} if subscription_start else {}
     user_ref.set(
         {
             "subscriptions": {
@@ -1279,6 +1317,7 @@ def _write_legacy_subscription_shadow_from_apple(
                         "appStoreTransactionId": meta.get("appStoreTransactionId"),
                         "appleOriginalTransactionId": meta.get("appleOriginalTransactionId"),
                         "appleEnvironment": meta.get("environment"),
+                        **subscription_start_field,
                         "updatedAt": firestore.SERVER_TIMESTAMP,
                     }
                 }
@@ -1724,6 +1763,7 @@ async def get_billing_entitlement(
     # Route-level source of truth when available.
     ent_doc = db.collection("routeEntitlements").document(route).get()
     route_doc_entitlement: Optional[BillingEntitlement] = None
+    blocked_apple_sandbox = False
     if ent_doc.exists:
         ent_data = ent_doc.to_dict() or {}
         route_doc_entitlement = _coerce_entitlement_from_route_doc(route, ent_data)
@@ -1733,24 +1773,7 @@ async def get_billing_entitlement(
                 entitlement=_finalize_entitlement(route_doc_entitlement, resolved_from="route_entitlements"),
             )
         if _is_apple_sandbox_document(ent_data):
-            return BillingEntitlementResponse(
-                ok=True,
-                entitlement=_finalize_entitlement(
-                    route_doc_entitlement
-                    or BillingEntitlement(
-                        routeNumber=route,
-                        active=False,
-                        plan=_normalize_plan(ent_data.get("plan")),
-                        provider="apple",
-                        interval=_normalize_interval(ent_data.get("interval")),
-                        currentPeriodEndMs=_to_epoch_millis(ent_data.get("currentPeriodEnd")),
-                        source="route_entitlements",
-                        updatedAtMs=_to_epoch_millis(ent_data.get("updatedAt")),
-                        features={},
-                    ),
-                    resolved_from="route_entitlements",
-                ),
-            )
+            blocked_apple_sandbox = True
 
     owner_uid = _resolve_owner_uid_for_route(
         db=db,
@@ -1769,7 +1792,8 @@ async def get_billing_entitlement(
         owner_uid = decoded_token["uid"]
 
     legacy_entitlement = _coerce_legacy_subscription_entitlement(route, owner_data)
-    if legacy_entitlement:
+    legacy_provider = _normalize_provider(legacy_entitlement.provider) if legacy_entitlement else None
+    if legacy_entitlement and not (blocked_apple_sandbox and legacy_provider == "apple"):
         try:
             _write_route_entitlement_from_legacy(
                 db=db,
