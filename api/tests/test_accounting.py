@@ -19,6 +19,7 @@ from order_forecast.api.tests.test_business_access import fixture
 class MemoryStore:
     def __init__(self):
         self.docs, self.originals, self.attempts, self.history, self.agent_jobs = {}, {}, {}, [], {}
+        self.receipt_job_states, self.receipt_queue_calls = {}, []
 
     def get(self, key):
         return deepcopy(self.docs.get(key))
@@ -50,10 +51,11 @@ class MemoryStore:
         return deepcopy(self.attempts.get((kind, upload, file, attempt)))
 
     def queue_receipt(self, upload, retry=False):
-        pass
+        self.receipt_queue_calls.append((upload, retry))
+        self.receipt_job_states.setdefault(upload, "queued")
 
     def receipt_jobs(self):
-        return {}
+        return deepcopy(self.receipt_job_states)
 
     def queue_receipt_agent(self, upload, ocr_attempt):
         self.agent_jobs.setdefault((upload, ocr_attempt), {"status": "queued", "review": None})
@@ -260,6 +262,99 @@ class AccountingBehaviorTests(unittest.TestCase):
         self.assertEqual(evidence.original(self.store, "receipt", packet["id"], packet["files"][0]["id"])["content"], pdf)
         self.assertEqual(len(self.domain.load("expenses")["items"]), 1)
 
+    def test_receipt_archive_restore_hides_only_the_review_and_preserves_original(self):
+        for processing_status in ("queued", "running", "needs_attention"):
+            with self.subTest(processing_status=processing_status):
+                store = MemoryStore()
+                domain = Accounting(store, "123456", "2026-09-15")
+                packet = evidence.upload(store, "123456", "receipt", [
+                    ("receipt.jpg", "image/jpeg", b"\xff\xd8\xff\xc0\x00\x08\x00\x00\x00\x00\x00\x00\xff\xda\x00\x02\xff\xd9")])
+                file_id = packet["files"][0]["id"]
+                original = evidence.original(store, "receipt", packet["id"], file_id)["content"]
+                store.receipt_job_states[packet["id"]] = processing_status
+
+                archived = evidence.change_receipt_review(domain, packet["id"], {
+                    "revision": 0, "action": "archive",
+                })
+                self.assertEqual(archived["items"], [])
+                self.assertEqual(archived["archivedItems"][0]["packetId"], packet["id"])
+                self.assertIn("archivedAt", archived["archivedItems"][0]["review"])
+                self.assertEqual(store.history[-1][0], "receipt-review:" + packet["id"])
+                self.assertEqual(evidence.original(store, "receipt", packet["id"], file_id)["content"], original)
+
+                restored = evidence.change_receipt_review(domain, packet["id"], {
+                    "revision": 1, "action": "restore",
+                })
+                self.assertEqual(restored["archivedItems"], [])
+                self.assertEqual(restored["items"][0]["packetId"], packet["id"])
+                self.assertNotIn("archivedAt", restored["items"][0]["review"])
+                self.assertEqual(evidence.original(store, "receipt", packet["id"], file_id)["content"], original)
+
+    def test_archived_running_receipt_can_finish_without_resurrection_or_agent_requeue(self):
+        packet = evidence.upload(self.store, "123456", "receipt", [
+            ("receipt.jpg", "image/jpeg", b"\xff\xd8\xff\xc0\x00\x08\x00\x00\x00\x00\x00\x00\xff\xda\x00\x02\xff\xd9")])
+        file = packet["files"][0]
+        evidence.change_receipt_review(self.domain, packet["id"], {"revision": 0, "action": "archive"})
+        report = dict(schemaVersion=1, route="123456", packetId=packet["id"], attemptId=str(uuid4()),
+                      createdAt="2026-09-15T12:00:00Z", pipelineVersion="fixture", status="needs_attention",
+                      documents=[dict(fileId=file["id"], sha256=file["sha256"], status="unsupported",
+                                      extraction={"documentType": "unknown", "fields": {}})], proposal=None)
+        finished = evidence.accept_receipt_attempt(self.store, "123456", packet["id"], report)
+        self.assertEqual(finished["items"], [])
+        self.assertEqual(finished["archivedItems"][0]["ocrAttemptId"], report["attemptId"])
+        self.assertEqual(self.store.agent_jobs, {})
+        self.assertEqual(evidence.receipt_inbox(self.store, "123456")["items"], [])
+        self.assertEqual(self.store.agent_jobs, {})
+
+        restored = evidence.change_receipt_review(self.domain, packet["id"], {"revision": 1, "action": "restore"})
+        self.assertEqual(restored["items"][0]["processingStatus"], "agent_queued")
+        self.assertIn((packet["id"], report["attemptId"]), self.store.agent_jobs)
+
+    def test_archived_agent_completion_stays_deleted_and_is_ready_after_restore(self):
+        packet = evidence.upload(self.store, "123456", "receipt", [
+            ("receipt.jpg", "image/jpeg", b"\xff\xd8\xff\xc0\x00\x08\x00\x00\x00\x00\x00\x00\xff\xda\x00\x02\xff\xd9")])
+        file = packet["files"][0]
+        report = dict(schemaVersion=1, route="123456", packetId=packet["id"], attemptId=str(uuid4()),
+                      createdAt="2026-09-15T12:00:00Z", pipelineVersion="fixture", status="ocr_complete",
+                      documents=[dict(fileId=file["id"], sha256=file["sha256"], status="ocr_complete",
+                                      extraction={"documentType": "payment_receipt", "fields": {}})], proposal=None)
+        evidence.accept_receipt_attempt(self.store, "123456", packet["id"], report)
+        evidence.change_receipt_review(self.domain, packet["id"], {"revision": 0, "action": "archive"})
+        agent = dict(reviewId=str(uuid4()), createdAt="2026-09-15T12:01:00Z", confidence=90,
+                     confidenceTier="high", fileReviews=[], proposal={"agentReview": "complete", "issues": []})
+        self.store.agent_jobs[packet["id"], report["attemptId"]] = {"status": "complete", "review": agent}
+        hidden = evidence.receipt_inbox(self.store, "123456")
+        self.assertEqual(hidden["items"], [])
+        self.assertEqual(hidden["archivedItems"][0]["agentReviewId"], agent["reviewId"])
+        restored = evidence.change_receipt_review(self.domain, packet["id"], {"revision": 1, "action": "restore"})
+        self.assertEqual(restored["items"][0]["processingStatus"], "complete")
+
+    def test_archived_exact_duplicate_points_to_restore_instead_of_reupload(self):
+        content = b"\xff\xd8\xff\xc0\x00\x08\x00\x00\x00\x00\x00\x00\xff\xda\x00\x02\xff\xd9"
+        packet = evidence.upload(self.store, "123456", "receipt", [("receipt.jpg", "image/jpeg", content)])
+        evidence.change_receipt_review(self.domain, packet["id"], {"revision": 0, "action": "archive"})
+        with self.assertRaises(HTTPException) as duplicate:
+            evidence.upload(self.store, "123456", "receipt", [("same.jpg", "image/jpeg", content)])
+        self.assertEqual(duplicate.exception.status_code, 409)
+        self.assertIn("Deleted receipts", duplicate.exception.detail)
+
+    def test_receipt_archive_refuses_linked_and_stale_changes_and_is_idempotent_at_current_revision(self):
+        packet = evidence.upload(self.store, "123456", "receipt", [
+            ("receipt.jpg", "image/jpeg", b"\xff\xd8\xff\xc0\x00\x08\x00\x00\x00\x00\x00\x00\xff\xda\x00\x02\xff\xd9")])
+        paid = self.domain.expenses("POST", "", {"revision": 0, "expense": expense()})["items"][0]
+        evidence.change_receipt_review(self.domain, packet["id"], {"revision": 0, "action": "record", "expenseId": paid["id"]})
+        with self.assertRaises(HTTPException) as linked:
+            evidence.change_receipt_review(self.domain, packet["id"], {"revision": 1, "action": "archive"})
+        self.assertEqual(linked.exception.status_code, 409)
+        self.assertIn("Detach", linked.exception.detail)
+        evidence.change_receipt_review(self.domain, packet["id"], {"revision": 1, "action": "unlink"})
+        evidence.change_receipt_review(self.domain, packet["id"], {"revision": 2, "action": "archive"})
+        repeated = evidence.change_receipt_review(self.domain, packet["id"], {"revision": 3, "action": "archive"})
+        self.assertEqual(repeated["archivedItems"][0]["review"]["revision"], 3)
+        with self.assertRaises(HTTPException) as stale:
+            evidence.change_receipt_review(self.domain, packet["id"], {"revision": 2, "action": "restore"})
+        self.assertEqual(stale.exception.status_code, 409)
+
     def test_receipts_invoices_accumulate_past_104_across_uploads(self):
         for batch in range(22):
             files = [(f"invoice-{batch}-{i}.pdf", "application/pdf", f"%PDF-1.7\nInvoice {batch}-{i}\n%%EOF".encode()) for i in range(5)]
@@ -412,6 +507,37 @@ class AccountingHttpTests(unittest.TestCase):
         self.assertEqual(duplicate.status_code, 201)
         self.assertEqual(duplicate.json()['duplicateCount'], 1)
         self.assertEqual(self.request("GET", "money-in").json()["remittances"], [])
+
+    def test_receipt_archive_http_is_owner_scoped_idempotent_and_keeps_original_route(self):
+        jpeg = b"\xff\xd8\xff\xc0\x00\x08\x00\x00\x00\x00\x00\x00\xff\xda\x00\x02\xff\xd9"
+        url = "/api/business/accounting/receipts?route=989262"
+        created = self.client.post(url, files={"files": ("receipt.jpg", jpeg, "image/jpeg")},
+                                   headers={"Idempotency-Key": str(uuid4())})
+        self.assertEqual(created.status_code, 201, created.text)
+        packet = created.json()
+        path = f'receipt-reviews/{packet["id"]}'
+        request_id = str(uuid4())
+        archived = self.request("PATCH", path, {"revision": 0, "action": "archive"}, request_id)
+        self.assertEqual(archived.status_code, 200, archived.text)
+        self.assertEqual(archived.json()["items"], [])
+        self.assertEqual(archived.json()["archivedItems"][0]["packetId"], packet["id"])
+        self.assertEqual(self.request("PATCH", path, {"revision": 0, "action": "archive"}, request_id).json(), archived.json())
+        retry = self.request("POST", f'{path}/read', {})
+        self.assertEqual(retry.status_code, 409)
+        self.assertIn("Restore", retry.text)
+        original = self.request("GET", f'{path}/files/{packet["files"][0]["id"]}')
+        self.assertEqual(original.status_code, 200)
+        self.assertEqual(original.content, jpeg)
+
+        self.app.dependency_overrides[verify_firebase_token] = lambda: {"uid": "team-member"}
+        self.db.set_document("users/team-member", {"profile": {"role": "teamMember", "routeNumber": "989262"}})
+        denied = self.request("PATCH", path, {"revision": 1, "action": "restore"})
+        self.assertEqual(denied.status_code, 403)
+        self.app.dependency_overrides[verify_firebase_token] = lambda: {"uid": "owner"}
+        restored = self.request("PATCH", path, {"revision": 1, "action": "restore"})
+        self.assertEqual(restored.status_code, 200, restored.text)
+        self.assertEqual(restored.json()["archivedItems"], [])
+        self.assertEqual(restored.json()["items"][0]["packetId"], packet["id"])
 
 
 if __name__ == "__main__":

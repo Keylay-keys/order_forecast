@@ -49,9 +49,15 @@ def transaction():
 
 def claim():
     with transaction() as cur:
-        cur.execute("""SELECT job_id,firebase_uid,route_number,upload_id FROM accounting_receipt_jobs
-            WHERE attempts < 3 AND (status='queued' OR status='running' AND lease_expires_at < now())
-            ORDER BY created_at LIMIT 1 FOR UPDATE SKIP LOCKED""")
+        cur.execute("""SELECT j.job_id,j.firebase_uid,j.route_number,j.upload_id FROM accounting_receipt_jobs j
+            WHERE j.attempts < 3 AND (j.status='queued' OR j.status='running' AND j.lease_expires_at < now())
+            AND NOT EXISTS (
+                SELECT 1 FROM accounting_documents d
+                WHERE d.firebase_uid=j.firebase_uid AND d.route_number=j.route_number
+                AND d.document_key='receipt-review:' || j.upload_id::text
+                AND d.payload ? 'archivedAt'
+            )
+            ORDER BY j.created_at LIMIT 1 FOR UPDATE OF j SKIP LOCKED""")
         row = cur.fetchone()
         if row is None:
             return None
@@ -89,10 +95,16 @@ def read_manifest(uid, route, upload):
 
 def claim_agent():
     with transaction() as cur:
-        cur.execute("""SELECT job_id,firebase_uid,route_number,upload_id,ocr_attempt_id
-            FROM accounting_receipt_agent_jobs
-            WHERE attempts < 3 AND (status='queued' OR status='running' AND lease_expires_at < now())
-            ORDER BY created_at LIMIT 1 FOR UPDATE SKIP LOCKED""")
+        cur.execute("""SELECT j.job_id,j.firebase_uid,j.route_number,j.upload_id,j.ocr_attempt_id
+            FROM accounting_receipt_agent_jobs j
+            WHERE j.attempts < 3 AND (j.status='queued' OR j.status='running' AND j.lease_expires_at < now())
+            AND NOT EXISTS (
+                SELECT 1 FROM accounting_documents d
+                WHERE d.firebase_uid=j.firebase_uid AND d.route_number=j.route_number
+                AND d.document_key='receipt-review:' || j.upload_id::text
+                AND d.payload ? 'archivedAt'
+            )
+            ORDER BY j.created_at LIMIT 1 FOR UPDATE OF j SKIP LOCKED""")
         row = cur.fetchone()
         if row is None:
             return None

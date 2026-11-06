@@ -113,8 +113,11 @@ def dispatch(store, route, today, method, path, body, files, refresh):
             return evidence.accept_receipt_attempt(store, route, parts[0], body)
         if len(parts) == 2 and parts[1] == "read" and method == "POST":
             identifier(parts[0])
-            if store.get("receipt-upload:" + parts[0]) is None:
+            manifest = store.get("receipt-upload:" + parts[0])
+            if manifest is None:
                 fail("Receipt packet not found.", 404)
+            if evidence.receipt_review(store, route, manifest).get("archivedAt"):
+                fail("Restore this receipt before requesting another read.", 409)
             store.queue_receipt(parts[0], retry=True)
             return {"queued": True, "route": route}
     fail("Accounting endpoint not found.", 404)

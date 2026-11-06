@@ -110,7 +110,7 @@ def upload(store, route, kind, files):
             if kind == "statement":
                 duplicates += 1
                 continue
-            fail("This exact file has already been uploaded.", 409)
+            fail("This exact file has already been uploaded. If you deleted it, restore it from Deleted receipts.", 409)
         digests.add(digest)
         item = dict(id=str(uuid4()), originalName=name, bytes=len(content), sha256=digest)
         if kind == "receipt":
@@ -337,10 +337,12 @@ def receipt_review(store, route, manifest):
 
 
 def receipt_inbox(store, route):
-    items = []
+    items, archived_items = [], []
     jobs = store.receipt_jobs()
     agent_jobs = store.receipt_agent_reviews()
     for manifest in store.documents("receipt-upload:"):
+        review = receipt_review(store, route, manifest)
+        archived = bool(review.get("archivedAt"))
         pointer = store.get("receipt-latest:" + manifest["id"])
         report = store.attempt("receipt", manifest["id"], manifest["id"], pointer["attemptId"]) if pointer else None
         if pointer and not report:
@@ -349,7 +351,7 @@ def receipt_inbox(store, route):
         if report:
             key = (manifest["id"], report["attemptId"])
             agent = agent_jobs.get(key)
-            if agent is None:
+            if agent is None and not archived:
                 # One-time backfill for accepted OCR attempts created before
                 # the agent-review stage was introduced.
                 store.queue_receipt_agent(*key)
@@ -365,7 +367,7 @@ def receipt_inbox(store, route):
                 documentType=(agent_file or {}).get("documentType", extraction.get("documentType", "unknown")),
                 ocrStatus=(document or {}).get("status", "unsupported"), fields=extraction.get("fields", {})))
         item = dict(packetId=manifest["id"], createdAt=manifest["createdAt"], ocrStatus=report["status"] if report else "not_run",
-                    files=review_files, proposal=(agent_report or {}).get("proposal"), review=receipt_review(store, route, manifest),
+                    files=review_files, proposal=(agent_report or {}).get("proposal"), review=review,
                     processingStatus=(("agent_" + agent["status"]) if agent and agent["status"] != "complete"
                                       else "complete" if agent_report else jobs.get(manifest["id"], "needs_attention")))
         if report:
@@ -373,8 +375,10 @@ def receipt_inbox(store, route):
         if agent_report:
             item.update(agentReviewId=agent_report["reviewId"], agentReviewedAt=agent_report["createdAt"],
                         agentConfidence=agent_report["confidence"], agentConfidenceTier=agent_report["confidenceTier"])
-        items.append(item)
-    return dict(schemaVersion=1, route=route, items=sorted(items, key=lambda i: i["createdAt"], reverse=True))
+        (archived_items if archived else items).append(item)
+    def newest_first(values):
+        return sorted(values, key=lambda item: item["createdAt"], reverse=True)
+    return dict(schemaVersion=1, route=route, items=newest_first(items), archivedItems=newest_first(archived_items))
 
 
 def change_receipt_review(accounting, packet_id, body):
@@ -383,7 +387,9 @@ def change_receipt_review(accounting, packet_id, body):
     if manifest is None:
         fail("Receipt packet not found.", 404)
     action = body.get("action")
-    allowed = ("revision", "action", "groupedFileIds", "includeInAccountantHandoff") if action == "save" else ("revision", "action") if action == "unlink" else ("revision", "action", "expenseId")
+    allowed = (("revision", "action", "groupedFileIds", "includeInAccountantHandoff") if action == "save"
+               else ("revision", "action") if action in ("unlink", "archive", "restore")
+               else ("revision", "action", "expenseId"))
     fields(body, allowed, ("revision", "action"))
     review = receipt_review(accounting.store, accounting.route, manifest)
     accounting.revision(review, body)
@@ -400,6 +406,16 @@ def change_receipt_review(accounting, packet_id, body):
     elif action == "unlink" and review["status"] == "recorded":
         review["status"] = "reviewing"
         review.pop("linkedExpenseId", None)
+    elif action == "archive":
+        if review.get("linkedExpenseId"):
+            fail("Detach this receipt from its expense before deleting it.", 409)
+        if review.get("archivedAt"):
+            return receipt_inbox(accounting.store, accounting.route)
+        review["archivedAt"] = now()
+    elif action == "restore":
+        if not review.get("archivedAt"):
+            return receipt_inbox(accounting.store, accounting.route)
+        review.pop("archivedAt", None)
     else:
         fail("Invalid receipt review change.")
     review.update(revision=review["revision"] + 1, updatedAt=now())
@@ -474,7 +490,8 @@ def accept_receipt_attempt(store, route, packet_id, report):
         return receipt_inbox(store, route)
     store.add_attempt("receipt", packet_id, packet_id, report["attemptId"], report)
     store.put("receipt-latest:" + packet_id, {"attemptId": report["attemptId"]})
-    store.queue_receipt_agent(packet_id, report["attemptId"])
+    if not receipt_review(store, route, manifest).get("archivedAt"):
+        store.queue_receipt_agent(packet_id, report["attemptId"])
     return receipt_inbox(store, route)
 
 
