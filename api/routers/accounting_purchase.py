@@ -17,7 +17,7 @@ from fastapi.responses import Response
 from starlette.concurrency import run_in_threadpool
 
 from ..accounting_domain import fail
-from ..accounting_purchase_import_worker import process_reference
+from ..accounting_purchase_import_worker import cleanup_imported_reference, process_reference
 from ..dependencies import get_firestore, verify_firebase_token
 from ..middleware.rate_limit import rate_limit_history
 from .accounting import HEADERS, bounded_body
@@ -65,6 +65,10 @@ def _verified_result(data: dict, *, route: str, packet_id: str, uid: str, digest
         and data.get("clusterImportUploadId") == packet_id
         and isinstance(data.get("clusterImportOwnerUid"), str)
         and data.get("clusterImportOwnerUid")
+        and data.get("firebaseStorageCleanupStatus") == "deleted"
+        and type(data.get("pageCount")) is int
+        and type(data.get("firebaseStorageDeletedObjects")) is int
+        and data["firebaseStorageDeletedObjects"] == data["pageCount"]
     ):
         return {
             "status": "imported",
@@ -99,6 +103,25 @@ async def import_accounting_purchase(
     replay = _verified_result(data, route=route, packet_id=packet_id, uid=uid, digest=digest)
     if replay:
         return Response(json.dumps(replay), media_type="application/json", headers=HEADERS)
+    bucket = os.environ.get("FIREBASE_STORAGE_BUCKET", "").strip() or DEFAULT_BUCKET
+    already_imported = (
+        data.get("clusterImportStatus") == "imported"
+        and data.get("pendingClusterImport") is False
+        and data.get("clusterImportUploadId") == packet_id
+    )
+    if already_imported:
+        await run_in_threadpool(cleanup_imported_reference, db, reference, bucket)
+        after_cleanup = _data(await run_in_threadpool(reference.get))
+        result = _verified_result(
+            after_cleanup, route=route, packet_id=packet_id, uid=uid, digest=digest,
+        )
+        if result:
+            return Response(json.dumps(result), media_type="application/json", headers=HEADERS)
+        raise HTTPException(
+            503,
+            "Purchase was saved; secure transfer cleanup is still pending.",
+            headers={"Retry-After": "5"},
+        )
     if (
         data.get("status") != "ready"
         or data.get("uploadComplete") is not True
@@ -106,9 +129,15 @@ async def import_accounting_purchase(
     ):
         raise HTTPException(409, "Purchase upload is not ready for import")
 
-    bucket = os.environ.get("FIREBASE_STORAGE_BUCKET", "").strip() or DEFAULT_BUCKET
     await run_in_threadpool(process_reference, db, reference, bucket)
     after = _data(await run_in_threadpool(reference.get))
+    if (
+        after.get("clusterImportStatus") == "imported"
+        and after.get("pendingClusterImport") is False
+        and after.get("clusterImportUploadId") == packet_id
+    ):
+        await run_in_threadpool(cleanup_imported_reference, db, reference, bucket)
+        after = _data(await run_in_threadpool(reference.get))
     result = _verified_result(after, route=route, packet_id=packet_id, uid=uid, digest=digest)
     if result is None:
         if after.get("clusterImportStatus") == "needs_attention":

@@ -1,10 +1,11 @@
 """Import completed Firebase app scans into the hosted Accounting receipt pipeline.
 
-Firebase is a durable handoff, not the Accounting system of record. This worker
+Firebase is a recoverable handoff, not the Accounting system of record. This worker
 claims only completed app packets, independently revalidates route access and
 Storage identity, then stores the immutable originals in the owner's existing
 PostgreSQL Accounting workspace. The existing receipt OCR worker handles the
-resulting queue. Firebase objects are retained after import.
+resulting queue. Once the cluster commit is durable, the exact sealed Firebase
+Storage generations are removed while the Firestore audit record is retained.
 """
 from __future__ import annotations
 
@@ -17,6 +18,7 @@ from typing import Any
 from uuid import UUID, uuid4, uuid5
 
 from firebase_admin import firestore, storage
+from google.api_core.exceptions import NotFound
 from .accounting_evidence import detect_media
 from .accounting_store import accounting_transaction
 from .dependencies import get_firebase_app
@@ -69,8 +71,8 @@ def _manifest_hash(objects: list[dict[str, Any]]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
-def parse_ready_upload(document_path: str, data: Any, expected_bucket: str) -> dict[str, Any]:
-    """Validate the server-completed Firestore packet before any external I/O."""
+def _parse_upload_manifest(document_path: str, data: Any, expected_bucket: str) -> dict[str, Any]:
+    """Validate immutable upload identity and the server-sealed Storage manifest."""
     match = PATH.fullmatch(document_path)
     if not match or type(data) is not dict:
         _fail("INVALID_UPLOAD_IDENTITY")
@@ -87,7 +89,6 @@ def parse_ready_upload(document_path: str, data: Any, expected_bucket: str) -> d
         or data.get("source") != "app_scan"
         or data.get("status") != "ready"
         or data.get("uploadComplete") is not True
-        or data.get("pendingClusterImport") is not True
         or data.get("expectedPageIds") != page_ids
         or not isinstance(data.get("createdAt"), datetime)
     ):
@@ -140,6 +141,27 @@ def parse_ready_upload(document_path: str, data: Any, expected_bucket: str) -> d
         "manifestHash": digest,
         "clientRelease": data.get("clientRelease") if type(data.get("clientRelease")) is dict else {},
     }
+
+
+def parse_ready_upload(document_path: str, data: Any, expected_bucket: str) -> dict[str, Any]:
+    """Validate a server-completed packet that is still waiting for cluster import."""
+    packet = _parse_upload_manifest(document_path, data, expected_bucket)
+    if data.get("pendingClusterImport") is not True:
+        _fail("INVALID_READY_UPLOAD")
+    return packet
+
+
+def parse_imported_upload(document_path: str, data: Any, expected_bucket: str) -> dict[str, Any]:
+    """Validate an imported packet before removing its exact Firebase generations."""
+    packet = _parse_upload_manifest(document_path, data, expected_bucket)
+    if (
+        data.get("pendingClusterImport") is not False
+        or data.get("clusterImportStatus") != "imported"
+        or data.get("clusterImportUploadId") != packet["packetId"]
+        or not _clean(data.get("clusterImportOwnerUid"))
+    ):
+        _fail("INVALID_IMPORTED_UPLOAD")
+    return packet
 
 
 def actor_allowed(packet: dict[str, Any], route_data: Any, claim_data: Any,
@@ -286,6 +308,105 @@ def download_sources(packet: dict[str, Any], bucket: Any) -> list[dict[str, Any]
     return sources
 
 
+def delete_firebase_sources(packet: dict[str, Any], bucket: Any) -> int:
+    """Remove only the manifest-pinned Firebase generations after cluster commit.
+
+    A missing generation is already clean. A different current generation at the
+    same path is never targeted by this function.
+    """
+    removed = 0
+    for item in packet["objects"]:
+        generation = int(item["storageGeneration"])
+        blob = bucket.blob(item["storagePath"], generation=generation)
+        try:
+            blob.delete(if_generation_match=generation, timeout=30)
+        except NotFound:
+            pass
+        removed += 1
+    return removed
+
+
+def _record_cleanup_result(db: Any, reference: Any, packet: dict[str, Any],
+                           *, deleted: bool, object_count: int = 0) -> bool:
+    transaction = db.transaction()
+
+    @firestore.transactional
+    def record(current):
+        snapshot = reference.get(transaction=current)
+        data = _snapshot_data(snapshot)
+        if (
+            data.get("clusterImportStatus") != "imported"
+            or data.get("pendingClusterImport") is not False
+            or data.get("clusterImportUploadId") != packet["packetId"]
+            or data.get("storageManifestHash") != packet["manifestHash"]
+        ):
+            return False
+        if data.get("firebaseStorageCleanupStatus") == "deleted":
+            return data.get("firebaseStorageDeletedObjects") == len(packet["objects"])
+        attempts = data.get("firebaseStorageCleanupAttempts", 0)
+        attempts = attempts if type(attempts) is int and attempts >= 0 else 0
+        values = {
+            "firebaseStorageCleanupStatus": "deleted" if deleted else "pending",
+            "firebaseStorageCleanupAttempts": attempts + 1,
+            "firebaseStorageCleanupUpdatedAt": datetime.now(timezone.utc),
+        }
+        if deleted:
+            values.update({
+                "firebaseStorageDeletedObjects": object_count,
+                "firebaseStorageDeletedAt": datetime.now(timezone.utc),
+                "firebaseStorageCleanupErrorCode": firestore.DELETE_FIELD,
+            })
+        else:
+            values.update({
+                "firebaseStorageCleanupErrorCode": "FIREBASE_STORAGE_DELETE_RETRY",
+                "firebaseStorageDeletedObjects": firestore.DELETE_FIELD,
+                "firebaseStorageDeletedAt": firestore.DELETE_FIELD,
+            })
+        current.update(reference, values)
+        return deleted
+
+    return record(transaction)
+
+
+def cleanup_imported_reference(db: Any, reference: Any, expected_bucket: str,
+                               bucket_factory=None) -> bool:
+    """Ensure an imported packet no longer has active Firebase image objects."""
+    data = _snapshot_data(reference.get())
+    try:
+        packet = parse_imported_upload(reference.path, data, expected_bucket)
+    except PermanentImportError:
+        logger.warning("Accounting app scan cleanup identity rejected", extra={
+            "packet_path": reference.path,
+        })
+        return False
+    if (
+        data.get("firebaseStorageCleanupStatus") == "deleted"
+        and data.get("firebaseStorageDeletedObjects") == len(packet["objects"])
+    ):
+        return True
+    try:
+        bucket = (bucket_factory or (lambda name: storage.bucket(
+            name=name, app=get_firebase_app(),
+        )))(expected_bucket)
+        removed = delete_firebase_sources(packet, bucket)
+    except Exception:
+        _record_cleanup_result(db, reference, packet, deleted=False)
+        logger.warning("Accounting app scan Firebase cleanup will retry", extra={
+            "packet_path": reference.path,
+        })
+        return False
+    completed = _record_cleanup_result(
+        db, reference, packet, deleted=True, object_count=removed,
+    )
+    if completed:
+        logger.info("Accounting app scan Firebase images deleted", extra={
+            "route_number": packet["route"],
+            "packet_id": packet["packetId"],
+            "page_count": removed,
+        })
+    return completed
+
+
 def _claim(db: Any, reference: Any) -> dict[str, Any] | None:
     transaction = db.transaction()
 
@@ -357,6 +478,9 @@ def process_reference(db: Any, reference: Any, expected_bucket: str, bucket_fact
             "clusterImportedAt": datetime.now(timezone.utc),
             "clusterImportReplay": replay,
             "clusterImportErrorCode": firestore.DELETE_FIELD,
+            "firebaseStorageCleanupStatus": "pending",
+            "firebaseStorageCleanupAttempts": 0,
+            "firebaseStorageCleanupErrorCode": firestore.DELETE_FIELD,
         }):
             raise RuntimeError("Import lease changed before completion")
         logger.info("Accounting app scan imported", extra={

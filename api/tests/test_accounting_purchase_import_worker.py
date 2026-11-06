@@ -3,6 +3,9 @@ from datetime import datetime, timezone
 import base64
 import hashlib
 import unittest
+from unittest.mock import patch
+
+from google.api_core.exceptions import NotFound
 
 from order_forecast.api import accounting_purchase_import_worker as worker
 
@@ -59,6 +62,18 @@ def ready_upload(uploader=OWNER, pages=1):
     }
 
 
+def imported_upload(uploader=OWNER, pages=1):
+    value = ready_upload(uploader, pages)
+    value.update({
+        "pendingClusterImport": False,
+        "clusterImportStatus": "imported",
+        "clusterImportUploadId": PACKET_ID,
+        "clusterImportOwnerUid": OWNER,
+        "firebaseStorageCleanupStatus": "pending",
+    })
+    return value
+
+
 class FakeStore:
     def __init__(self):
         self.documents = {}
@@ -97,6 +112,7 @@ class FakeBlob:
             "source": "app_scan",
             "schemaVersion": "1",
         }
+        self.delete_calls = []
 
     def reload(self, **kwargs):
         if kwargs.get("if_generation_match") != self.generation:
@@ -108,16 +124,24 @@ class FakeBlob:
             raise AssertionError("generation precondition missing")
         return self.content
 
+    def delete(self, **kwargs):
+        if kwargs.get("if_generation_match") != self.generation:
+            raise AssertionError("generation precondition missing from delete")
+        if kwargs.get("timeout") != 30:
+            raise AssertionError("bounded delete timeout missing")
+        self.delete_calls.append(kwargs)
+
 
 class FakeBucket:
     def __init__(self, objects):
         self.objects = {item["storagePath"]: item for item in objects}
+        self.blobs = {path: FakeBlob(item) for path, item in self.objects.items()}
 
     def blob(self, path, generation=None):
         item = self.objects[path]
         if generation != int(item["storageGeneration"]):
             raise AssertionError("wrong generation")
-        return FakeBlob(item)
+        return self.blobs[path]
 
 
 class FakeReference:
@@ -125,7 +149,7 @@ class FakeReference:
         self.db = db
         self.path = path
 
-    def get(self):
+    def get(self, transaction=None):
         return FakeSnapshot(self, self.db.documents.get(self.path))
 
 
@@ -158,6 +182,19 @@ class FakeFirestore:
     def get_all(self, references):
         # Deliberately reverse the order to enforce path-bound authorization.
         return [reference.get() for reference in reversed(references)]
+
+    def transaction(self):
+        return FakeTransaction()
+
+
+class FakeTransaction:
+    def update(self, reference, values):
+        document = reference.db.documents[reference.path]
+        for key, value in values.items():
+            if value is worker.firestore.DELETE_FIELD:
+                document.pop(key, None)
+            else:
+                document[key] = value
 
 
 class PurchaseImportTests(unittest.TestCase):
@@ -194,6 +231,67 @@ class PurchaseImportTests(unittest.TestCase):
         self.assertTrue(replay)
         self.assertEqual(repeated, manifest)
         self.assertEqual(len(store.originals), 2)
+
+    def test_imported_packet_cleanup_deletes_only_manifest_generations(self):
+        data = imported_upload(pages=2)
+        packet = worker.parse_imported_upload(
+            f"routes/{ROUTE}/accounting_purchase_uploads/{PACKET_ID}", data, BUCKET,
+        )
+        bucket = FakeBucket(data["storageManifest"])
+        self.assertEqual(worker.delete_firebase_sources(packet, bucket), 2)
+        for index, item in enumerate(data["storageManifest"]):
+            self.assertEqual(bucket.blobs[item["storagePath"]].delete_calls, [{
+                "if_generation_match": index + 10,
+                "timeout": 30,
+            }])
+
+    def test_imported_packet_cleanup_treats_missing_exact_generation_as_clean(self):
+        data = imported_upload()
+        packet = worker.parse_imported_upload(
+            f"routes/{ROUTE}/accounting_purchase_uploads/{PACKET_ID}", data, BUCKET,
+        )
+        bucket = FakeBucket(data["storageManifest"])
+
+        def missing(**_kwargs):
+            raise NotFound("already removed")
+
+        bucket.blobs[data["storageManifest"][0]["storagePath"]].delete = missing
+        self.assertEqual(worker.delete_firebase_sources(packet, bucket), 1)
+
+    def test_cleanup_records_completion_only_after_exact_deletes(self):
+        data = imported_upload(pages=2)
+        path = f"routes/{ROUTE}/accounting_purchase_uploads/{PACKET_ID}"
+        db = FakeFirestore({path: data})
+        reference = FakeReference(db, path)
+        bucket = FakeBucket(data["storageManifest"])
+        with patch.object(worker.firestore, "transactional", side_effect=lambda function: function):
+            self.assertTrue(worker.cleanup_imported_reference(
+                db, reference, BUCKET, bucket_factory=lambda _name: bucket,
+            ))
+        saved = db.documents[path]
+        self.assertEqual(saved["firebaseStorageCleanupStatus"], "deleted")
+        self.assertEqual(saved["firebaseStorageDeletedObjects"], 2)
+        self.assertEqual(saved["firebaseStorageCleanupAttempts"], 1)
+        self.assertNotIn("firebaseStorageCleanupErrorCode", saved)
+
+    def test_cleanup_failure_stays_retryable_after_cluster_import(self):
+        data = imported_upload()
+        path = f"routes/{ROUTE}/accounting_purchase_uploads/{PACKET_ID}"
+        db = FakeFirestore({path: data})
+        reference = FakeReference(db, path)
+        bucket = FakeBucket(data["storageManifest"])
+        bucket.blobs[data["storageManifest"][0]["storagePath"]].delete = (
+            lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("temporary delete failure"))
+        )
+        with patch.object(worker.firestore, "transactional", side_effect=lambda function: function):
+            self.assertFalse(worker.cleanup_imported_reference(
+                db, reference, BUCKET, bucket_factory=lambda _name: bucket,
+            ))
+        saved = db.documents[path]
+        self.assertEqual(saved["firebaseStorageCleanupStatus"], "pending")
+        self.assertEqual(saved["firebaseStorageCleanupAttempts"], 1)
+        self.assertEqual(saved["firebaseStorageCleanupErrorCode"], "FIREBASE_STORAGE_DELETE_RETRY")
+        self.assertNotIn("firebaseStorageDeletedObjects", saved)
 
     def test_team_member_is_attributed_but_imported_into_owner_workspace(self):
         packet = worker.parse_ready_upload(

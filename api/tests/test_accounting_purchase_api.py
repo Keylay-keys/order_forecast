@@ -61,6 +61,7 @@ def upload(**changes):
         "userId": UID,
         "source": "app_scan",
         "status": "ready",
+        "pageCount": 1,
         "uploadComplete": True,
         "pendingClusterImport": True,
         "storageManifestHash": DIGEST,
@@ -90,10 +91,23 @@ class AccountingPurchaseApiTests(unittest.TestCase):
                 "clusterImportStatus": "imported",
                 "clusterImportUploadId": PACKET,
                 "clusterImportOwnerUid": "owner-uid",
+                "firebaseStorageCleanupStatus": "pending",
             })
             return True
 
-        with patch.object(accounting_purchase, "process_reference", side_effect=imported):
+        def cleaned(_db, reference, bucket):
+            self.assertIs(_db, db)
+            self.assertEqual(bucket, "routespark-1f47d.firebasestorage.app")
+            db.documents[reference.path].update({
+                "firebaseStorageCleanupStatus": "deleted",
+                "firebaseStorageDeletedObjects": 1,
+            })
+            return True
+
+        with (
+            patch.object(accounting_purchase, "process_reference", side_effect=imported),
+            patch.object(accounting_purchase, "cleanup_imported_reference", side_effect=cleaned),
+        ):
             response = client.post(
                 f"/api/business/accounting-purchase-import?route={ROUTE}",
                 json={"packetId": PACKET, "storageManifestHash": DIGEST},
@@ -109,13 +123,67 @@ class AccountingPurchaseApiTests(unittest.TestCase):
             clusterImportStatus="imported",
             clusterImportUploadId=PACKET,
             clusterImportOwnerUid="owner-uid",
+            firebaseStorageCleanupStatus="deleted",
+            firebaseStorageDeletedObjects=1,
         ))
-        with patch.object(accounting_purchase, "process_reference") as process:
+        with (
+            patch.object(accounting_purchase, "process_reference") as process,
+            patch.object(accounting_purchase, "cleanup_imported_reference") as cleanup,
+        ):
             response = client.post(
                 f"/api/business/accounting-purchase-import?route={ROUTE}",
                 json={"packetId": PACKET, "storageManifestHash": DIGEST},
             )
         self.assertEqual(response.status_code, 200)
+        process.assert_not_called()
+        cleanup.assert_not_called()
+
+    def test_imported_packet_finishes_pending_cleanup_without_reimport(self):
+        client, db = self.client(upload(
+            pendingClusterImport=False,
+            clusterImportStatus="imported",
+            clusterImportUploadId=PACKET,
+            clusterImportOwnerUid="owner-uid",
+            firebaseStorageCleanupStatus="pending",
+        ))
+
+        def cleaned(_db, reference, _bucket):
+            db.documents[reference.path].update({
+                "firebaseStorageCleanupStatus": "deleted",
+                "firebaseStorageDeletedObjects": 1,
+            })
+            return True
+
+        with (
+            patch.object(accounting_purchase, "process_reference") as process,
+            patch.object(accounting_purchase, "cleanup_imported_reference", side_effect=cleaned) as cleanup,
+        ):
+            response = client.post(
+                f"/api/business/accounting-purchase-import?route={ROUTE}",
+                json={"packetId": PACKET, "storageManifestHash": DIGEST},
+            )
+        self.assertEqual(response.status_code, 200)
+        process.assert_not_called()
+        cleanup.assert_called_once()
+
+    def test_imported_packet_returns_retryable_error_while_cleanup_is_pending(self):
+        client, _ = self.client(upload(
+            pendingClusterImport=False,
+            clusterImportStatus="imported",
+            clusterImportUploadId=PACKET,
+            clusterImportOwnerUid="owner-uid",
+            firebaseStorageCleanupStatus="pending",
+        ))
+        with (
+            patch.object(accounting_purchase, "process_reference") as process,
+            patch.object(accounting_purchase, "cleanup_imported_reference", return_value=False),
+        ):
+            response = client.post(
+                f"/api/business/accounting-purchase-import?route={ROUTE}",
+                json={"packetId": PACKET, "storageManifestHash": DIGEST},
+            )
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.headers.get("retry-after"), "5")
         process.assert_not_called()
 
     def test_cross_account_or_changed_manifest_is_denied_before_import(self):
