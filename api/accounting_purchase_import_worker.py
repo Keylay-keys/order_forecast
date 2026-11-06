@@ -4,8 +4,8 @@ Firebase is a recoverable handoff, not the Accounting system of record. This wor
 claims only completed app packets, independently revalidates route access and
 Storage identity, then stores the immutable originals in the owner's existing
 PostgreSQL Accounting workspace. The existing receipt OCR worker handles the
-resulting queue. Once the cluster commit is durable, the exact sealed Firebase
-Storage generations are removed while the Firestore audit record is retained.
+resulting queue. Once the cluster commit is durable, it schedules Firebase-side
+removal of the exact sealed Storage generations while retaining the audit record.
 """
 from __future__ import annotations
 
@@ -18,7 +18,6 @@ from typing import Any
 from uuid import UUID, uuid4, uuid5
 
 from firebase_admin import firestore, storage
-from google.api_core.exceptions import NotFound
 from .accounting_evidence import detect_media
 from .accounting_store import accounting_transaction
 from .dependencies import get_firebase_app
@@ -308,30 +307,25 @@ def download_sources(packet: dict[str, Any], bucket: Any) -> list[dict[str, Any]
     return sources
 
 
-def delete_firebase_sources(packet: dict[str, Any], bucket: Any) -> int:
-    """Remove only the manifest-pinned Firebase generations after cluster commit.
+def schedule_firebase_cleanup(db: Any, reference: Any, expected_bucket: str) -> bool:
+    """Delegate exact-generation deletion to the Firebase-side cleanup worker.
 
-    A missing generation is already clean. A different current generation at the
-    same path is never targeted by this function.
+    The cluster attests only after its immutable originals are committed. It
+    does not receive Storage delete permission; Firebase revalidates the sealed
+    manifest and performs the bounded deletion under its own Admin identity.
     """
-    removed = 0
-    for item in packet["objects"]:
-        generation = int(item["storageGeneration"])
-        blob = bucket.blob(item["storagePath"], generation=generation)
-        try:
-            blob.delete(if_generation_match=generation, timeout=30)
-        except NotFound:
-            pass
-        removed += 1
-    return removed
-
-
-def _record_cleanup_result(db: Any, reference: Any, packet: dict[str, Any],
-                           *, deleted: bool, object_count: int = 0) -> bool:
+    data = _snapshot_data(reference.get())
+    try:
+        packet = parse_imported_upload(reference.path, data, expected_bucket)
+    except PermanentImportError:
+        logger.warning("Accounting app scan cleanup identity rejected", extra={
+            "packet_path": reference.path,
+        })
+        return False
     transaction = db.transaction()
 
     @firestore.transactional
-    def record(current):
+    def schedule(current):
         snapshot = reference.get(transaction=current)
         data = _snapshot_data(snapshot)
         if (
@@ -343,68 +337,22 @@ def _record_cleanup_result(db: Any, reference: Any, packet: dict[str, Any],
             return False
         if data.get("firebaseStorageCleanupStatus") == "deleted":
             return data.get("firebaseStorageDeletedObjects") == len(packet["objects"])
-        attempts = data.get("firebaseStorageCleanupAttempts", 0)
-        attempts = attempts if type(attempts) is int and attempts >= 0 else 0
-        values = {
-            "firebaseStorageCleanupStatus": "deleted" if deleted else "pending",
-            "firebaseStorageCleanupAttempts": attempts + 1,
-            "firebaseStorageCleanupUpdatedAt": datetime.now(timezone.utc),
-        }
-        if deleted:
-            values.update({
-                "firebaseStorageDeletedObjects": object_count,
-                "firebaseStorageDeletedAt": datetime.now(timezone.utc),
-                "firebaseStorageCleanupErrorCode": firestore.DELETE_FIELD,
-            })
-        else:
-            values.update({
-                "firebaseStorageCleanupErrorCode": "FIREBASE_STORAGE_DELETE_RETRY",
-                "firebaseStorageDeletedObjects": firestore.DELETE_FIELD,
-                "firebaseStorageDeletedAt": firestore.DELETE_FIELD,
-            })
-        current.update(reference, values)
-        return deleted
-
-    return record(transaction)
-
-
-def cleanup_imported_reference(db: Any, reference: Any, expected_bucket: str,
-                               bucket_factory=None) -> bool:
-    """Ensure an imported packet no longer has active Firebase image objects."""
-    data = _snapshot_data(reference.get())
-    try:
-        packet = parse_imported_upload(reference.path, data, expected_bucket)
-    except PermanentImportError:
-        logger.warning("Accounting app scan cleanup identity rejected", extra={
-            "packet_path": reference.path,
+        if data.get("firebaseStorageCleanupStatus") == "scheduled":
+            return isinstance(data.get("firebaseStorageCleanupAfter"), datetime)
+        now = datetime.now(timezone.utc)
+        current.update(reference, {
+            "firebaseStorageCleanupStatus": "scheduled",
+            "firebaseStorageCleanupAfter": now,
+            "firebaseStorageCleanupScheduledAt": now,
+            "firebaseStorageCleanupAttempts": 0,
+            "firebaseStorageCleanupUpdatedAt": now,
+            "firebaseStorageCleanupErrorCode": firestore.DELETE_FIELD,
+            "firebaseStorageDeletedObjects": firestore.DELETE_FIELD,
+            "firebaseStorageDeletedAt": firestore.DELETE_FIELD,
         })
-        return False
-    if (
-        data.get("firebaseStorageCleanupStatus") == "deleted"
-        and data.get("firebaseStorageDeletedObjects") == len(packet["objects"])
-    ):
         return True
-    try:
-        bucket = (bucket_factory or (lambda name: storage.bucket(
-            name=name, app=get_firebase_app(),
-        )))(expected_bucket)
-        removed = delete_firebase_sources(packet, bucket)
-    except Exception:
-        _record_cleanup_result(db, reference, packet, deleted=False)
-        logger.warning("Accounting app scan Firebase cleanup will retry", extra={
-            "packet_path": reference.path,
-        })
-        return False
-    completed = _record_cleanup_result(
-        db, reference, packet, deleted=True, object_count=removed,
-    )
-    if completed:
-        logger.info("Accounting app scan Firebase images deleted", extra={
-            "route_number": packet["route"],
-            "packet_id": packet["packetId"],
-            "page_count": removed,
-        })
-    return completed
+
+    return schedule(transaction)
 
 
 def _claim(db: Any, reference: Any) -> dict[str, Any] | None:
@@ -470,15 +418,18 @@ def process_reference(db: Any, reference: Any, expected_bucket: str, bucket_fact
         bucket = (bucket_factory or (lambda name: storage.bucket(name=name, app=get_firebase_app())))(expected_bucket)
         sources = download_sources(packet, bucket)
         manifest, replay = save_packet(owner_uid, packet, sources)
+        imported_at = datetime.now(timezone.utc)
         if not _finish(db, reference, lease, {
             "pendingClusterImport": False,
             "clusterImportStatus": "imported",
             "clusterImportUploadId": manifest["id"],
             "clusterImportOwnerUid": owner_uid,
-            "clusterImportedAt": datetime.now(timezone.utc),
+            "clusterImportedAt": imported_at,
             "clusterImportReplay": replay,
             "clusterImportErrorCode": firestore.DELETE_FIELD,
-            "firebaseStorageCleanupStatus": "pending",
+            "firebaseStorageCleanupStatus": "scheduled",
+            "firebaseStorageCleanupAfter": imported_at,
+            "firebaseStorageCleanupScheduledAt": imported_at,
             "firebaseStorageCleanupAttempts": 0,
             "firebaseStorageCleanupErrorCode": firestore.DELETE_FIELD,
         }):

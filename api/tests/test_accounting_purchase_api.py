@@ -1,4 +1,5 @@
 import unittest
+from datetime import datetime, timezone
 from unittest.mock import patch
 
 from fastapi import FastAPI
@@ -91,23 +92,12 @@ class AccountingPurchaseApiTests(unittest.TestCase):
                 "clusterImportStatus": "imported",
                 "clusterImportUploadId": PACKET,
                 "clusterImportOwnerUid": "owner-uid",
-                "firebaseStorageCleanupStatus": "pending",
+                "firebaseStorageCleanupStatus": "scheduled",
+                "firebaseStorageCleanupAfter": datetime.now(timezone.utc),
             })
             return True
 
-        def cleaned(_db, reference, bucket):
-            self.assertIs(_db, db)
-            self.assertEqual(bucket, "routespark-1f47d.firebasestorage.app")
-            db.documents[reference.path].update({
-                "firebaseStorageCleanupStatus": "deleted",
-                "firebaseStorageDeletedObjects": 1,
-            })
-            return True
-
-        with (
-            patch.object(accounting_purchase, "process_reference", side_effect=imported),
-            patch.object(accounting_purchase, "cleanup_imported_reference", side_effect=cleaned),
-        ):
+        with patch.object(accounting_purchase, "process_reference", side_effect=imported):
             response = client.post(
                 f"/api/business/accounting-purchase-import?route={ROUTE}",
                 json={"packetId": PACKET, "storageManifestHash": DIGEST},
@@ -128,7 +118,7 @@ class AccountingPurchaseApiTests(unittest.TestCase):
         ))
         with (
             patch.object(accounting_purchase, "process_reference") as process,
-            patch.object(accounting_purchase, "cleanup_imported_reference") as cleanup,
+            patch.object(accounting_purchase, "schedule_firebase_cleanup") as cleanup,
         ):
             response = client.post(
                 f"/api/business/accounting-purchase-import?route={ROUTE}",
@@ -138,7 +128,7 @@ class AccountingPurchaseApiTests(unittest.TestCase):
         process.assert_not_called()
         cleanup.assert_not_called()
 
-    def test_imported_packet_finishes_pending_cleanup_without_reimport(self):
+    def test_imported_packet_schedules_firebase_cleanup_without_reimport(self):
         client, db = self.client(upload(
             pendingClusterImport=False,
             clusterImportStatus="imported",
@@ -147,16 +137,16 @@ class AccountingPurchaseApiTests(unittest.TestCase):
             firebaseStorageCleanupStatus="pending",
         ))
 
-        def cleaned(_db, reference, _bucket):
+        def scheduled(_db, reference, _bucket):
             db.documents[reference.path].update({
-                "firebaseStorageCleanupStatus": "deleted",
-                "firebaseStorageDeletedObjects": 1,
+                "firebaseStorageCleanupStatus": "scheduled",
+                "firebaseStorageCleanupAfter": datetime.now(timezone.utc),
             })
             return True
 
         with (
             patch.object(accounting_purchase, "process_reference") as process,
-            patch.object(accounting_purchase, "cleanup_imported_reference", side_effect=cleaned) as cleanup,
+            patch.object(accounting_purchase, "schedule_firebase_cleanup", side_effect=scheduled) as cleanup,
         ):
             response = client.post(
                 f"/api/business/accounting-purchase-import?route={ROUTE}",
@@ -176,7 +166,7 @@ class AccountingPurchaseApiTests(unittest.TestCase):
         ))
         with (
             patch.object(accounting_purchase, "process_reference") as process,
-            patch.object(accounting_purchase, "cleanup_imported_reference", return_value=False),
+            patch.object(accounting_purchase, "schedule_firebase_cleanup", return_value=False),
         ):
             response = client.post(
                 f"/api/business/accounting-purchase-import?route={ROUTE}",

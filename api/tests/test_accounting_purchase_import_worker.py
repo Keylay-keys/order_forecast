@@ -5,8 +5,6 @@ import hashlib
 import unittest
 from unittest.mock import patch
 
-from google.api_core.exceptions import NotFound
-
 from order_forecast.api import accounting_purchase_import_worker as worker
 
 
@@ -232,66 +230,48 @@ class PurchaseImportTests(unittest.TestCase):
         self.assertEqual(repeated, manifest)
         self.assertEqual(len(store.originals), 2)
 
-    def test_imported_packet_cleanup_deletes_only_manifest_generations(self):
-        data = imported_upload(pages=2)
-        packet = worker.parse_imported_upload(
-            f"routes/{ROUTE}/accounting_purchase_uploads/{PACKET_ID}", data, BUCKET,
-        )
-        bucket = FakeBucket(data["storageManifest"])
-        self.assertEqual(worker.delete_firebase_sources(packet, bucket), 2)
-        for index, item in enumerate(data["storageManifest"]):
-            self.assertEqual(bucket.blobs[item["storagePath"]].delete_calls, [{
-                "if_generation_match": index + 10,
-                "timeout": 30,
-            }])
-
-    def test_imported_packet_cleanup_treats_missing_exact_generation_as_clean(self):
-        data = imported_upload()
-        packet = worker.parse_imported_upload(
-            f"routes/{ROUTE}/accounting_purchase_uploads/{PACKET_ID}", data, BUCKET,
-        )
-        bucket = FakeBucket(data["storageManifest"])
-
-        def missing(**_kwargs):
-            raise NotFound("already removed")
-
-        bucket.blobs[data["storageManifest"][0]["storagePath"]].delete = missing
-        self.assertEqual(worker.delete_firebase_sources(packet, bucket), 1)
-
-    def test_cleanup_records_completion_only_after_exact_deletes(self):
+    def test_cluster_schedules_cleanup_only_after_import(self):
         data = imported_upload(pages=2)
         path = f"routes/{ROUTE}/accounting_purchase_uploads/{PACKET_ID}"
         db = FakeFirestore({path: data})
         reference = FakeReference(db, path)
-        bucket = FakeBucket(data["storageManifest"])
         with patch.object(worker.firestore, "transactional", side_effect=lambda function: function):
-            self.assertTrue(worker.cleanup_imported_reference(
-                db, reference, BUCKET, bucket_factory=lambda _name: bucket,
-            ))
+            self.assertTrue(worker.schedule_firebase_cleanup(db, reference, BUCKET))
         saved = db.documents[path]
-        self.assertEqual(saved["firebaseStorageCleanupStatus"], "deleted")
-        self.assertEqual(saved["firebaseStorageDeletedObjects"], 2)
-        self.assertEqual(saved["firebaseStorageCleanupAttempts"], 1)
+        self.assertEqual(saved["firebaseStorageCleanupStatus"], "scheduled")
+        self.assertIsInstance(saved["firebaseStorageCleanupAfter"], datetime)
+        self.assertIsInstance(saved["firebaseStorageCleanupScheduledAt"], datetime)
+        self.assertEqual(saved["firebaseStorageCleanupAttempts"], 0)
         self.assertNotIn("firebaseStorageCleanupErrorCode", saved)
+        self.assertNotIn("firebaseStorageDeletedObjects", saved)
 
-    def test_cleanup_failure_stays_retryable_after_cluster_import(self):
+    def test_scheduled_cleanup_replay_is_idempotent(self):
         data = imported_upload()
+        scheduled_at = datetime(2026, 11, 6, 19, tzinfo=timezone.utc)
+        data.update({
+            "firebaseStorageCleanupStatus": "scheduled",
+            "firebaseStorageCleanupAfter": scheduled_at,
+            "firebaseStorageCleanupScheduledAt": scheduled_at,
+            "firebaseStorageCleanupAttempts": 0,
+        })
         path = f"routes/{ROUTE}/accounting_purchase_uploads/{PACKET_ID}"
         db = FakeFirestore({path: data})
         reference = FakeReference(db, path)
-        bucket = FakeBucket(data["storageManifest"])
-        bucket.blobs[data["storageManifest"][0]["storagePath"]].delete = (
-            lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("temporary delete failure"))
-        )
         with patch.object(worker.firestore, "transactional", side_effect=lambda function: function):
-            self.assertFalse(worker.cleanup_imported_reference(
-                db, reference, BUCKET, bucket_factory=lambda _name: bucket,
-            ))
+            self.assertTrue(worker.schedule_firebase_cleanup(db, reference, BUCKET))
         saved = db.documents[path]
-        self.assertEqual(saved["firebaseStorageCleanupStatus"], "pending")
-        self.assertEqual(saved["firebaseStorageCleanupAttempts"], 1)
-        self.assertEqual(saved["firebaseStorageCleanupErrorCode"], "FIREBASE_STORAGE_DELETE_RETRY")
-        self.assertNotIn("firebaseStorageDeletedObjects", saved)
+        self.assertEqual(saved["firebaseStorageCleanupAfter"], scheduled_at)
+        self.assertEqual(saved["firebaseStorageCleanupAttempts"], 0)
+
+    def test_cleanup_is_not_scheduled_for_unimported_packet(self):
+        data = imported_upload()
+        data["clusterImportStatus"] = "needs_attention"
+        path = f"routes/{ROUTE}/accounting_purchase_uploads/{PACKET_ID}"
+        db = FakeFirestore({path: data})
+        reference = FakeReference(db, path)
+        with patch.object(worker.firestore, "transactional", side_effect=lambda function: function):
+            self.assertFalse(worker.schedule_firebase_cleanup(db, reference, BUCKET))
+        self.assertEqual(data["firebaseStorageCleanupStatus"], "pending")
 
     def test_team_member_is_attributed_but_imported_into_owner_workspace(self):
         packet = worker.parse_ready_upload(
