@@ -66,6 +66,19 @@ class AccountingStore:
             raise RuntimeError("Original integrity mismatch")
         return dict(sha256=digest, mediaType=media_type, originalName=name, content=content)
 
+    def original_metadata(self, kind, upload, file):
+        """Read immutable source metadata without loading document bytes.
+
+        Preview screens reconcile the stored digest and byte count with the
+        server-owned manifest. Export generation separately reads and hashes the
+        bytes before adding them to an archive.
+        """
+        self.cursor.execute("""SELECT sha256,media_type,octet_length(content) FROM accounting_originals
+            WHERE firebase_uid=%s AND route_number=%s AND kind=%s AND upload_id=%s AND file_id=%s""",
+            (*self.scope, kind, upload, file))
+        row = self.cursor.fetchone()
+        return None if row is None else dict(sha256=row[0], mediaType=row[1], bytes=row[2])
+
     def add_attempt(self, kind, upload, file, attempt_id, payload):
         self.cursor.execute("""INSERT INTO accounting_attempts
             (firebase_uid,route_number,kind,upload_id,file_id,attempt_id,payload) VALUES (%s,%s,%s,%s,%s,%s,%s)""", (*self.scope, kind, upload, file, attempt_id, Json(payload)))

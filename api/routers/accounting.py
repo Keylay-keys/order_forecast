@@ -3,6 +3,7 @@ import hashlib
 import asyncio
 import json
 import logging
+import re
 from datetime import datetime
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -16,7 +17,9 @@ from ..dependencies import get_firestore, verify_firebase_token
 from ..middleware.rate_limit import rate_limit_history
 from ..accounting_domain import Accounting, fail, identifier, now
 from ..accounting_store import accounting_transaction
+from ..accountant_handoff import build_handoff_preview
 from ..accounting_pdf_capacity import request_capacity
+from ..errors import StructuredApiError
 from .. import accounting_evidence as evidence
 from .. import accounting_email as email_intake
 from .. import accounting_email_sender as email_sender
@@ -174,6 +177,37 @@ def _execute(uid, route, today, method, path, body, files, refresh, request_id, 
         if request_id:
             store.put("request:" + request_id, {"fingerprint": fingerprint, "response": result})
         return result
+
+
+def execute_handoff_preview(uid, route, year):
+    with accounting_transaction(uid, route) as store:
+        return build_handoff_preview(store, route, year)
+
+
+@router.get("/business/accounting/handoff/preview")
+@rate_limit_history
+async def accountant_handoff_preview(
+    request: Request,
+    route: str = Query(..., pattern=r"^[0-9]{6}$"),
+    year: str = Query(...),
+    decoded_token: dict = Depends(verify_firebase_token),
+    db=Depends(get_firestore),
+):
+    await require_business_access(route, decoded_token, db)
+    if re.fullmatch(r"(?:20|21)[0-9]{2}", year) is None:
+        raise StructuredApiError(400, "Choose a valid handoff year", "HANDOFF_YEAR_INVALID")
+    try:
+        result = await run_in_threadpool(execute_handoff_preview, decoded_token["uid"], route, int(year))
+    except HTTPException as error:
+        if error.status_code == 503:
+            raise StructuredApiError(503, "Accountant handoff evidence could not be verified",
+                                     "HANDOFF_EVIDENCE_UNVERIFIED") from None
+        raise
+    except Exception:
+        logger.warning("Accountant handoff preview could not complete")
+        raise StructuredApiError(503, "Accountant handoff is temporarily unavailable",
+                                 "HANDOFF_PREVIEW_UNAVAILABLE") from None
+    return Response(json.dumps(result, allow_nan=False), media_type="application/json", headers=HEADERS)
 
 
 @router.api_route("/business/accounting/{path:path}", methods=["GET", "POST", "PATCH", "DELETE"], dependencies=[Depends(upload_capacity)])
