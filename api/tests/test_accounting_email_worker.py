@@ -12,6 +12,21 @@ from order_forecast.api.tests.test_accounting_email import message, PDF
 
 
 class WorkerProgressTests(TestCase):
+    def test_unapproved_rewritten_sender_is_held_with_a_machine_readable_reason(self):
+        sender = 'outlook_0123456789ABCDEF@outlook.com'
+        raw = message(sender)
+        job = dict(id='message', lease='lease', enabled=True, uid='owner', route='123456',
+            raw=raw, digest=sha256(raw).hexdigest(), result={}, address='private@example.test',
+            forwarder='owner@example.com', authorized_senders=[])
+        with patch.object(worker, 'require_business_access', new_callable=AsyncMock), \
+             patch.object(worker, 'finish') as finish:
+            asyncio.run(worker.process(job, object()))
+        status, result = finish.call_args.args[1:]
+        self.assertEqual(status, 'needs_attention')
+        self.assertEqual(result['reason'], 'sender_not_allowed')
+        self.assertEqual(result['senderProvider'], 'outlook')
+        self.assertEqual(result['detail'], worker.intake.SENDER_MISMATCH_DETAIL)
+
     def test_advice_records_once_outside_pdf_transaction_and_never_becomes_a_statement(self):
         raw = message('PaymentAdvices@gruma.com', [(PDF, 'Payment Advice Note from 09_15_2026.PDF')])
         store = MemoryStore()

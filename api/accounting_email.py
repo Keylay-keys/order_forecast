@@ -25,6 +25,40 @@ MAX_MIME_PARTS = 2048  # Attached .eml messages contain their own MIME trees.
 SUPPLIER = "notification@gruma.com"
 PAYMENT_SUPPLIER = "paymentadvices@gruma.com"
 VERIFIER = "forwarding-noreply@google.com"
+SENDER_MISMATCH_DETAIL = "This email used a forwarding address RouteSpark has not approved yet. Review and approve that exact address, or upload the PDF instead."
+LEGACY_SENDER_MISMATCH_DETAIL = "Forward from your verified settlement inbox, or change your inbox in Email settlements."
+UNCONNECTED_SENDER_DETAIL = "This email came from an address that is not connected to this route. Forward the PDF from your connected inbox, or upload it instead."
+OUTLOOK_REWRITTEN_SENDER = re.compile(r"^outlook_[0-9a-f]{16,64}@outlook[.]com$", re.I)
+APPROVABLE_SENDER = re.compile(
+    r"[a-z0-9!#$%&'*+/=?^_`{|}~-]+(?:\.[a-z0-9!#$%&'*+/=?^_`{|}~-]+)*"
+    r"@[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)+",
+    re.I,
+)
+ICLOUD_DOMAINS = {"icloud.com", "me.com", "mac.com"}
+BLOCKED_APPROVAL_DOMAINS = {"gruma.com"}
+
+
+class SenderApprovalRequired(ValueError):
+    """A held message used one exact provider-rewritten sender identity."""
+
+    def __init__(self, sender, provider):
+        super().__init__(SENDER_MISMATCH_DETAIL if provider else UNCONNECTED_SENDER_DETAIL)
+        self.sender = sender
+        self.provider = provider
+
+
+def sender_binding_provider(sender, forwarder=""):
+    """Classify one exact approvable sender; the label never grants domain trust."""
+    sender = (sender or "").lower()
+    forwarder = (forwarder or "").lower()
+    if not APPROVABLE_SENDER.fullmatch(sender) or len(sender) > 254 or len(sender.split("@", 1)[0]) > 64:
+        return None
+    if sender.rsplit("@", 1)[-1] in BLOCKED_APPROVAL_DOMAINS:
+        return None
+    if OUTLOOK_REWRITTEN_SENDER.fullmatch(sender):
+        return "outlook"
+    domains = {value.rsplit("@", 1)[-1] for value in (sender, forwarder) if "@" in value}
+    return "icloud" if domains & ICLOUD_DOMAINS else "forwarding"
 
 
 def domain():
@@ -92,6 +126,13 @@ def setup(store, route, method, body):
             status, result = arrival_status(result, advice_records)
         if status in ("needs_attention", "blocked"):
             result.update(arrival_headers(header))
+            provider = sender_binding_provider(result.get("sender", ""), row[1] if row else "")
+            result["senderApprovalAvailable"] = bool(
+                provider and (result.get("reason") == "sender_not_allowed"
+                              or result.get("detail") == LEGACY_SENDER_MISMATCH_DETAIL)
+            )
+            if result["senderApprovalAvailable"]:
+                result["senderProvider"] = provider
             result["handledAt"] = (handled or {}).get("handledAt")
         if time.time() - received.timestamp() > 3600 or received.timestamp() < verified_at:
             result.pop("verificationCode", None)
@@ -141,6 +182,47 @@ def handle_arrival(store, body):
     return result
 
 
+def approve_sender(store, body):
+    """Bind only the exact rewritten sender from one owner-scoped held arrival."""
+    if set(body) != {"id"}:
+        fail("Choose the forwarded email to approve.")
+    mid = identifier(body.get("id"))
+    store.cursor.execute("""SELECT j.status,j.result,o.address,a.forwarder_email,substring(o.content FROM 1 FOR 65536)
+        FROM accounting_email_originals o JOIN accounting_email_jobs j USING(message_id)
+        JOIN accounting_email_addresses a USING(address)
+        WHERE o.firebase_uid=%s AND o.route_number=%s AND o.message_id=%s FOR UPDATE OF j""", (*store.scope, mid))
+    row = store.cursor.fetchone()
+    if not row:
+        fail("Email arrival not found.", 404)
+    status, result, address, forwarder, header = row
+    labels = arrival_headers(header)
+    sender = labels.get("sender", "").lower()
+    provider = sender_binding_provider(sender, forwarder)
+    if not provider:
+        fail("This forwarding address cannot be approved automatically.", 409)
+    approval_pending = status == "needs_attention" and isinstance(result, dict) and (
+        result.get("reason") == "sender_not_allowed" or result.get("detail") == LEGACY_SENDER_MISMATCH_DETAIL
+    )
+    store.cursor.execute("""SELECT 1 FROM accounting_email_sender_bindings
+        WHERE address=%s AND verified_forwarder_email=%s AND sender_email=%s""", (address, forwarder, sender))
+    already_approved = store.cursor.fetchone() is not None
+    if already_approved and not approval_pending:
+        return {"id": mid, "senderApproved": True, "queued": status in ("queued", "reading")}
+    if not approval_pending:
+        fail("This email is not waiting for sender approval. Refresh its status.", 409)
+    if already_approved:
+        store.cursor.execute("""UPDATE accounting_email_jobs SET status='queued',attempts=0,lease_token=NULL,
+            lease_expires_at=NULL,result='{}'::jsonb,updated_at=now() WHERE message_id=%s""", (mid,))
+        return {"id": mid, "senderApproved": True, "queued": True}
+    store.cursor.execute("""INSERT INTO accounting_email_sender_bindings
+        (address,verified_forwarder_email,sender_email,provider,source_message_id) VALUES (%s,%s,%s,%s,%s)
+        ON CONFLICT (address,verified_forwarder_email,sender_email) DO NOTHING""",
+        (address, forwarder, sender, provider, mid))
+    store.cursor.execute("""UPDATE accounting_email_jobs SET status='queued',attempts=0,lease_token=NULL,
+        lease_expires_at=NULL,result='{}'::jsonb,updated_at=now() WHERE message_id=%s""", (mid,))
+    return {"id": mid, "senderApproved": True, "queued": True}
+
+
 def verify_signature(timestamp, recipient, sender, digest, signature):
     key = os.environ.get("ACCOUNTING_EMAIL_SECRET", "")
     if not available() or not re.fullmatch(r"[0-9]{10}", timestamp or "") or abs(time.time() - int(timestamp)) > 300:
@@ -185,18 +267,20 @@ def accept(address, uid, route, sender, raw):
         return {"accepted": True, "duplicate": False, "id": mid}
 
 
-def parse_message(raw, address, forwarder):
+def parse_message(raw, address, forwarder, authorized_senders=()):
     if not 0 < len(raw) <= MAX_EMAIL:
         raise ValueError("The email exceeds the 25 MB limit. Upload the PDFs separately.")
     message = BytesParser(policy=policy.default).parsebytes(raw)
     if len(message.get_all("From", [])) != 1:
         raise ValueError("The email sender could not be identified.")
     senders = getaddresses(message.get_all("From", []))
-    if len(senders) != 1 or senders[0][1].lower() not in (forwarder.lower(), SUPPLIER, PAYMENT_SUPPLIER, VERIFIER):
-        raise ValueError("Forward from your verified settlement inbox, or change your inbox in Email settlements.")
+    sender = senders[0][1].lower() if len(senders) == 1 else ""
+    allowed = {forwarder.lower(), SUPPLIER, PAYMENT_SUPPLIER, VERIFIER,
+               *(value.lower() for value in authorized_senders)}
+    if not sender or sender not in allowed:
+        raise SenderApprovalRequired(sender, sender_binding_provider(sender, forwarder))
     # From is a routing restriction, not proof of sender identity. The private,
     # unguessable alias and signed provider relay are the authorization boundary.
-    sender = senders[0][1].lower()
     stack, parts, files, texts, hashes = [(message, 0)], 0, [], [], set()
     while stack:
         part, depth = stack.pop()

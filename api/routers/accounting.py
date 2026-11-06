@@ -62,6 +62,8 @@ def dispatch(store, route, today, method, path, body, files, refresh):
         return email_intake.setup(store, route, method, body)
     if domain == "email-intake" and suffix == "handle" and method == "POST":
         return email_intake.handle_arrival(store, body)
+    if domain == "email-intake" and suffix == "approve-sender" and method == "POST":
+        return email_intake.approve_sender(store, body)
     if domain == "expenses":
         return accounting.expenses(method, suffix, body)
     if domain == "bills":

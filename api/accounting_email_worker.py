@@ -30,11 +30,14 @@ def claim():
         lease = str(uuid4())
         cur.execute("""UPDATE accounting_email_jobs SET status='reading',attempts=attempts+1,
             lease_token=%s,lease_expires_at=now()+interval '10 minutes',updated_at=now() WHERE message_id=%s""", (lease, mid))
-        cur.execute("""SELECT o.firebase_uid,o.route_number,o.address,a.forwarder_email,o.sha256,o.content,a.enabled
+        cur.execute("""SELECT o.firebase_uid,o.route_number,o.address,a.forwarder_email,o.sha256,o.content,a.enabled,
+            ARRAY(SELECT b.sender_email FROM accounting_email_sender_bindings b
+                WHERE b.address=o.address AND b.verified_forwarder_email=a.forwarder_email ORDER BY b.sender_email)
             FROM accounting_email_originals o JOIN accounting_email_addresses a USING(address) WHERE o.message_id=%s""", (mid,))
-        uid, route, address, forwarder, digest, raw, enabled = cur.fetchone()
+        uid, route, address, forwarder, digest, raw, enabled, authorized_senders = cur.fetchone()
         return dict(id=str(mid), lease=lease, uid=uid, route=route, address=address,
-                    forwarder=forwarder, digest=result.get('retainedContentSha256', digest), raw=bytes(raw), enabled=enabled, result=result)
+                    forwarder=forwarder, authorized_senders=authorized_senders,
+                    digest=result.get('retainedContentSha256', digest), raw=bytes(raw), enabled=enabled, result=result)
 
 
 def lease(cur, job):
@@ -78,7 +81,7 @@ async def process(job, db):
             raise ValueError("Stored email integrity check failed. Upload the PDF to continue.")
         result = job["result"]
         if not result.get("saved"):
-            metadata, files = intake.parse_message(job["raw"], job["address"], job["forwarder"])
+            metadata, files = intake.parse_message(job["raw"], job["address"], job["forwarder"], job.get("authorized_senders", ()))
             if metadata.get("verificationCode") or metadata.get("verificationUrl"):
                 finish(job, "verification", metadata)
                 return
@@ -157,6 +160,9 @@ async def process(job, db):
             advice_status, result = payment_advice.arrival_status(result, {record["documentNumber"]: record for record in advice_records if record})
             errors += int(advice_status == "needs_attention")
         finish(job, "needs_attention" if errors else "ready" if result["statements"] or result.get("paymentAdviceDocuments") else "duplicate", result)
+    except intake.SenderApprovalRequired as error:
+        finish(job, "needs_attention", {**job["result"], "reason": "sender_not_allowed",
+            "senderProvider": error.provider, "detail": str(error)})
     except ValueError as error:
         finish(job, "needs_attention", {**job["result"], "detail": str(error)})
     except HTTPException as error:

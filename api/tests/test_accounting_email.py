@@ -57,6 +57,39 @@ class MimeTests(unittest.TestCase):
             _, files = intake.parse_message(message(sender), ADDRESS, 'owner@gmail.com')
             self.assertEqual(files, [('Statement.pdf', 'application/pdf', PDF)])
 
+    def test_outlook_rewritten_sender_requires_one_exact_owner_approved_binding(self):
+        sender = 'outlook_0123456789ABCDEF@outlook.com'
+        with self.assertRaises(intake.SenderApprovalRequired) as error:
+            intake.parse_message(message(sender), ADDRESS, 'owner@example.com')
+        self.assertEqual(error.exception.provider, 'outlook')
+        _, files = intake.parse_message(message(sender), ADDRESS, 'owner@example.com', [sender.lower()])
+        self.assertEqual(files, [('Statement.pdf', 'application/pdf', PDF)])
+        with self.assertRaises(intake.SenderApprovalRequired):
+            intake.parse_message(message('outlook_FEDCBA9876543210@outlook.com'), ADDRESS,
+                                 'owner@example.com', [sender.lower()])
+
+    def test_sender_approval_classifies_one_exact_address_without_trusting_a_domain(self):
+        self.assertEqual(intake.sender_binding_provider('outlook_0123456789abcdef@outlook.com'), 'outlook')
+        self.assertEqual(intake.sender_binding_provider('relay@icloud.com'), 'icloud')
+        self.assertEqual(intake.sender_binding_provider('rewritten@relay.example', 'owner@icloud.com'), 'icloud')
+        self.assertEqual(intake.sender_binding_provider('person@outlook.com'), 'forwarding')
+        for sender in ('outlook_bad', 'two@@example.com', 'person@example', 'sapadmin@gruma.com',
+                       'outlook_0123456789abcdef@outlook.com.evil.test\nBcc: bad@example.com'):
+            self.assertIsNone(intake.sender_binding_provider(sender))
+        with self.assertRaisesRegex(intake.SenderApprovalRequired, intake.SENDER_MISMATCH_DETAIL):
+            intake.parse_message(message('person@outlook.com'), ADDRESS, 'owner@example.com')
+
+    def test_icloud_and_unknown_forwarders_require_exact_approval_then_parse(self):
+        for sender, forwarder, provider in (
+            ('relay@icloud.com', 'owner@icloud.com', 'icloud'),
+            ('rewrite@provider.example', 'owner@custom.example', 'forwarding'),
+        ):
+            with self.assertRaises(intake.SenderApprovalRequired) as error:
+                intake.parse_message(message(sender), ADDRESS, forwarder)
+            self.assertEqual(error.exception.provider, provider)
+            _, files = intake.parse_message(message(sender), ADDRESS, forwarder, [sender])
+            self.assertEqual(files, [('Statement.pdf', 'application/pdf', PDF)])
+
     def test_sender_restricted_and_fake_pdf_rejected(self):
         for raw in (message('stranger@example.com'), message(attachments=[(b'<html>bad</html>', 'x.pdf')]), message(attachments=[])):
             with self.assertRaises(ValueError):
