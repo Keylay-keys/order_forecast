@@ -33,8 +33,9 @@ Referrer-Policy: no-referrer
 
 The preview is limited to 30 authenticated requests per minute under the
 existing Accounting read policy. Export is limited to two requests per 15
-minutes per authenticated user and permits only one active export for the same
-owner and route.
+minutes per authenticated user on each API replica. A PostgreSQL session lock
+additionally permits only one active export for the same owner and route across
+all replicas.
 
 ## Canonical snapshot rules
 
@@ -238,7 +239,9 @@ Content-Disposition: attachment; filename="routespark-accountant-handoff-2026.zi
 The export endpoint runs the same builder itself. It does not trust or accept a
 preview response, `snapshotId`, amount, document reference, or hash from the
 client. `manifest.json` repeats the exact preview facts and snapshot identity
-used for the export and adds a SHA-256 and byte count for every ZIP entry.
+used for the export and adds a SHA-256 and byte count for every other ZIP entry.
+The response header `X-RouteSpark-Manifest-SHA256` authenticates the manifest
+itself without creating an impossible self-referential hash.
 
 The archive contains:
 
@@ -249,7 +252,7 @@ paid-expenses.csv
 data-gaps.csv
 manifest.json
 settlement-statements/YYYY-MM-DD_to_YYYY-MM-DD.pdf
-supporting-documents/YYYY-MM-DD/<expense-id>/<sequence>.<jpg|png|pdf>
+supporting-documents/YYYY-MM-DD/<expense-id>/<purchase-id>/<sequence>.<jpg|png|pdf>
 ```
 
 The server generates every archive path. Original filenames appear only as

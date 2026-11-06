@@ -91,6 +91,11 @@ rate_limit_portal_sap_order_write = limiter.limit(
     key_func=authenticated_or_ip_key,
     override_defaults=True,
 )
+rate_limit_accounting_export = limiter.limit(
+    "2/15 minutes",
+    key_func=authenticated_or_ip_key,
+    override_defaults=True,
+)
 
 
 def setup_rate_limiting(app):

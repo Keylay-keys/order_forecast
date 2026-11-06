@@ -4,8 +4,10 @@ The preview deliberately contains no presentation labels or document bytes.
 Export generation consumes the same snapshot builder in a separate module.
 """
 from copy import deepcopy
+from datetime import date, datetime
 import hashlib
 import json
+import re
 
 from .accounting_domain import Accounting, fail, now
 from .accounting_performance import gross_sales_cents
@@ -44,6 +46,26 @@ def _year(value):
     if type(value) is not int or not 2000 <= value <= 2100:
         fail("Choose a valid handoff year.")
     return str(value)
+
+
+def _is_day(value):
+    if type(value) is not str or re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", value) is None:
+        return False
+    try:
+        date.fromisoformat(value)
+        return True
+    except ValueError:
+        return False
+
+
+def _is_timestamp(value):
+    if type(value) is not str:
+        return False
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return parsed.tzinfo is not None
+    except ValueError:
+        return False
 
 
 def _original_descriptor(store, route, kind, upload_id, file_id):
@@ -215,9 +237,13 @@ def build_handoff_preview(store, route, year, *, generated_at=None):
     statement_periods = []
     source_file_count = 0
     source_bytes = 0
-    for period in sorted(money_ledger["settlements"], key=lambda item: item["periodEnd"]):
-        if period["periodEnd"][:4] != year_text:
-            continue
+    if any(type(period) is not dict or not _is_day(period.get("periodStart")) or not _is_day(period.get("periodEnd"))
+           for period in money_ledger["settlements"]):
+        _unverified()
+    selected_periods = [period for period in money_ledger["settlements"] if period["periodEnd"][:4] == year_text]
+    if len({period["periodEnd"] for period in selected_periods}) != len(selected_periods):
+        _unverified()
+    for period in sorted(selected_periods, key=lambda item: item["periodEnd"]):
         row = _confirmed_statement(store, route, period)
         source_bytes += row.pop("_sourceBytes")
         source_file_count += 1
@@ -232,25 +258,36 @@ def build_handoff_preview(store, route, year, *, generated_at=None):
             gaps.append(_gap("BILLING_PERIOD_CROSSES_CALENDAR_YEAR", "settlementStatement", row["source"]["attemptId"],
                              {"periodStart": row["periodStart"], "periodEnd": row["periodEnd"]}))
 
+    if any(type(item) is not dict or not _is_day(item.get("periodEnd")) or not _is_day(item.get("receivedDate"))
+           for item in money_ledger["remittances"]):
+        _unverified()
     settlement_payments = sorted(
         [_copy_payment(item) for item in money_ledger["remittances"] if item["receivedDate"][:4] == year_text],
         key=lambda item: (item["receivedDate"], item["id"]),
     )
+    if any(type(item) is not dict or not _is_day(item.get("periodEnd")) or not _is_day(item.get("receivedDate"))
+           for item in cash_ledger["payments"]):
+        _unverified()
     cash_collections = sorted(
         [_copy_payment(item, cash=True) for item in cash_ledger["payments"]
          if not item.get("archivedAt") and item["receivedDate"][:4] == year_text],
         key=lambda item: (item["receivedDate"], item["id"]),
     )
+    if any(type(item) is not dict or not _is_day(item.get("date")) for item in expenses_ledger["items"]):
+        _unverified()
     paid_expenses = sorted(
         [_copy_expense(item) for item in expenses_ledger["items"]
          if not item.get("archivedAt") and item["date"][:4] == year_text],
         key=lambda item: (item["date"], item["id"]),
     )
+    if len({item["id"] for item in paid_expenses}) != len(paid_expenses):
+        _unverified()
     expenses_by_id = {item["id"]: item for item in paid_expenses}
     all_active_expense_ids = {item["id"] for item in expenses_ledger["items"] if not item.get("archivedAt")}
 
     supporting_purchases = []
     relevant_reviews = []
+    seen_purchase_ids = set()
     for manifest in store.documents("receipt-upload:"):
         if type(manifest) is not dict or manifest.get("route") != route or type(manifest.get("files")) is not list:
             _unverified()
@@ -258,11 +295,15 @@ def build_handoff_preview(store, route, year, *, generated_at=None):
         try:
             created_at = manifest["createdAt"]
             purchase_id = manifest["id"]
+            if purchase_id in seen_purchase_ids:
+                _unverified()
+            seen_purchase_ids.add(purchase_id)
             included = review["includeInAccountantHandoff"]
             grouped = review["groupedFileIds"]
             linked = review.get("linkedExpenseId")
             archived = bool(review.get("archivedAt"))
-            if (type(created_at) is not str or len(created_at) < 10 or type(included) is not bool
+            if (not _is_timestamp(created_at)
+                    or type(included) is not bool
                     or type(grouped) is not list or not grouped or len(grouped) != len(set(grouped))):
                 _unverified()
         except (KeyError, TypeError):

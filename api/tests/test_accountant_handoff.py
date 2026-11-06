@@ -1,18 +1,26 @@
 """Canonical Accountant handoff facts, placement and evidence boundaries."""
 from copy import deepcopy
 from contextlib import contextmanager
+import hashlib
+import io
+import json
 import logging
+from pathlib import Path
+import tempfile
 import unittest
 from unittest.mock import patch
+import zipfile
 
 from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
-
 from order_forecast.api.accountant_handoff import build_handoff_preview
+from order_forecast.api.accountant_handoff_export import create_handoff_export, DEFAULT_EXPORT_COPY
+from order_forecast.api.accounting_store import AccountingExportBusy, accounting_export_scope
 from order_forecast.api.accounting_domain import Accounting
 from order_forecast.api import accounting_evidence as evidence
 from order_forecast.api.dependencies import get_firestore, verify_firebase_token
 from order_forecast.api.errors import install_api_error_handlers
+from order_forecast.api.middleware.rate_limit import limiter
 from order_forecast.api.routers import accounting
 from order_forecast.api.tests.test_business_access import fixture
 from order_forecast.api.tests.test_accounting import MemoryStore, analysis, expense
@@ -195,9 +203,151 @@ class AccountantHandoffBuilderTests(unittest.TestCase):
         changed = self.preview()
         self.assertNotEqual(first["snapshotId"], changed["snapshotId"])
 
+    def test_cluster_timestamp_format_is_accepted_and_malformed_dates_fail_closed(self):
+        paid = self.paid_expense(vendor="Timestamp format")
+        self.receipt("offset-time", linked=paid["id"], created_at="2026-09-12T18:00:00+00:00")
+        self.assertEqual(len(self.preview()["supportingPurchases"]), 1)
+
+        expenses = self.accounting.load("expenses")
+        expenses["items"][0]["date"] = "2026-02-31"
+        self.store.put("expenses", expenses)
+        with self.assertRaises(HTTPException) as raised:
+            self.preview()
+        self.assertEqual(raised.exception.status_code, 503)
+
+    def test_zip_uses_same_snapshot_hashes_entries_and_escapes_spreadsheet_cells(self):
+        _, reading = self.statement("final")
+        self.confirm(reading, 0)
+        paid = self.paid_expense(vendor="=FORMULA", note="@hidden", amountCents=17500)
+        self.receipt("support", linked=paid["id"])
+        self.receipt("support-two", linked=paid["id"])
+        snapshot = self.preview()
+
+        with tempfile.TemporaryDirectory() as directory:
+            artifact = create_handoff_export(
+                self.store, "123456", snapshot, DEFAULT_EXPORT_COPY,
+                temp_directory=directory,
+            )
+            self.assertTrue(Path(artifact.path).is_file())
+            with zipfile.ZipFile(artifact.path) as bundle:
+                names = set(bundle.namelist())
+                self.assertTrue({"summary.pdf", "income-by-billing-period.csv", "paid-expenses.csv",
+                                 "data-gaps.csv", "manifest.json"}.issubset(names))
+                self.assertTrue(any(name.startswith("settlement-statements/") for name in names))
+                supporting = [name for name in names if name.startswith("supporting-documents/")]
+                self.assertEqual(len(supporting), 2)
+                self.assertEqual(len(set(supporting)), 2)
+                self.assertTrue(bundle.read("summary.pdf").startswith(b"%PDF-1.4"))
+                self.assertTrue(bundle.read("summary.pdf").endswith(b"%%EOF\n"))
+                expenses_csv = bundle.read("paid-expenses.csv").decode("utf-8-sig")
+                self.assertIn("'=FORMULA", expenses_csv)
+                self.assertIn("'@hidden", expenses_csv)
+                manifest = json.loads(bundle.read("manifest.json"))
+                self.assertEqual(manifest["snapshot"]["snapshotId"], snapshot["snapshotId"])
+                self.assertNotIn("manifest.json", {entry["path"] for entry in manifest["entries"]})
+                for entry in manifest["entries"]:
+                    content = bundle.read(entry["path"])
+                    self.assertEqual(entry["bytes"], len(content))
+                    self.assertEqual(entry["sha256"], hashlib.sha256(content).hexdigest())
+                self.assertEqual(artifact.manifest_sha256,
+                                 hashlib.sha256(bundle.read("manifest.json")).hexdigest())
+
+    def test_export_refuses_source_changed_after_preview_and_removes_partial_file(self):
+        manifest, reading = self.statement("final")
+        self.confirm(reading, 0)
+        snapshot = self.preview()
+        key = ("statement", manifest["id"], manifest["files"][0]["id"])
+        self.store.originals[key]["content"] += b"tampered"
+
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaises(HTTPException) as raised:
+                create_handoff_export(self.store, "123456", snapshot, DEFAULT_EXPORT_COPY,
+                                      temp_directory=directory)
+            self.assertEqual(raised.exception.status_code, 503)
+            self.assertEqual(list(Path(directory).iterdir()), [])
+
+    def test_export_refuses_preview_over_hard_limit_without_reading_sources(self):
+        snapshot = self.preview()
+        snapshot["export"].update(available=False, reasonCode="HANDOFF_EXPORT_TOO_LARGE")
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaises(HTTPException) as raised:
+                create_handoff_export(self.store, "123456", snapshot, DEFAULT_EXPORT_COPY,
+                                      temp_directory=directory)
+            self.assertEqual(raised.exception.status_code, 413)
+            self.assertEqual(list(Path(directory).iterdir()), [])
+
+
+class AccountantHandoffExportScopeTests(unittest.TestCase):
+    class Cursor:
+        def __init__(self, try_lock=True, unlock=True):
+            self.try_lock, self.unlock, self.last = try_lock, unlock, ""
+            self.queries = []
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return False
+
+        def execute(self, query, params=None):
+            self.last = query
+            self.queries.append((query, params))
+
+        def fetchone(self):
+            if "pg_try_advisory_lock" in self.last:
+                return (self.try_lock,)
+            if "pg_advisory_unlock" in self.last:
+                return (self.unlock,)
+            raise AssertionError(self.last)
+
+    class Connection:
+        def __init__(self, cursor):
+            self.saved_cursor = cursor
+            self.rollbacks = 0
+
+        def cursor(self):
+            return self.saved_cursor
+
+        def rollback(self):
+            self.rollbacks += 1
+
+    def test_cluster_lock_is_acquired_and_released_even_when_export_fails(self):
+        cursor = self.Cursor()
+        connection = self.Connection(cursor)
+        released, discarded = [], []
+        with self.assertRaisesRegex(RuntimeError, "export failed"):
+            with accounting_export_scope("owner", "989262", acquire=lambda: connection,
+                                         release=released.append, discard=discarded.append):
+                raise RuntimeError("export failed")
+        self.assertTrue(any("pg_try_advisory_lock" in query for query, _ in cursor.queries))
+        self.assertTrue(any("pg_advisory_unlock" in query for query, _ in cursor.queries))
+        self.assertEqual(released, [connection])
+        self.assertEqual(discarded, [])
+
+    def test_busy_scope_returns_connection_without_yielding(self):
+        cursor = self.Cursor(try_lock=False)
+        connection = self.Connection(cursor)
+        released = []
+        with self.assertRaises(AccountingExportBusy):
+            with accounting_export_scope("owner", "989262", acquire=lambda: connection,
+                                         release=released.append, discard=lambda _: None):
+                self.fail("busy scope yielded")
+        self.assertFalse(any("pg_advisory_unlock" in query for query, _ in cursor.queries))
+        self.assertEqual(released, [connection])
+
+    def test_failed_unlock_discards_pooled_connection(self):
+        cursor = self.Cursor(unlock=False)
+        connection = self.Connection(cursor)
+        released, discarded = [], []
+        with accounting_export_scope("owner", "989262", acquire=lambda: connection,
+                                     release=released.append, discard=discarded.append):
+            pass
+        self.assertEqual(released, [])
+        self.assertEqual(discarded, [connection])
 
 class AccountantHandoffHttpTests(unittest.TestCase):
     def setUp(self):
+        limiter.reset()
         self.app = FastAPI()
         install_api_error_handlers(self.app, debug_mode=False, app_logger=logging.getLogger("test.handoff"))
         self.app.include_router(accounting.router, prefix="/api")
@@ -219,10 +369,16 @@ class AccountantHandoffHttpTests(unittest.TestCase):
         self.patcher = patch.object(accounting, "accounting_transaction", transaction)
         self.patcher.start()
         self.addCleanup(self.patcher.stop)
+        self.export_patcher = patch.object(accounting, "accounting_export_scope", transaction)
+        self.export_patcher.start()
+        self.addCleanup(self.export_patcher.stop)
         self.client = TestClient(self.app, raise_server_exceptions=False)
 
     def get(self, year="2026"):
         return self.client.get(f"/api/business/accounting/handoff/preview?route=989262&year={year}")
+
+    def export(self, year="2026"):
+        return self.client.get(f"/api/business/accounting/handoff/export?route=989262&year={year}")
 
     def test_owner_preview_is_read_only_no_store_and_versioned(self):
         response = self.get()
@@ -236,10 +392,35 @@ class AccountantHandoffHttpTests(unittest.TestCase):
         self.assertEqual(response.status_code, 400, response.text)
         self.assertEqual(response.json()["code"], "HANDOFF_YEAR_INVALID")
 
+    def test_owner_export_is_zip_with_manifest_hash_and_temporary_file_is_removed(self):
+        before = set(Path(tempfile.gettempdir()).glob("routespark-handoff-*.zip"))
+        response = self.export()
+        after = set(Path(tempfile.gettempdir()).glob("routespark-handoff-*.zip"))
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.headers["content-type"], "application/zip")
+        self.assertIn("routespark-accountant-handoff-2026.zip", response.headers["content-disposition"])
+        with zipfile.ZipFile(io.BytesIO(response.content)) as bundle:
+            manifest = bundle.read("manifest.json")
+            self.assertEqual(response.headers["x-routespark-manifest-sha256"], hashlib.sha256(manifest).hexdigest())
+        self.assertEqual(after, before)
+
+    def test_export_errors_are_stable_and_do_not_leave_files(self):
+        with patch.object(accounting, "execute_handoff_export", side_effect=HTTPException(413, "private")):
+            too_large = self.export()
+        self.assertEqual(too_large.status_code, 413)
+        self.assertEqual(too_large.json()["code"], "HANDOFF_EXPORT_TOO_LARGE")
+        self.assertNotIn("private", too_large.text)
+
+        with patch.object(accounting, "execute_handoff_export", side_effect=accounting.AccountingExportBusy()):
+            busy = self.export()
+        self.assertEqual(busy.status_code, 409)
+        self.assertEqual(busy.json()["code"], "HANDOFF_EXPORT_BUSY")
+
     def test_team_member_and_transferred_owner_cannot_preview(self):
         self.app.dependency_overrides[verify_firebase_token] = lambda: {"uid": "team-member"}
         self.db.set_document("users/team-member", {"profile": {"role": "teamMember", "routeNumber": "989262"}})
         self.assertEqual(self.get().status_code, 403)
+        self.assertEqual(self.export().status_code, 403)
         self.app.dependency_overrides[verify_firebase_token] = lambda: {"uid": "owner"}
         self.db.set_document("routes/989262", {"ownerUid": "someone-else"})
         self.assertEqual(self.get().status_code, 403)

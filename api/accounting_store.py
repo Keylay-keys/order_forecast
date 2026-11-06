@@ -10,7 +10,7 @@ from uuid import uuid4
 
 from psycopg2.extras import Json
 
-from .dependencies import get_pg_connection, return_pg_connection
+from .dependencies import _discard_pg_connection, get_pg_connection, return_pg_connection
 
 
 class AccountingStore:
@@ -128,6 +128,10 @@ class AccountingStore:
         return result
 
 
+class AccountingExportBusy(Exception):
+    pass
+
+
 @contextmanager
 def accounting_transaction(uid, route, *, acquire=get_pg_connection, release=return_pg_connection):
     conn = None
@@ -146,5 +150,50 @@ def accounting_transaction(uid, route, *, acquire=get_pg_connection, release=ret
             conn.rollback()
         raise
     finally:
+        if conn is not None:
+            release(conn)
+
+
+@contextmanager
+def accounting_export_scope(uid, route, *, acquire=get_pg_connection, release=return_pg_connection,
+                            discard=_discard_pg_connection):
+    """Read immutable export sources without holding the Accounting write lock.
+
+    A session advisory lock prevents another API replica from building a second
+    large bundle for the same owner and route. It is always released explicitly
+    before the pooled connection is returned.
+    """
+    conn = None
+    locked = False
+    lock_key = int.from_bytes(hashlib.sha256(("handoff\0" + uid + "\0" + route).encode()).digest()[:8],
+                              "big", signed=True)
+    try:
+        conn = acquire()
+        with conn.cursor() as cur:
+            cur.execute("SET TRANSACTION READ ONLY")
+            cur.execute("SET LOCAL lock_timeout = '5s'")
+            cur.execute("SET LOCAL statement_timeout = '120s'")
+            cur.execute("SELECT pg_try_advisory_lock(%s)", (lock_key,))
+            locked = bool(cur.fetchone()[0])
+            if not locked:
+                raise AccountingExportBusy()
+            yield AccountingStore(cur, uid, route)
+        conn.rollback()
+    except Exception:
+        if conn is not None:
+            conn.rollback()
+        raise
+    finally:
+        if conn is not None and locked:
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT pg_advisory_unlock(%s)", (lock_key,))
+                    if cur.fetchone()[0] is not True:
+                        raise RuntimeError("Accounting export lock was not held")
+                conn.rollback()
+            except Exception:
+                # Never return a connection that might retain a session lock.
+                discard(conn)
+                conn = None
         if conn is not None:
             release(conn)

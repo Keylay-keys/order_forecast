@@ -4,20 +4,23 @@ import asyncio
 import json
 import logging
 import re
+from pathlib import Path
 from datetime import datetime
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
-from fastapi.responses import Response
+from fastapi.responses import FileResponse, Response
+from starlette.background import BackgroundTask
 from starlette.concurrency import run_in_threadpool
 from starlette.datastructures import UploadFile
 
 from ..business_access import require_business_access
 from ..dependencies import get_firestore, verify_firebase_token
-from ..middleware.rate_limit import rate_limit_history
+from ..middleware.rate_limit import rate_limit_accounting_export, rate_limit_history
 from ..accounting_domain import Accounting, fail, identifier, now
-from ..accounting_store import accounting_transaction
+from ..accounting_store import AccountingExportBusy, accounting_export_scope, accounting_transaction
 from ..accountant_handoff import build_handoff_preview
+from ..accountant_handoff_export import create_handoff_export, DEFAULT_EXPORT_COPY
 from ..accounting_pdf_capacity import request_capacity
 from ..errors import StructuredApiError
 from .. import accounting_evidence as evidence
@@ -184,6 +187,25 @@ def execute_handoff_preview(uid, route, year):
         return build_handoff_preview(store, route, year)
 
 
+def execute_handoff_export(uid, route, year):
+    snapshot = execute_handoff_preview(uid, route, year)
+    with accounting_export_scope(uid, route) as store:
+        return create_handoff_export(store, route, snapshot, DEFAULT_EXPORT_COPY)
+
+
+def delete_handoff_export(path):
+    try:
+        Path(path).unlink(missing_ok=True)
+    except Exception:
+        logger.warning("Accountant handoff temporary file cleanup failed")
+
+
+def handoff_year(value):
+    if re.fullmatch(r"(?:20|21)[0-9]{2}", value) is None:
+        raise StructuredApiError(400, "Choose a valid handoff year", "HANDOFF_YEAR_INVALID")
+    return int(value)
+
+
 @router.get("/business/accounting/handoff/preview")
 @rate_limit_history
 async def accountant_handoff_preview(
@@ -194,10 +216,9 @@ async def accountant_handoff_preview(
     db=Depends(get_firestore),
 ):
     await require_business_access(route, decoded_token, db)
-    if re.fullmatch(r"(?:20|21)[0-9]{2}", year) is None:
-        raise StructuredApiError(400, "Choose a valid handoff year", "HANDOFF_YEAR_INVALID")
+    selected_year = handoff_year(year)
     try:
-        result = await run_in_threadpool(execute_handoff_preview, decoded_token["uid"], route, int(year))
+        result = await run_in_threadpool(execute_handoff_preview, decoded_token["uid"], route, selected_year)
     except HTTPException as error:
         if error.status_code == 503:
             raise StructuredApiError(503, "Accountant handoff evidence could not be verified",
@@ -208,6 +229,43 @@ async def accountant_handoff_preview(
         raise StructuredApiError(503, "Accountant handoff is temporarily unavailable",
                                  "HANDOFF_PREVIEW_UNAVAILABLE") from None
     return Response(json.dumps(result, allow_nan=False), media_type="application/json", headers=HEADERS)
+
+
+@router.get("/business/accounting/handoff/export")
+@rate_limit_accounting_export
+async def accountant_handoff_export(
+    request: Request,
+    route: str = Query(..., pattern=r"^[0-9]{6}$"),
+    year: str = Query(...),
+    decoded_token: dict = Depends(verify_firebase_token),
+    db=Depends(get_firestore),
+):
+    await require_business_access(route, decoded_token, db)
+    selected_year = handoff_year(year)
+    try:
+        artifact = await run_in_threadpool(execute_handoff_export, decoded_token["uid"], route, selected_year)
+    except AccountingExportBusy:
+        raise StructuredApiError(409, "An Accountant handoff download is already being prepared",
+                                 "HANDOFF_EXPORT_BUSY") from None
+    except HTTPException as error:
+        if error.status_code == 413:
+            raise StructuredApiError(413, "This handoff is too large for one download",
+                                     "HANDOFF_EXPORT_TOO_LARGE") from None
+        if error.status_code == 503:
+            raise StructuredApiError(503, "Accountant handoff evidence could not be verified",
+                                     "HANDOFF_EVIDENCE_UNVERIFIED") from None
+        raise
+    except Exception:
+        logger.warning("Accountant handoff export could not complete")
+        raise StructuredApiError(503, "Accountant handoff download is temporarily unavailable",
+                                 "HANDOFF_EXPORT_UNAVAILABLE") from None
+    return FileResponse(
+        artifact.path,
+        media_type="application/zip",
+        filename=f"routespark-accountant-handoff-{selected_year}.zip",
+        headers={**HEADERS, "X-RouteSpark-Manifest-SHA256": artifact.manifest_sha256},
+        background=BackgroundTask(delete_handoff_export, artifact.path),
+    )
 
 
 @router.api_route("/business/accounting/{path:path}", methods=["GET", "POST", "PATCH", "DELETE"], dependencies=[Depends(upload_capacity)])
