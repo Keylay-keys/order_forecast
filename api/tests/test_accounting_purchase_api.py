@@ -107,7 +107,7 @@ class AccountingPurchaseApiTests(unittest.TestCase):
             "status": "imported", "route": ROUTE, "packetId": PACKET, "uploadId": PACKET,
         })
 
-    def test_import_replay_is_idempotent_without_downloading_again(self):
+    def test_non_pilot_team_member_replay_after_cleanup_is_idempotent(self):
         client, _ = self.client(upload(
             pendingClusterImport=False,
             clusterImportStatus="imported",
@@ -125,6 +125,9 @@ class AccountingPurchaseApiTests(unittest.TestCase):
                 json={"packetId": PACKET, "storageManifestHash": DIGEST},
             )
         self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {
+            "status": "imported", "route": ROUTE, "packetId": PACKET, "uploadId": PACKET,
+        })
         process.assert_not_called()
         cleanup.assert_not_called()
 

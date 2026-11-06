@@ -13,7 +13,6 @@ from order_forecast.api.tests.route_transfer_fakes import FakeFirestore
 
 def fixture():
     return FakeFirestore({
-        "accounting_pilots/owner": {"schemaVersion": 1, "enabled": True, "routes": ["989262"]},
         "users/owner": {"profile": {"role": "owner", "routeNumber": "989262"}},
         "routes/989262": {"ownerUid": "owner"},
         "routeNumbers/989262": {"userId": "owner"},
@@ -21,11 +20,10 @@ def fixture():
 
 
 class BusinessAccessTests(unittest.IsolatedAsyncioTestCase):
-    async def test_owner_invitation_and_both_canonical_anchors_required(self):
+    async def test_non_pilot_owner_and_both_canonical_anchors_required(self):
         db = fixture()
         self.assertIsNotNone(await require_business_access("989262", {"uid": "owner"}, db))
         for path, data in [
-            ("accounting_pilots/owner", {"schemaVersion": 1, "enabled": False, "routes": ["989262"]}),
             ("users/owner", {"profile": {"role": "teamMember", "routeNumber": "989262"}}),
             ("users/owner", {"profile": {"role": "owner", "routeNumber": "123456"}}),
             ("routes/989262", {"ownerUid": "new-owner"}),
@@ -40,10 +38,9 @@ class BusinessAccessTests(unittest.IsolatedAsyncioTestCase):
                     await require_business_access("989262", {"uid": "owner"}, db)
                 self.assertEqual(error.exception.status_code, 403)
 
-    async def test_other_invited_owner_cannot_read_kyles_route(self):
+    async def test_other_owner_cannot_read_kyles_route(self):
         db = fixture()
         db.set_document("users/tester", {"profile": {"role": "owner", "routeNumber": "123456"}})
-        db.set_document("accounting_pilots/tester", {"schemaVersion": 1, "enabled": True, "routes": ["123456", "989262"]})
         db.set_document("routes/123456", {"ownerUid": "tester"})
         db.set_document("routeNumbers/123456", {"userId": "tester"})
         await require_business_access("123456", {"uid": "tester"}, db)
@@ -51,24 +48,22 @@ class BusinessAccessTests(unittest.IsolatedAsyncioTestCase):
             await require_business_access("989262", {"uid": "tester"}, db)
         self.assertEqual(error.exception.status_code, 403)
 
-    async def test_malformed_missing_and_client_forged_grants_fail_closed(self):
-        for data in [{}, {"enabled": True, "routes": ["989262"]},
-                     {"schemaVersion": True, "enabled": True, "routes": ["989262"]},
-                     {"schemaVersion": 1, "enabled": "true", "routes": ["989262"]},
-                     {"schemaVersion": 1, "enabled": True, "routes": "989262"},
-                     {"schemaVersion": 1, "enabled": True, "routes": [989262]},
-                     {"schemaVersion": 1, "enabled": True, "routes": ["*"]}]:
-            with self.subTest(data=data):
-                db = fixture()
-                db.set_document("accounting_pilots/owner", data)
-                with self.assertRaises(HTTPException) as error:
-                    await require_business_access("989262", {"uid": "owner", "accountingBeta": True}, db)
-                self.assertEqual(error.exception.status_code, 403)
+    async def test_client_claim_cannot_replace_canonical_ownership(self):
+        db = fixture()
+        db.set_document("routes/989262", {"ownerUid": "other"})
+        with self.assertRaises(HTTPException) as error:
+            await require_business_access(
+                "989262",
+                {"uid": "owner", "accountingBeta": True, "routeNumber": "989262"},
+                db,
+            )
+        self.assertEqual(error.exception.status_code, 403)
 
-    async def test_revocation_applies_to_next_request(self):
+    async def test_route_transfer_revokes_access_on_next_request(self):
         db = fixture()
         await require_business_access("989262", {"uid": "owner"}, db)
-        db.update_document("accounting_pilots/owner", {"enabled": False})
+        db.set_document("routes/989262", {"ownerUid": "new-owner"})
+        db.set_document("routeNumbers/989262", {"userId": "new-owner"})
         with self.assertRaises(HTTPException) as error:
             await require_business_access("989262", {"uid": "owner"}, db)
         self.assertEqual(error.exception.status_code, 403)
@@ -87,7 +82,7 @@ class BusinessAccessTests(unittest.IsolatedAsyncioTestCase):
                 await require_business_access(route, token, fixture())
             self.assertEqual(error.exception.status_code, expected)
 
-    def test_direct_http_requires_auth_and_denies_uninvited_owner(self):
+    def test_direct_http_requires_auth_and_denies_wrong_owner(self):
         app = FastAPI()
         app.include_router(business.router, prefix="/api")
         app.include_router(metrics.router, prefix="/api")
@@ -99,7 +94,7 @@ class BusinessAccessTests(unittest.IsolatedAsyncioTestCase):
             response = client.get("/api/business/access?route=989262")
             self.assertEqual(response.status_code, 200)
             self.assertEqual(response.json(), {"uid": "owner", "routeNumber": "989262", "enabled": True})
-            db.set_document("accounting_pilots/owner", {})
+            db.set_document("routes/989262", {"ownerUid": "other"})
             for path in ["business/access", "metrics/settlements", "metrics/expenses", "metrics/payroll"]:
                 self.assertEqual(client.get(f"/api/{path}?route=989262").status_code, 403)
             self.assertEqual(client.delete("/api/metrics/expenses/example?route=989262").status_code, 403)

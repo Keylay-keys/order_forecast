@@ -1,4 +1,4 @@
-"""Accounting pilot access and the authenticated cluster workflow API."""
+"""Accounting access and the authenticated cluster workflow API."""
 
 from fastapi import APIRouter, Depends, Query, Request
 from google.cloud import firestore
