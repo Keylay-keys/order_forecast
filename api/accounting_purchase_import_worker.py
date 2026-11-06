@@ -164,22 +164,16 @@ def parse_imported_upload(document_path: str, data: Any, expected_bucket: str) -
 
 
 def actor_allowed(packet: dict[str, Any], route_data: Any, claim_data: Any,
-                  pilot_data: Any, user_data: Any) -> str:
+                  user_data: Any) -> str:
     """Return the canonical owner UID after repeating the Firebase authorization."""
-    if not all(type(item) is dict for item in (route_data, claim_data, pilot_data, user_data)):
+    if not all(type(item) is dict for item in (route_data, claim_data, user_data)):
         _fail("ACCOUNTING_ACCESS_REVOKED")
     owner_uid = _clean(route_data.get("ownerUid"))
     route = packet["route"]
     uploader = packet["uploaderUid"]
-    routes = pilot_data.get("routes")
     if (
         not owner_uid
         or claim_data.get("userId") != owner_uid
-        or pilot_data.get("schemaVersion") != 1
-        or pilot_data.get("enabled") is not True
-        or type(routes) is not list
-        or not 1 <= len(routes) <= 100
-        or route not in routes
     ):
         _fail("ACCOUNTING_ACCESS_REVOKED")
     profile = user_data.get("profile") if type(user_data.get("profile")) is dict else {}
@@ -271,9 +265,12 @@ def authorize(db: Any, packet: dict[str, Any]) -> str:
     snapshots = {snapshot.reference.path: snapshot for snapshot in db.get_all([route_ref, claim_ref, user_ref])}
     route_data = _snapshot_data(snapshots.get(route_ref.path))
     owner_uid = _clean(route_data.get("ownerUid"))
-    pilot_data = _snapshot_data(db.collection("accounting_pilots").document(owner_uid).get()) if owner_uid else {}
-    return actor_allowed(packet, route_data, _snapshot_data(snapshots.get(claim_ref.path)), pilot_data,
-                         _snapshot_data(snapshots.get(user_ref.path)))
+    return actor_allowed(
+        packet,
+        route_data,
+        _snapshot_data(snapshots.get(claim_ref.path)),
+        _snapshot_data(snapshots.get(user_ref.path)),
+    )
 
 
 def download_sources(packet: dict[str, Any], bucket: Any) -> list[dict[str, Any]]:

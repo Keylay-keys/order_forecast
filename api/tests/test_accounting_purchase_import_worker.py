@@ -281,7 +281,6 @@ class PurchaseImportTests(unittest.TestCase):
             packet,
             {"ownerUid": OWNER},
             {"userId": OWNER},
-            {"schemaVersion": 1, "enabled": True, "routes": [ROUTE]},
             {"profile": {"role": "teamMember"}, "routeAssignments": {
                 ROUTE: {"role": "team_member", "verified": True, "assignedTo": OWNER},
             }},
@@ -303,7 +302,6 @@ class PurchaseImportTests(unittest.TestCase):
             f"users/{MEMBER}": {"routeAssignments": {ROUTE: {
                 "role": "team_member", "verified": True, "assignedTo": OWNER,
             }}},
-            f"accounting_pilots/{OWNER}": {"schemaVersion": 1, "enabled": True, "routes": [ROUTE]},
         })
         self.assertEqual(worker.authorize(db, packet), OWNER)
 
@@ -315,7 +313,6 @@ class PurchaseImportTests(unittest.TestCase):
             worker.actor_allowed(
                 packet,
                 {"ownerUid": OWNER}, {"userId": OWNER},
-                {"schemaVersion": 1, "enabled": True, "routes": [ROUTE]},
                 {"routeAssignments": {ROUTE: {
                     "role": "team_member", "verified": True, "assignedTo": "different-owner",
                 }}},
