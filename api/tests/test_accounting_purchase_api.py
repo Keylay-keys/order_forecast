@@ -1,4 +1,6 @@
 import unittest
+from contextlib import contextmanager
+from copy import deepcopy
 from datetime import datetime, timezone
 from unittest.mock import patch
 
@@ -33,7 +35,7 @@ class Reference:
     def collection(self, name):
         return Collection(self.db, f"{self.path}/{name}")
 
-    def get(self):
+    def get(self, transaction=None):
         return Snapshot(self)
 
 
@@ -48,10 +50,37 @@ class Collection:
 
 class Firestore:
     def __init__(self, data):
-        self.documents = {f"routes/{ROUTE}/accounting_purchase_uploads/{PACKET}": data}
+        self.documents = {
+            f"routes/{ROUTE}/accounting_purchase_uploads/{PACKET}": data,
+            f"routes/{ROUTE}": {"ownerUid": "owner-uid"},
+            f"routeNumbers/{ROUTE}": {"userId": "owner-uid"},
+            f"users/{UID}": {"routeAssignments": {ROUTE: {
+                "role": "team_member", "verified": True, "assignedTo": "owner-uid",
+            }}},
+        }
 
     def collection(self, name):
         return Collection(self, name)
+
+    def get_all(self, references):
+        return [reference.get() for reference in reversed(references)]
+
+
+class SourceStore:
+    def __init__(self, *, manifest=True, integrity=None, job="queued"):
+        self.manifest = {"id": PACKET} if manifest else None
+        self.integrity = integrity
+        self.job = job
+
+    def get(self, key):
+        if key == "receipt-upload:" + PACKET:
+            return deepcopy(self.manifest)
+        if key == "receipt-integrity:" + PACKET:
+            return deepcopy(self.integrity)
+        return None
+
+    def receipt_jobs(self):
+        return {} if self.job is None else {PACKET: self.job}
 
 
 def upload(**changes):
@@ -192,6 +221,85 @@ class AccountingPurchaseApiTests(unittest.TestCase):
                     )
                 self.assertEqual(response.status_code, 403)
                 process.assert_not_called()
+
+    def test_phone_source_status_supports_team_member_uploader(self):
+        client, _ = self.client(upload(
+            pendingClusterImport=False,
+            clusterImportStatus="imported",
+            clusterImportUploadId=PACKET,
+            clusterImportOwnerUid="owner-uid",
+        ))
+        with patch.object(
+            accounting_purchase, "_receipt_source_status", return_value={"status": "verified"},
+        ) as source_status:
+            response = client.get(
+                f"/api/business/accounting-purchase-source-status?route={ROUTE}&packetId={PACKET}",
+            )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {
+            "route": ROUTE, "packetId": PACKET, "status": "verified",
+        })
+        source_status.assert_called_once_with("owner-uid", ROUTE, PACKET)
+
+    def test_phone_processing_status_is_private_and_retryable(self):
+        client, _ = self.client(upload(
+            pendingClusterImport=False,
+            clusterImportStatus="imported",
+            clusterImportUploadId=PACKET,
+            clusterImportOwnerUid="owner-uid",
+        ))
+        with patch.object(
+            accounting_purchase, "_receipt_source_status", return_value={"status": "processing"},
+        ):
+            response = client.get(
+                f"/api/business/accounting-purchase-source-status?route={ROUTE}&packetId={PACKET}",
+            )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers["retry-after"], "5")
+        self.assertEqual(response.headers["cache-control"], "private, no-store")
+
+    def test_phone_source_status_denies_other_uploader_or_revoked_member(self):
+        for data, revoke in (
+            (upload(pendingClusterImport=False, clusterImportStatus="imported",
+                    clusterImportUploadId=PACKET, clusterImportOwnerUid="owner-uid", userId="other"), False),
+            (upload(pendingClusterImport=False, clusterImportStatus="imported",
+                    clusterImportUploadId=PACKET, clusterImportOwnerUid="owner-uid"), True),
+        ):
+            with self.subTest(revoke=revoke):
+                client, db = self.client(data)
+                if revoke:
+                    db.documents[f"users/{UID}"]["routeAssignments"][ROUTE]["verified"] = False
+                response = client.get(
+                    f"/api/business/accounting-purchase-source-status?route={ROUTE}&packetId={PACKET}",
+                )
+                self.assertEqual(response.status_code, 403)
+
+    def test_source_status_keeps_photo_until_verified_and_returns_safe_rescan_reason(self):
+        cases = (
+            (SourceStore(job="queued"), {"status": "processing"}),
+            (SourceStore(job="running"), {"status": "verified"}),
+            (SourceStore(job="complete"), {"status": "verified"}),
+            (SourceStore(manifest=False), {"status": "needs_rescan", "reason": "stored_original_missing"}),
+            (SourceStore(integrity={
+                "schemaVersion": 1,
+                "status": "needs_rescan",
+                "reason": "stored_original_hash_mismatch",
+                "detectedAt": "2026-11-06T20:00:00+00:00",
+            }), {"status": "needs_rescan", "reason": "stored_original_hash_mismatch"}),
+        )
+        for store, expected in cases:
+            with self.subTest(expected=expected):
+                @contextmanager
+                def transaction(uid, route):
+                    self.assertEqual((uid, route), ("owner-uid", ROUTE))
+                    yield store
+
+                self.assertEqual(
+                    accounting_purchase._receipt_source_status(
+                        "owner-uid", ROUTE, PACKET, transaction,
+                    ),
+                    expected,
+                )
 
 
 if __name__ == "__main__":

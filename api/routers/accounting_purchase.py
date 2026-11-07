@@ -18,7 +18,14 @@ from fastapi.responses import Response
 from starlette.concurrency import run_in_threadpool
 
 from ..accounting_domain import fail
-from ..accounting_purchase_import_worker import process_reference, schedule_firebase_cleanup
+from ..accounting_evidence import saved_receipt_integrity
+from ..accounting_purchase_import_worker import (
+    PermanentImportError,
+    actor_allowed,
+    process_reference,
+    schedule_firebase_cleanup,
+)
+from ..accounting_store import accounting_transaction
 from ..dependencies import get_firestore, verify_firebase_token
 from ..middleware.rate_limit import rate_limit_history
 from .accounting import HEADERS, bounded_body
@@ -85,6 +92,90 @@ def _verified_result(data: dict, *, route: str, packet_id: str, uid: str, digest
             "uploadId": packet_id,
         }
     return None
+
+
+def _status_owner(db, data: dict, *, route: str, packet_id: str, uid: str) -> str:
+    """Recheck the exact uploader and current route authority for phone polling."""
+    if (
+        data.get("schemaVersion") != 1
+        or data.get("id") != packet_id
+        or data.get("routeNumber") != route
+        or data.get("userId") != uid
+        or data.get("source") != "app_scan"
+        or data.get("clusterImportStatus") != "imported"
+        or data.get("pendingClusterImport") is not False
+        or data.get("clusterImportUploadId") != packet_id
+    ):
+        raise HTTPException(403, "Purchase upload access denied")
+    route_ref = db.collection("routes").document(route)
+    claim_ref = db.collection("routeNumbers").document(route)
+    user_ref = db.collection("users").document(uid)
+    snapshots = {snapshot.reference.path: snapshot for snapshot in db.get_all([
+        route_ref, claim_ref, user_ref,
+    ])}
+    route_data = _data(snapshots.get(route_ref.path))
+    try:
+        owner_uid = actor_allowed(
+            {"route": route, "uploaderUid": uid},
+            route_data,
+            _data(snapshots.get(claim_ref.path)),
+            _data(snapshots.get(user_ref.path)),
+        )
+    except PermanentImportError:
+        raise HTTPException(403, "Purchase upload access denied") from None
+    if data.get("clusterImportOwnerUid") != owner_uid:
+        raise HTTPException(403, "Purchase upload access denied")
+    return owner_uid
+
+
+def _receipt_source_status(owner_uid: str, route: str, packet_id: str,
+                           transaction_factory=accounting_transaction) -> dict:
+    with transaction_factory(owner_uid, route) as store:
+        manifest = store.get("receipt-upload:" + packet_id)
+        if manifest is None:
+            return {"status": "needs_rescan", "reason": "stored_original_missing"}
+        integrity = saved_receipt_integrity(store, packet_id)
+        if integrity:
+            return {"status": "needs_rescan", "reason": integrity["reason"]}
+        job = store.receipt_jobs().get(packet_id)
+        return {"status": "processing" if job in (None, "queued") else "verified"}
+
+
+@router.get("/business/accounting-purchase-source-status")
+@rate_limit_history
+async def accounting_purchase_source_status(
+    request: Request,
+    route: str = Query(..., pattern=r"^[0-9]{6}$"),
+    packetId: str = Query(..., pattern=PACKET.pattern),
+    decoded_token: dict = Depends(verify_firebase_token),
+    db=Depends(get_firestore),
+):
+    """Let only the original phone uploader wait for cluster source verification."""
+    uid = decoded_token.get("uid")
+    if not isinstance(uid, str) or not uid:
+        raise HTTPException(401, "Authentication required")
+    reference = db.collection("routes").document(route).collection(
+        "accounting_purchase_uploads"
+    ).document(packetId)
+    data = _data(await run_in_threadpool(reference.get))
+    if not data:
+        raise HTTPException(404, "Purchase upload not found")
+    try:
+        owner_uid = await run_in_threadpool(
+            _status_owner, db, data, route=route, packet_id=packetId, uid=uid,
+        )
+        state = await run_in_threadpool(_receipt_source_status, owner_uid, route, packetId)
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(
+            503, "Purchase source verification is still pending.", headers={"Retry-After": "5"},
+        ) from None
+    result = {"route": route, "packetId": packetId, **state}
+    headers = dict(HEADERS)
+    if state["status"] == "processing":
+        headers["Retry-After"] = "5"
+    return Response(json.dumps(result), media_type="application/json", headers=headers)
 
 
 @router.post("/business/accounting-purchase-import")

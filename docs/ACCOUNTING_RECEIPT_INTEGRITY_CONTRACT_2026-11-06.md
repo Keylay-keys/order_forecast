@@ -29,6 +29,30 @@ add a client-computed digest for additional end-to-end evidence, but that is not
 the boundary that previously allowed an unverified database write to be called
 imported.
 
+## Phone source-status contract
+
+After import, the original authenticated uploader may poll:
+
+`GET /api/business/accounting-purchase-source-status?route={route}&packetId={packetId}`
+
+The endpoint rechecks the upload identity, the uploader's current owner or
+verified-team-member assignment, both canonical route ownership anchors, and
+the cluster import owner. It returns no receipt content or route-wide data.
+
+Possible responses are:
+
+```json
+{"route":"989262","packetId":"...","status":"processing"}
+{"route":"989262","packetId":"...","status":"verified"}
+{"route":"989262","packetId":"...","status":"needs_rescan","reason":"stored_original_hash_mismatch"}
+```
+
+`processing` includes `Retry-After: 5`. Every response is private and
+non-cacheable. The app should keep its retained photo and small upload record
+while processing, remove both after `verified`, and keep the photo while showing
+the rescan alert after `needs_rescan`. A revoked team member and any other user
+receive no status.
+
 ## Receipt inbox integrity status
 
 Before OCR claims a receipt, the cluster reads and verifies every saved source.
