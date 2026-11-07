@@ -336,12 +336,60 @@ def receipt_review(store, route, manifest):
         groupedFileIds=[f["id"] for f in manifest["files"]], includeInAccountantHandoff=False, status="reviewing")
 
 
+RECEIPT_INTEGRITY_REASONS = frozenset((
+    "stored_original_missing",
+    "stored_original_hash_mismatch",
+    "stored_original_metadata_mismatch",
+))
+
+
+def receipt_source_integrity(store, manifest):
+    """Return a stable user-action reason when retained receipt bytes are unsafe."""
+    for file in manifest["files"]:
+        try:
+            source = store.original("receipt", manifest["id"], file["id"])
+        except RuntimeError:
+            return "stored_original_hash_mismatch"
+        if source is None:
+            return "stored_original_missing"
+        if (
+            source.get("sha256") != file["sha256"]
+            or source.get("mediaType") != file["mediaType"]
+            or source.get("originalName") != file["originalName"]
+            or len(source.get("content", b"")) != file["bytes"]
+        ):
+            return "stored_original_metadata_mismatch"
+    return None
+
+
+def saved_receipt_integrity(store, upload_id):
+    value = store.get("receipt-integrity:" + upload_id)
+    if value is None:
+        return None
+    if (
+        type(value) is not dict
+        or set(value) != {"schemaVersion", "status", "reason", "detectedAt"}
+        or value.get("schemaVersion") != 1
+        or value.get("status") != "needs_rescan"
+        or value.get("reason") not in RECEIPT_INTEGRITY_REASONS
+        or not isinstance(value.get("detectedAt"), str)
+    ):
+        fail("Receipt integrity status could not be verified.", 503)
+    from datetime import datetime
+    try:
+        datetime.fromisoformat(value["detectedAt"].replace("Z", "+00:00"))
+    except ValueError:
+        fail("Receipt integrity status could not be verified.", 503)
+    return value
+
+
 def receipt_inbox(store, route):
     items, archived_items = [], []
     jobs = store.receipt_jobs()
     agent_jobs = store.receipt_agent_reviews()
     for manifest in store.documents("receipt-upload:"):
         review = receipt_review(store, route, manifest)
+        integrity = saved_receipt_integrity(store, manifest["id"])
         archived = bool(review.get("archivedAt"))
         pointer = store.get("receipt-latest:" + manifest["id"])
         report = store.attempt("receipt", manifest["id"], manifest["id"], pointer["attemptId"]) if pointer else None
@@ -368,8 +416,11 @@ def receipt_inbox(store, route):
                 ocrStatus=(document or {}).get("status", "unsupported"), fields=extraction.get("fields", {})))
         item = dict(packetId=manifest["id"], createdAt=manifest["createdAt"], ocrStatus=report["status"] if report else "not_run",
                     files=review_files, proposal=(agent_report or {}).get("proposal"), review=review,
-                    processingStatus=(("agent_" + agent["status"]) if agent and agent["status"] != "complete"
+                    processingStatus=("needs_attention" if integrity else
+                                      ("agent_" + agent["status"]) if agent and agent["status"] != "complete"
                                       else "complete" if agent_report else jobs.get(manifest["id"], "needs_attention")))
+        if integrity:
+            item["sourceIntegrity"] = integrity
         if report:
             item.update(ocrAttemptId=report["attemptId"], ocrCreatedAt=report["createdAt"], pipelineVersion=report["pipelineVersion"])
         if agent_report:

@@ -14,9 +14,14 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import Response
 from starlette.concurrency import run_in_threadpool
 
-from ..accounting_domain import fail, identifier
+from ..accounting_domain import fail, identifier, now
 from ..accounting_store import AccountingStore
-from ..accounting_evidence import accept_receipt_agent_attempt, accept_receipt_attempt, original
+from ..accounting_evidence import (
+    accept_receipt_agent_attempt,
+    accept_receipt_attempt,
+    original,
+    receipt_source_integrity,
+)
 from ..business_access import require_business_access
 from ..dependencies import get_firestore, get_pg_connection, return_pg_connection
 from .accounting import HEADERS, bounded_body
@@ -65,6 +70,21 @@ def claim():
         lease = str(uuid4())
         cur.execute("""UPDATE accounting_receipt_jobs SET status='running',attempts=attempts+1,
             lease_token=%s,lease_expires_at=now()+interval '10 minutes',updated_at=now() WHERE job_id=%s""", (lease, job))
+        store = AccountingStore(cur, uid, route)
+        manifest = store.get("receipt-upload:" + upload)
+        if manifest is None:
+            cur.execute("UPDATE accounting_receipt_jobs SET status='blocked',updated_at=now() WHERE job_id=%s", (job,))
+            return None
+        reason = receipt_source_integrity(store, manifest)
+        if reason:
+            store.put("receipt-integrity:" + upload, {
+                "schemaVersion": 1,
+                "status": "needs_rescan",
+                "reason": reason,
+                "detectedAt": now(),
+            })
+            cur.execute("UPDATE accounting_receipt_jobs SET status='blocked',updated_at=now() WHERE job_id=%s", (job,))
+            return None
         return dict(jobId=job, uid=uid, route=route, uploadId=upload, lease=lease)
 
 

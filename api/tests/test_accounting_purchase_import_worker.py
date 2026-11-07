@@ -90,6 +90,20 @@ class FakeStore:
     def add_original(self, kind, upload, file, content):
         self.originals[(kind, file["sha256"])] = (upload, file, content)
 
+    def original(self, kind, upload, file_id):
+        for stored_kind, _digest in self.originals:
+            stored_upload, file, content = self.originals[(stored_kind, _digest)]
+            if stored_kind == kind and stored_upload == upload and file["id"] == file_id:
+                if hashlib.sha256(content).hexdigest() != file["sha256"]:
+                    raise RuntimeError("Original integrity mismatch")
+                return {
+                    "sha256": file["sha256"],
+                    "mediaType": file["mediaType"],
+                    "originalName": file["originalName"],
+                    "content": content,
+                }
+        return None
+
     def queue_receipt(self, upload):
         self.jobs.add(upload)
 
@@ -229,6 +243,65 @@ class PurchaseImportTests(unittest.TestCase):
         self.assertTrue(replay)
         self.assertEqual(repeated, manifest)
         self.assertEqual(len(store.originals), 2)
+
+    def test_saved_packet_is_read_back_before_import_confirmation(self):
+        data = ready_upload(pages=2)
+        packet = worker.parse_ready_upload(
+            f"routes/{ROUTE}/accounting_purchase_uploads/{PACKET_ID}", data, BUCKET,
+        )
+        sources = worker.download_sources(packet, FakeBucket(data["storageManifest"]))
+        store = FakeStore()
+
+        @contextmanager
+        def transaction(uid, route):
+            self.assertEqual((uid, route), (OWNER, ROUTE))
+            yield store
+
+        manifest, _ = worker.save_packet(OWNER, packet, sources, transaction)
+        worker.verify_saved_packet(OWNER, packet, manifest, transaction)
+
+        key = next(iter(store.originals))
+        upload, file, _content = store.originals[key]
+        store.originals[key] = (upload, file, b"damaged after commit")
+        with self.assertRaisesRegex(RuntimeError, "Saved purchase original failed verification"):
+            worker.verify_saved_packet(OWNER, packet, manifest, transaction)
+
+    def test_failed_database_readback_never_marks_firebase_imported(self):
+        data = ready_upload()
+        path = f"routes/{ROUTE}/accounting_purchase_uploads/{PACKET_ID}"
+        db = FakeFirestore({path: data})
+        reference = FakeReference(db, path)
+        packet = worker.parse_ready_upload(path, data, BUCKET)
+        manifest = worker.receipt_manifest(packet, [{
+            "pageId": "page_0.jpg",
+            "content": JPEG,
+            "sha256": hashlib.sha256(JPEG).hexdigest(),
+        }])
+        finished = []
+
+        def finish(_db, _reference, _lease, values):
+            finished.append(values)
+            return True
+
+        with (
+            patch.object(worker, "_claim", return_value={"lease": "lease", "attempt": 1, "data": data}),
+            patch.object(worker, "authorize", return_value=OWNER),
+            patch.object(worker, "download_sources", return_value=[{
+                "pageId": "page_0.jpg", "content": JPEG,
+                "sha256": hashlib.sha256(JPEG).hexdigest(),
+            }]),
+            patch.object(worker, "save_packet", return_value=(manifest, False)),
+            patch.object(worker, "verify_saved_packet", side_effect=RuntimeError("readback failed")),
+            patch.object(worker, "_finish", side_effect=finish),
+        ):
+            self.assertFalse(worker.process_reference(
+                db, reference, BUCKET, bucket_factory=lambda _name: object(),
+            ))
+
+        self.assertEqual(len(finished), 1)
+        self.assertEqual(finished[0]["clusterImportStatus"], "queued")
+        self.assertTrue(finished[0]["pendingClusterImport"])
+        self.assertNotIn("clusterImportUploadId", finished[0])
 
     def test_cluster_schedules_cleanup_only_after_import(self):
         data = imported_upload(pages=2)

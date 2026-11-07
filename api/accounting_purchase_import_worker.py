@@ -252,6 +252,35 @@ def save_packet(owner_uid: str, packet: dict[str, Any], sources: list[dict[str, 
     return manifest, False
 
 
+def verify_saved_packet(owner_uid: str, packet: dict[str, Any], manifest: dict[str, Any],
+                        transaction_factory=accounting_transaction) -> None:
+    """Read committed originals through the normal integrity-checking path.
+
+    The phone removes its retained photos only after Firebase reports the cluster
+    import as complete.  Saving in one transaction and then reading in a new one
+    makes that response attest to committed, retrievable bytes rather than only a
+    successful INSERT call.
+    """
+    try:
+        with transaction_factory(owner_uid, packet["route"]) as store:
+            if store.get("receipt-upload:" + packet["packetId"]) != manifest:
+                raise RuntimeError("Saved purchase manifest failed verification")
+            for file in manifest["files"]:
+                source = store.original("receipt", manifest["id"], file["id"])
+                if (
+                    source is None
+                    or source.get("sha256") != file["sha256"]
+                    or source.get("mediaType") != file["mediaType"]
+                    or source.get("originalName") != file["originalName"]
+                    or len(source.get("content", b"")) != file["bytes"]
+                ):
+                    raise RuntimeError("Saved purchase original failed verification")
+    except Exception as error:
+        if isinstance(error, RuntimeError) and str(error).startswith("Saved purchase"):
+            raise
+        raise RuntimeError("Saved purchase original failed verification") from error
+
+
 def _snapshot_data(snapshot: Any) -> dict[str, Any]:
     return snapshot.to_dict() if snapshot is not None and snapshot.exists else {}
 
@@ -415,6 +444,7 @@ def process_reference(db: Any, reference: Any, expected_bucket: str, bucket_fact
         bucket = (bucket_factory or (lambda name: storage.bucket(name=name, app=get_firebase_app())))(expected_bucket)
         sources = download_sources(packet, bucket)
         manifest, replay = save_packet(owner_uid, packet, sources)
+        verify_saved_packet(owner_uid, packet, manifest)
         imported_at = datetime.now(timezone.utc)
         if not _finish(db, reference, lease, {
             "pendingClusterImport": False,

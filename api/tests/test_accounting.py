@@ -290,6 +290,26 @@ class AccountingBehaviorTests(unittest.TestCase):
                 self.assertNotIn("archivedAt", restored["items"][0]["review"])
                 self.assertEqual(evidence.original(store, "receipt", packet["id"], file_id)["content"], original)
 
+    def test_receipt_integrity_reason_is_exposed_without_file_identity(self):
+        packet = evidence.upload(self.store, "123456", "receipt", [
+            ("receipt.jpg", "image/jpeg", b"\xff\xd8\xff\xc0\x00\x08\x00\x00\x00\x00\x00\x00\xff\xda\x00\x02\xff\xd9")])
+        self.store.put("receipt-integrity:" + packet["id"], {
+            "schemaVersion": 1,
+            "status": "needs_rescan",
+            "reason": "stored_original_hash_mismatch",
+            "detectedAt": "2026-11-06T19:00:00+00:00",
+        })
+
+        item = evidence.receipt_inbox(self.store, "123456")["items"][0]
+        self.assertEqual(item["processingStatus"], "needs_attention")
+        self.assertEqual(item["sourceIntegrity"], {
+            "schemaVersion": 1,
+            "status": "needs_rescan",
+            "reason": "stored_original_hash_mismatch",
+            "detectedAt": "2026-11-06T19:00:00+00:00",
+        })
+        self.assertNotIn("fileId", item["sourceIntegrity"])
+
     def test_archived_running_receipt_can_finish_without_resurrection_or_agent_requeue(self):
         packet = evidence.upload(self.store, "123456", "receipt", [
             ("receipt.jpg", "image/jpeg", b"\xff\xd8\xff\xc0\x00\x08\x00\x00\x00\x00\x00\x00\xff\xda\x00\x02\xff\xd9")])
