@@ -167,7 +167,7 @@ class AccountantHandoffBuilderTests(unittest.TestCase):
         self.assertIn("PAID_EXPENSE_WITHOUT_SUPPORTING_DOCUMENTS", codes)
         self.assertEqual(result["export"]["sourceFileCount"], 1)
 
-    def test_confirmed_pointer_manifest_and_original_mismatches_fail_closed(self):
+    def test_unverified_statement_is_omitted_and_becomes_a_dated_gap(self):
         manifest, reading = self.statement("verified")
         self.confirm(reading, 0)
         cases = []
@@ -187,13 +187,36 @@ class AccountantHandoffBuilderTests(unittest.TestCase):
                 saved = deepcopy(self.store.attempts if kind == "attempt" else self.store.originals)
                 target = self.store.attempts if kind == "attempt" else self.store.originals
                 target[key] = bad
-                with self.assertRaises(HTTPException) as raised:
-                    self.preview()
-                self.assertEqual(raised.exception.status_code, 503)
+                result = self.preview()
+                self.assertEqual(result["statementPeriods"], [])
+                gap = next(item for item in result["gaps"] if item["code"] == "STATEMENT_EVIDENCE_UNVERIFIED")
+                self.assertEqual(gap["dates"], {"periodStart": "2026-09-03", "periodEnd": "2026-09-09"})
+                self.assertEqual(result["export"]["sourceFileCount"], 0)
+                if kind == "attempt":
+                    with tempfile.TemporaryDirectory() as directory:
+                        artifact = create_handoff_export(self.store, "123456", result, DEFAULT_EXPORT_COPY,
+                                                         temp_directory=directory)
+                        with zipfile.ZipFile(artifact.path) as bundle:
+                            gaps = bundle.read("items-to-check.csv").decode("utf-8-sig")
+                            self.assertIn("Saved settlement statement could not be verified and is not included", gaps)
                 if kind == "attempt":
                     self.store.attempts = saved
                 else:
                     self.store.originals = saved
+
+    def test_unverified_receipt_is_omitted_and_becomes_a_dated_gap(self):
+        paid = self.paid_expense(vendor="Damaged receipt")
+        manifest = self.receipt("damaged", linked=paid["id"], created_at="2026-09-12T18:00:00Z")
+        original_key = ("receipt", manifest["id"], manifest["files"][0]["id"])
+        self.store.originals[original_key]["content"] += b"tampered"
+
+        result = self.preview()
+
+        self.assertEqual(result["supportingPurchases"], [])
+        receipt_gap = next(item for item in result["gaps"] if item["code"] == "SUPPORTING_DOCUMENT_EVIDENCE_UNVERIFIED")
+        self.assertEqual(receipt_gap["dates"], {"createdAt": "2026-09-12"})
+        self.assertNotIn("PAID_EXPENSE_WITHOUT_SUPPORTING_DOCUMENTS", {item["code"] for item in result["gaps"]})
+        self.assertEqual(result["export"]["sourceFileCount"], 0)
 
     def test_snapshot_is_deterministic_and_changes_with_included_facts(self):
         self.paid_expense(vendor="Stable")
@@ -287,7 +310,7 @@ class AccountantHandoffBuilderTests(unittest.TestCase):
                 self.assertEqual(gaps[0]["Missing details"], "Gross sales")
                 manifest = json.loads(bundle.read("manifest.json"))
                 self.assertEqual(manifest["snapshot"]["snapshotId"], snapshot["snapshotId"])
-                self.assertEqual(manifest["copyVersion"], "labels-20261106")
+                self.assertEqual(manifest["copyVersion"], "labels-20261106-2")
                 self.assertNotIn("manifest.json", {entry["path"] for entry in manifest["entries"]})
                 for entry in manifest["entries"]:
                     content = bundle.read(entry["path"])
@@ -308,6 +331,9 @@ class AccountantHandoffBuilderTests(unittest.TestCase):
                 create_handoff_export(self.store, "123456", snapshot, DEFAULT_EXPORT_COPY,
                                       temp_directory=directory)
             self.assertEqual(raised.exception.status_code, 503)
+            self.assertEqual(raised.exception.details, {
+                "recordType": "statement", "periodStart": "2026-09-03", "periodEnd": "2026-09-09",
+            })
             self.assertEqual(list(Path(directory).iterdir()), [])
 
     def test_export_refuses_preview_over_hard_limit_without_reading_sources(self):
@@ -480,10 +506,12 @@ class AccountantHandoffHttpTests(unittest.TestCase):
         self.assertEqual(busy.json()["code"], "HANDOFF_EXPORT_BUSY")
 
         limiter.reset()
-        with patch.object(accounting, "execute_handoff_export", side_effect=HandoffEvidenceUnverified()):
+        safe_details = {"recordType": "receipt", "createdDate": "2026-09-12"}
+        with patch.object(accounting, "execute_handoff_export", side_effect=HandoffEvidenceUnverified(safe_details)):
             unverified = self.export()
         self.assertEqual(unverified.status_code, 503)
         self.assertEqual(unverified.json()["code"], "HANDOFF_EVIDENCE_UNVERIFIED")
+        self.assertEqual(unverified.json()["details"], safe_details)
 
         limiter.reset()
         with patch.object(accounting, "execute_handoff_export", side_effect=HTTPException(503, "private")):
@@ -493,16 +521,34 @@ class AccountantHandoffHttpTests(unittest.TestCase):
         self.assertNotIn("private", unavailable.text)
 
     def test_preview_distinguishes_unverified_evidence_from_unavailable_storage(self):
-        with patch.object(accounting, "execute_handoff_preview", side_effect=HandoffEvidenceUnverified()):
+        safe_details = {"recordType": "statement", "periodStart": "2026-09-03", "periodEnd": "2026-09-09"}
+        with patch.object(accounting, "execute_handoff_preview", side_effect=HandoffEvidenceUnverified(safe_details)):
             unverified = self.get()
         self.assertEqual(unverified.status_code, 503)
         self.assertEqual(unverified.json()["code"], "HANDOFF_EVIDENCE_UNVERIFIED")
+        self.assertEqual(unverified.json()["details"], safe_details)
 
         with patch.object(accounting, "execute_handoff_preview", side_effect=HTTPException(503, "private")):
             unavailable = self.get()
         self.assertEqual(unavailable.status_code, 503)
         self.assertEqual(unavailable.json()["code"], "HANDOFF_PREVIEW_UNAVAILABLE")
         self.assertNotIn("private", unavailable.text)
+
+    def test_unverified_details_reject_ids_names_paths_hashes_and_invalid_dates(self):
+        unsafe = [
+            {"recordType": "statement", "periodStart": "2026-09-03", "periodEnd": "2026-09-09", "fileId": "private"},
+            {"recordType": "receipt", "createdDate": "2026-09-12", "path": "/private/source.jpg"},
+            {"recordType": "receipt", "createdDate": "2026-02-31"},
+            {"recordType": "statement", "periodStart": "2026-09-03", "periodEnd": "not-a-date"},
+        ]
+        for details in unsafe:
+            with self.subTest(details=details):
+                limiter.reset()
+                with patch.object(accounting, "execute_handoff_preview",
+                                  side_effect=HandoffEvidenceUnverified(details)):
+                    response = self.get()
+                self.assertEqual(response.status_code, 503)
+                self.assertNotIn("details", response.json())
 
     def test_team_member_and_transferred_owner_cannot_preview(self):
         self.app.dependency_overrides[verify_firebase_token] = lambda: {"uid": "team-member"}

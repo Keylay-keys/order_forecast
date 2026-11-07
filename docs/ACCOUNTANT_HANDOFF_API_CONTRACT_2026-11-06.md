@@ -56,10 +56,13 @@ The builder reads one consistent server-side snapshot and returns a
 - active cash-account collections;
 - active receipt reviews and the immutable supporting documents they select.
 
-The builder fails closed with `503 HANDOFF_EVIDENCE_UNVERIFIED` if a confirmed
-row, immutable attempt, manifest, original, byte count, or SHA-256 does not
-reconcile. It never falls back to a newer OCR attempt, a similarly named file,
-or another billing period.
+The builder fails closed at the smallest safe scope. If one statement or marked
+receipt can be identified by its already-saved dates but its immutable evidence
+does not reconcile, that document is omitted and a dated gap is added. Its
+unverified facts and bytes never contribute to a total or export. Other verified
+records for the year remain available. A failure that cannot be safely isolated
+still returns `503 HANDOFF_EVIDENCE_UNVERIFIED`. The builder never falls back to
+a newer OCR attempt, a similarly named file, or another billing period.
 
 Archived paid expenses, archived cash-account collections, and deleted receipts
 are excluded. A supporting document is exportable only when its active purchase
@@ -227,11 +230,25 @@ Stable v1 gap codes:
 
 - `MARKED_PURCHASE_WITHOUT_PAID_EXPENSE`
 - `PAID_EXPENSE_WITHOUT_SUPPORTING_DOCUMENTS`
+- `STATEMENT_EVIDENCE_UNVERIFIED`
+- `SUPPORTING_DOCUMENT_EVIDENCE_UNVERIFIED`
 - `STATEMENT_FACTS_UNKNOWN`
 - `PRELIMINARY_STATEMENT_ONLY`
 - `BILLING_PERIOD_CROSSES_CALENDAR_YEAR`
 
-An unverified or missing source is an endpoint failure, not a gap.
+`STATEMENT_EVIDENCE_UNVERIFIED` contains the billing-period start and end dates.
+`SUPPORTING_DOCUMENT_EVIDENCE_UNVERIFIED` contains the receipt's created date.
+The affected document is not included in `sourceFileCount`, `sourceBytes`, facts,
+or ZIP entries. A paid expense with an unverified supporting document does not
+also receive the generic no-supporting-documents gap.
+
+The portal must not claim that an already-confirmed final statement can be
+replaced in place; that action does not exist in v1. For a damaged final, it
+should identify the billing period, explain that the statement is left out, and
+tell the owner to retrieve a clean PDF from the original email and send it
+separately with the handoff. If a newer final exists, the owner can add that PDF
+in Money in. A damaged receipt should identify its created date and direct the
+owner to Receipts to remove and upload the supporting document again.
 
 ## ZIP export
 
@@ -294,8 +311,20 @@ final on-screen wording.
 | 503 | `HANDOFF_PREVIEW_UNAVAILABLE` | Preview storage or generation was unavailable |
 | 503 | `HANDOFF_EXPORT_UNAVAILABLE` | Bounded export generation failed without exposing internals |
 
+When `HANDOFF_EVIDENCE_UNVERIFIED` can be safely attributed, the existing
+`details` field contains exactly one of these allowlisted shapes:
+
+```json
+{"recordType":"statement","periodStart":"2026-09-03","periodEnd":"2026-09-09"}
+```
+
+```json
+{"recordType":"receipt","createdDate":"2026-09-12"}
+```
+
+No details are returned when those dates cannot themselves be trusted.
 No error names a database table, storage path, private email address, original
-filename, extracted document text, or another account.
+filename, extracted document text, hash, record ID, or another account.
 
 ## Snapshot identity
 
@@ -326,14 +355,18 @@ the ID.
 5. A marked unlinked purchase and an expense without documents both appear in
    `items-to-check.csv`.
 6. Archived expenses, archived collections, and deleted receipts are absent.
-7. Any source-pointer, manifest, byte-count, or hash mismatch fails closed.
-8. Owner, assigned team member, unrelated owner, and anonymous HTTP cases prove
+7. A safely attributable statement or receipt mismatch omits only that document,
+   adds the dated gap, and still produces a valid preview and ZIP from the other
+   verified records.
+8. Evidence changed between preview and export fails with the allowlisted record
+   type and dates, removes the partial ZIP, and exposes no ID, name, hash, or path.
+9. Owner, assigned team member, unrelated owner, and anonymous HTTP cases prove
    owner-only isolation.
-9. Preview and ZIP are built independently from the same canonical builder and
+10. Preview and ZIP are built independently from the same canonical builder and
    have matching `snapshotId`, totals, gaps, and manifest hashes.
-10. Filenames, CSV cells, ZIP paths, disconnect cleanup, rate limits, concurrent
+11. Filenames, CSV cells, ZIP paths, disconnect cleanup, rate limits, concurrent
     requests, and maximum sizes are exercised with hostile boundary inputs.
-11. Export generation is benchmarked on the cluster hardware without holding an
+12. Export generation is benchmarked on the cluster hardware without holding an
     Accounting write lock during PDF/image compression or response transfer.
 12. The endpoint writes no Accounting record and logs no financial values,
     document bytes, original filenames, or recovery material.

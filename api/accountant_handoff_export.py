@@ -19,7 +19,7 @@ from .accountant_handoff import HandoffEvidenceUnverified
 # Machine keys and archive paths are fixed by the API contract; these visible
 # headings can change without changing the JSON preview schema.
 DEFAULT_EXPORT_COPY = {
-    "version": "labels-20261106",
+    "version": "labels-20261106-2",
     "title": "Accountant handoff",
     "route": "Route",
     "year": "Year",
@@ -65,6 +65,8 @@ DEFAULT_EXPORT_COPY = {
     "gapLabels": {
         "MARKED_PURCHASE_WITHOUT_PAID_EXPENSE": "Purchase marked for the handoff is not linked to a paid expense",
         "PAID_EXPENSE_WITHOUT_SUPPORTING_DOCUMENTS": "Paid expense has no supporting documents",
+        "STATEMENT_EVIDENCE_UNVERIFIED": "Saved settlement statement could not be verified and is not included",
+        "SUPPORTING_DOCUMENT_EVIDENCE_UNVERIFIED": "Supporting documents could not be verified and are not included",
         "STATEMENT_FACTS_UNKNOWN": "Some statement figures are not available",
         "PRELIMINARY_STATEMENT_ONLY": "Only a preliminary statement is confirmed for this billing period",
         "BILLING_PERIOD_CROSSES_CALENDAR_YEAR": "Billing period crosses into another calendar year",
@@ -118,8 +120,8 @@ class ExportArtifact:
     snapshot_id: str
 
 
-def _unverified():
-    raise HandoffEvidenceUnverified()
+def _unverified(details=None):
+    raise HandoffEvidenceUnverified(details)
 
 
 def _spreadsheet_text(value):
@@ -393,16 +395,16 @@ def _safe_id(value):
     return value
 
 
-def _source(store, route, kind, upload_id, file_id, expected):
+def _source(store, route, kind, upload_id, file_id, expected, details=None):
     source = store.original(kind, upload_id, file_id)
     try:
         content = bytes(source["content"])
         if (source["sha256"] != expected["sha256"] or source["mediaType"] != expected["mediaType"]
                 or len(content) != expected["bytes"] or hashlib.sha256(content).hexdigest() != expected["sha256"]):
-            _unverified()
+            _unverified(details)
         return content
     except (KeyError, TypeError, ValueError):
-        _unverified()
+        _unverified(details)
 
 
 def create_handoff_export(store, route, snapshot, copy, *, temp_directory=None):
@@ -429,29 +431,35 @@ def create_handoff_export(store, route, snapshot, copy, *, temp_directory=None):
 
             for period in snapshot["statementPeriods"]:
                 source = period["source"]
+                details = {
+                    "recordType": "statement",
+                    "periodStart": period["periodStart"],
+                    "periodEnd": period["periodEnd"],
+                }
                 # Byte counts are measured by the canonical preview but kept out
                 # of the public source object. Reconcile them through the original
                 # manifest before reading content.
                 manifest = store.get("statement-upload:" + source["uploadId"])
                 if type(manifest) is not dict or manifest.get("route") != route:
-                    _unverified()
+                    _unverified(details)
                 match = next((item for item in (manifest or {}).get("files", []) if item.get("id") == source["fileId"]), None)
                 if match is None:
-                    _unverified()
+                    _unverified(details)
                 expected = {"sha256": source["sha256"], "mediaType": source["mediaType"], "bytes": match.get("bytes")}
-                content = _source(store, route, "statement", source["uploadId"], source["fileId"], expected)
+                content = _source(store, route, "statement", source["uploadId"], source["fileId"], expected, details)
                 filename = _statement_path(period)
                 _entry(bundle, entries, filename, content, "application/pdf", compress=False)
 
             for purchase in snapshot["supportingPurchases"]:
                 purchase_id = _safe_id(purchase["purchaseId"])
                 expense_id = _safe_id(purchase["expenseId"])
+                details = {"recordType": "receipt", "createdDate": purchase["createdAt"][:10]}
                 for index, source in enumerate(purchase["files"], 1):
                     file_id = _safe_id(source["fileId"])
-                    content = _source(store, route, "receipt", purchase_id, file_id, source)
+                    content = _source(store, route, "receipt", purchase_id, file_id, source, details)
                     extension = {"image/jpeg": "jpg", "image/png": "png", "application/pdf": "pdf"}.get(source["mediaType"])
                     if extension is None:
-                        _unverified()
+                        _unverified(details)
                     filename = f'{_supporting_folder(purchase)}/{index:02d}.{extension}'
                     _entry(bundle, entries, filename, content, source["mediaType"], compress=False)
 

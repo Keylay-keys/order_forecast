@@ -230,9 +230,9 @@ async def accountant_handoff_preview(
     selected_year = handoff_year(year)
     try:
         result = await run_in_threadpool(execute_handoff_preview, decoded_token["uid"], route, selected_year)
-    except HandoffEvidenceUnverified:
+    except HandoffEvidenceUnverified as error:
         raise StructuredApiError(503, "Accountant handoff evidence could not be verified",
-                                 "HANDOFF_EVIDENCE_UNVERIFIED") from None
+                                 "HANDOFF_EVIDENCE_UNVERIFIED", details=error.details) from None
     except HTTPException as error:
         if error.status_code == 503:
             raise StructuredApiError(503, "Accountant handoff is temporarily unavailable",
@@ -261,9 +261,9 @@ async def accountant_handoff_export(
     except AccountingExportBusy:
         raise StructuredApiError(409, "An Accountant handoff download is already being prepared",
                                  "HANDOFF_EXPORT_BUSY") from None
-    except HandoffEvidenceUnverified:
+    except HandoffEvidenceUnverified as error:
         raise StructuredApiError(503, "Accountant handoff evidence could not be verified",
-                                 "HANDOFF_EVIDENCE_UNVERIFIED") from None
+                                 "HANDOFF_EVIDENCE_UNVERIFIED", details=error.details) from None
     except HTTPException as error:
         if error.status_code == 413:
             raise StructuredApiError(413, "This handoff is too large for one download",

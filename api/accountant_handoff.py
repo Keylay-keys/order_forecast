@@ -35,12 +35,13 @@ STATEMENT_FACT_FIELDS = (
 class HandoffEvidenceUnverified(HTTPException):
     """Canonical handoff evidence failed closed during reconciliation."""
 
-    def __init__(self):
+    def __init__(self, details=None):
         super().__init__(503, "Accountant handoff evidence could not be verified.")
+        self.details = _safe_evidence_details(details)
 
 
-def _unverified():
-    raise HandoffEvidenceUnverified()
+def _unverified(details=None):
+    raise HandoffEvidenceUnverified(details)
 
 
 def _canonical(value):
@@ -77,13 +78,44 @@ def _is_timestamp(value):
         return False
 
 
-def _original_descriptor(store, route, kind, upload_id, file_id):
+def _safe_evidence_details(details):
+    """Allow only dates and the two public evidence types across the API boundary."""
+    if type(details) is not dict:
+        return None
+    if (set(details) == {"recordType", "periodStart", "periodEnd"}
+            and details.get("recordType") == "statement"
+            and _is_day(details.get("periodStart")) and _is_day(details.get("periodEnd"))):
+        return dict(details)
+    if (set(details) == {"recordType", "createdDate"}
+            and details.get("recordType") == "receipt" and _is_day(details.get("createdDate"))):
+        return dict(details)
+    return None
+
+
+def _statement_evidence_details(period):
+    if type(period) is not dict:
+        return None
+    return _safe_evidence_details({
+        "recordType": "statement",
+        "periodStart": period.get("periodStart"),
+        "periodEnd": period.get("periodEnd"),
+    })
+
+
+def _receipt_evidence_details(manifest):
+    created_at = manifest.get("createdAt") if type(manifest) is dict else None
+    if not _is_timestamp(created_at):
+        return None
+    return _safe_evidence_details({"recordType": "receipt", "createdDate": created_at[:10]})
+
+
+def _original_descriptor(store, route, kind, upload_id, file_id, details=None):
     manifest = store.get(f"{kind}-upload:{upload_id}")
     if type(manifest) is not dict or manifest.get("route") != route or type(manifest.get("files")) is not list:
-        _unverified()
+        _unverified(details)
     matches = [item for item in manifest["files"] if type(item) is dict and item.get("id") == file_id]
     if len(matches) != 1:
-        _unverified()
+        _unverified(details)
     expected = matches[0]
     try:
         if hasattr(store, "original_metadata"):
@@ -92,12 +124,12 @@ def _original_descriptor(store, route, kind, upload_id, file_id):
             source = store.original(kind, upload_id, file_id)
             content = bytes(source["content"])
             if hashlib.sha256(content).hexdigest() != source["sha256"]:
-                _unverified()
+                _unverified(details)
             source = dict(source, bytes=len(content))
         if (source is None or source["sha256"] != expected["sha256"]
                 or source["mediaType"] != expected.get("mediaType", "application/pdf")
                 or source["bytes"] != expected["bytes"]):
-            _unverified()
+            _unverified(details)
         return {
             "fileId": file_id,
             "sha256": source["sha256"],
@@ -105,24 +137,25 @@ def _original_descriptor(store, route, kind, upload_id, file_id):
             "bytes": source["bytes"],
         }
     except (KeyError, TypeError, ValueError):
-        _unverified()
+        _unverified(details)
 
 
 def _confirmed_statement(store, route, period):
+    details = _statement_evidence_details(period)
     try:
         review = period["statementReview"]
         upload_id, file_id, attempt_id = (review[name] for name in ("uploadId", "fileId", "attemptId"))
         attempt = store.attempt("statement", upload_id, file_id, attempt_id)
-        source = _original_descriptor(store, route, "statement", upload_id, file_id)
+        source = _original_descriptor(store, route, "statement", upload_id, file_id, details)
         if (period.get("revision") not in ("preliminary", "final")
                 or type(attempt) is not dict or attempt.get("id") != attempt_id
                 or attempt.get("uploadId") != upload_id or attempt.get("fileId") != file_id
                 or attempt.get("route") != route or attempt.get("sha256") != source["sha256"]
                 or period.get("source") != "sha256:" + source["sha256"]):
-            _unverified()
+            _unverified(details)
         analysis = attempt.get("analysis")
         if not evidence.valid_analysis(analysis, route) or analysis.get("issues"):
-            _unverified()
+            _unverified(details)
         account = analysis["account"]
         adjustments_by_key = {item["key"]: item["cents"] for item in analysis["adjustments"]}
         required_amounts = [analysis[name] for name in ("marginCents", "inventoryCents", "totalAdjustmentsCents",
@@ -141,7 +174,7 @@ def _confirmed_statement(store, route, period):
             account["totalNewSettlement"] == account["amountToPay"],
         ]
         if not all(checks):
-            _unverified()
+            _unverified(details)
         comparisons = {
             "periodStart": analysis["periodStart"],
             "periodEnd": analysis["periodEnd"],
@@ -153,7 +186,7 @@ def _confirmed_statement(store, route, period):
             "statementPaymentCents": account["payment"],
         }
         if any(period.get(key) != value for key, value in comparisons.items()):
-            _unverified()
+            _unverified(details)
         facts = {
             "grossSalesCents": gross_sales_cents(attempt),
             "marginCents": analysis["marginCents"],
@@ -187,7 +220,7 @@ def _confirmed_statement(store, route, period):
             "_sourceBytes": source["bytes"],
         }
     except (KeyError, TypeError, ValueError):
-        _unverified()
+        _unverified(details)
 
 
 def _copy_payment(item, cash=False):
@@ -253,7 +286,12 @@ def build_handoff_preview(store, route, year, *, generated_at=None):
     if len({period["periodEnd"] for period in selected_periods}) != len(selected_periods):
         _unverified()
     for period in sorted(selected_periods, key=lambda item: item["periodEnd"]):
-        row = _confirmed_statement(store, route, period)
+        try:
+            row = _confirmed_statement(store, route, period)
+        except HandoffEvidenceUnverified:
+            gaps.append(_gap("STATEMENT_EVIDENCE_UNVERIFIED", "settlementStatement", period["periodEnd"],
+                             {"periodStart": period["periodStart"], "periodEnd": period["periodEnd"]}))
+            continue
         source_bytes += row.pop("_sourceBytes")
         source_file_count += 1
         statement_periods.append(row)
@@ -297,15 +335,20 @@ def build_handoff_preview(store, route, year, *, generated_at=None):
     supporting_purchases = []
     relevant_reviews = []
     seen_purchase_ids = set()
+    expenses_with_unverified_documents = set()
     for manifest in store.documents("receipt-upload:"):
+        details = _receipt_evidence_details(manifest)
         if type(manifest) is not dict or manifest.get("route") != route or type(manifest.get("files")) is not list:
-            _unverified()
-        review = evidence.receipt_review(store, route, manifest)
+            _unverified(details)
+        try:
+            review = evidence.receipt_review(store, route, manifest)
+        except (KeyError, TypeError):
+            _unverified(details)
         try:
             created_at = manifest["createdAt"]
             purchase_id = manifest["id"]
             if purchase_id in seen_purchase_ids:
-                _unverified()
+                _unverified(details)
             seen_purchase_ids.add(purchase_id)
             included = review["includeInAccountantHandoff"]
             grouped = review["groupedFileIds"]
@@ -314,9 +357,9 @@ def build_handoff_preview(store, route, year, *, generated_at=None):
             if (not _is_timestamp(created_at)
                     or type(included) is not bool
                     or type(grouped) is not list or not grouped or len(grouped) != len(set(grouped))):
-                _unverified()
+                _unverified(details)
         except (KeyError, TypeError):
-            _unverified()
+            _unverified(details)
         relevant = created_at[:4] == year_text or linked in expenses_by_id
         if relevant:
             relevant_reviews.append({
@@ -340,11 +383,21 @@ def build_handoff_preview(store, route, year, *, generated_at=None):
                                  {"createdAt": created_at}, ["linkedExpenseId"]))
             continue
         files = []
+        unverified_documents = False
         for file_id in grouped:
-            descriptor = _original_descriptor(store, route, "receipt", purchase_id, file_id)
+            try:
+                descriptor = _original_descriptor(store, route, "receipt", purchase_id, file_id, details)
+            except HandoffEvidenceUnverified:
+                unverified_documents = True
+                break
             files.append(descriptor)
-            source_file_count += 1
-            source_bytes += descriptor["bytes"]
+        if unverified_documents:
+            gaps.append(_gap("SUPPORTING_DOCUMENT_EVIDENCE_UNVERIFIED", "purchase", purchase_id,
+                             {"createdAt": created_at[:10]}))
+            expenses_with_unverified_documents.add(linked)
+            continue
+        source_file_count += len(files)
+        source_bytes += sum(descriptor["bytes"] for descriptor in files)
         purchase = {
             "purchaseId": purchase_id,
             "expenseId": linked,
@@ -357,7 +410,7 @@ def build_handoff_preview(store, route, year, *, generated_at=None):
     supporting_purchases.sort(key=lambda item: (item["createdAt"], item["purchaseId"]))
     for item in paid_expenses:
         item["supportingPurchaseIds"].sort()
-        if not item["supportingPurchaseIds"]:
+        if not item["supportingPurchaseIds"] and item["id"] not in expenses_with_unverified_documents:
             gaps.append(_gap("PAID_EXPENSE_WITHOUT_SUPPORTING_DOCUMENTS", "paidExpense", item["id"],
                              {"paymentDate": item["date"]}))
 
