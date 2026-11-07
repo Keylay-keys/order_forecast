@@ -10,7 +10,6 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import FileResponse, Response
-from starlette.background import BackgroundTask
 from starlette.concurrency import run_in_threadpool
 from starlette.datastructures import UploadFile
 
@@ -200,6 +199,18 @@ def delete_handoff_export(path):
         logger.warning("Accountant handoff temporary file cleanup failed")
 
 
+class HandoffFileResponse(FileResponse):
+    """Remove the generated ZIP even when the client disconnects during send."""
+
+    async def __call__(self, scope, receive, send):
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            # unlink() is a single local-filesystem operation. Keep it outside
+            # an await so task cancellation cannot interrupt the cleanup.
+            delete_handoff_export(self.path)
+
+
 def handoff_year(value):
     if re.fullmatch(r"(?:20|21)[0-9]{2}", value) is None:
         raise StructuredApiError(400, "Choose a valid handoff year", "HANDOFF_YEAR_INVALID")
@@ -265,12 +276,11 @@ async def accountant_handoff_export(
         logger.warning("Accountant handoff export could not complete")
         raise StructuredApiError(503, "Accountant handoff download is temporarily unavailable",
                                  "HANDOFF_EXPORT_UNAVAILABLE") from None
-    return FileResponse(
+    return HandoffFileResponse(
         artifact.path,
         media_type="application/zip",
         filename=f"routespark-accountant-handoff-{selected_year}.zip",
         headers={**HEADERS, "X-RouteSpark-Manifest-SHA256": artifact.manifest_sha256},
-        background=BackgroundTask(delete_handoff_export, artifact.path),
     )
 
 

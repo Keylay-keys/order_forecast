@@ -1,6 +1,7 @@
 """Canonical Accountant handoff facts, placement and evidence boundaries."""
 from copy import deepcopy
 from contextlib import contextmanager
+import asyncio
 import csv
 import hashlib
 import io
@@ -446,6 +447,25 @@ class AccountantHandoffHttpTests(unittest.TestCase):
             manifest = bundle.read("manifest.json")
             self.assertEqual(response.headers["x-routespark-manifest-sha256"], hashlib.sha256(manifest).hexdigest())
         self.assertEqual(after, before)
+
+    def test_export_file_is_removed_when_client_disconnects_during_send(self):
+        with tempfile.NamedTemporaryFile(prefix="routespark-handoff-test-", suffix=".zip", delete=False) as file:
+            file.write(b"temporary export")
+            path = file.name
+
+        response = accounting.HandoffFileResponse(path, media_type="application/zip")
+
+        async def receive():
+            return {"type": "http.disconnect"}
+
+        async def send(message):
+            if message["type"] == "http.response.body":
+                raise ConnectionError("client disconnected")
+
+        scope = {"type": "http", "method": "GET", "headers": []}
+        with self.assertRaisesRegex(ConnectionError, "client disconnected"):
+            asyncio.run(response(scope, receive, send))
+        self.assertFalse(Path(path).exists())
 
     def test_export_errors_are_stable_and_do_not_leave_files(self):
         with patch.object(accounting, "execute_handoff_export", side_effect=HTTPException(413, "private")):
