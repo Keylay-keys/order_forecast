@@ -238,11 +238,15 @@ class PurchaseImportTests(unittest.TestCase):
         self.assertEqual([file["originalName"] for file in manifest["files"]], ["Scan page 1.jpg", "Scan page 2.jpg"])
         self.assertEqual(len(store.originals), 2)
         self.assertEqual(store.jobs, {PACKET_ID})
+        review_key = "receipt-review:" + PACKET_ID
+        self.assertTrue(store.documents[review_key]["includeInAccountantHandoff"])
 
+        store.documents[review_key]["includeInAccountantHandoff"] = False
         repeated, replay = worker.save_packet(OWNER, packet, sources, transaction)
         self.assertTrue(replay)
         self.assertEqual(repeated, manifest)
         self.assertEqual(len(store.originals), 2)
+        self.assertFalse(store.documents[review_key]["includeInAccountantHandoff"])
 
     def test_saved_packet_is_read_back_before_import_confirmation(self):
         data = ready_upload(pages=2)

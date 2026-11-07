@@ -18,7 +18,7 @@ from typing import Any
 from uuid import UUID, uuid4, uuid5
 
 from firebase_admin import firestore, storage
-from .accounting_evidence import detect_media
+from .accounting_evidence import detect_media, receipt_review
 from .accounting_store import accounting_transaction
 from .dependencies import get_firebase_app
 
@@ -248,6 +248,9 @@ def save_packet(owner_uid: str, packet: dict[str, Any], sources: list[dict[str, 
         for file, source in zip(manifest["files"], sources):
             store.add_original("receipt", packet["packetId"], file, source["content"])
         store.put(key, manifest)
+        review = receipt_review(store, packet["route"], manifest)
+        review["includeInAccountantHandoff"] = True
+        store.put("receipt-review:" + packet["packetId"], review)
         store.queue_receipt(packet["packetId"])
     return manifest, False
 

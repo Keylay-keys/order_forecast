@@ -253,6 +253,7 @@ class AccountingBehaviorTests(unittest.TestCase):
     def test_receipt_review_links_only_existing_expense_and_retains_original(self):
         pdf = b"%PDF-1.7\nreceipt\n%%EOF"
         packet = evidence.upload(self.store, "123456", "receipt", [("receipt.pdf", "application/pdf", pdf)])
+        self.assertTrue(evidence.receipt_review(self.store, "123456", packet)["includeInAccountantHandoff"])
         with self.assertRaises(HTTPException):
             evidence.change_receipt_review(self.domain, packet["id"], {"revision": 0, "action": "record", "expenseId": str(uuid4())})
         paid = self.domain.expenses("POST", "", {"revision": 0, "expense": expense()})["items"][0]
@@ -260,6 +261,36 @@ class AccountingBehaviorTests(unittest.TestCase):
         self.assertEqual(linked["items"][0]["review"]["linkedExpenseId"], paid["id"])
         evidence.change_receipt_review(self.domain, packet["id"], {"revision": 1, "action": "unlink"})
         self.assertEqual(evidence.original(self.store, "receipt", packet["id"], packet["files"][0]["id"])["content"], pdf)
+        self.assertEqual(len(self.domain.load("expenses")["items"]), 1)
+
+    def test_old_receipt_fallback_stays_unchecked_and_atomic_record_is_duplicate_safe(self):
+        packet = evidence.upload(self.store, "123456", "receipt", [
+            ("receipt.pdf", "application/pdf", b"%PDF-1.7\nreceipt\n%%EOF")])
+        self.store.docs.pop("receipt-review:" + packet["id"])
+        old_review = evidence.receipt_review(self.store, "123456", packet)
+        self.assertFalse(old_review["includeInAccountantHandoff"])
+
+        result = evidence.record_receipt_expense(self.domain, packet["id"], {
+            "reviewRevision": 0,
+            "expenseRevision": 0,
+            "groupedFileIds": [packet["files"][0]["id"]],
+            "includeInAccountantHandoff": True,
+            "expense": expense(vendor="Atomic receipt"),
+        })
+        self.assertEqual(result["route"], "123456")
+        self.assertEqual(len(result["expenseLedger"]["items"]), 1)
+        linked = result["receiptInbox"]["items"][0]["review"]
+        self.assertEqual(linked["status"], "recorded")
+        self.assertEqual(linked["linkedExpenseId"], result["expenseLedger"]["items"][0]["id"])
+        with self.assertRaises(HTTPException) as duplicate:
+            evidence.record_receipt_expense(self.domain, packet["id"], {
+                "reviewRevision": 0,
+                "expenseRevision": 0,
+                "groupedFileIds": [packet["files"][0]["id"]],
+                "includeInAccountantHandoff": True,
+                "expense": expense(vendor="Duplicate"),
+            })
+        self.assertEqual(duplicate.exception.status_code, 409)
         self.assertEqual(len(self.domain.load("expenses")["items"]), 1)
 
     def test_receipt_archive_restore_hides_only_the_review_and_preserves_original(self):
@@ -558,6 +589,50 @@ class AccountingHttpTests(unittest.TestCase):
         self.assertEqual(restored.status_code, 200, restored.text)
         self.assertEqual(restored.json()["archivedItems"], [])
         self.assertEqual(restored.json()["items"][0]["packetId"], packet["id"])
+
+    def test_atomic_receipt_record_http_replays_and_new_key_retry_cannot_duplicate(self):
+        jpeg = b"\xff\xd8\xff\xc0\x00\x08\x00\x00\x00\x00\x00\x00\xff\xda\x00\x02\xff\xd9"
+        created = self.client.post(
+            "/api/business/accounting/receipts?route=989262",
+            files={"files": ("receipt.jpg", jpeg, "image/jpeg")},
+            headers={"Idempotency-Key": str(uuid4())},
+        )
+        self.assertEqual(created.status_code, 201, created.text)
+        packet = created.json()
+        path = f'receipt-reviews/{packet["id"]}/record-expense'
+        body = {
+            "reviewRevision": 0,
+            "expenseRevision": 0,
+            "groupedFileIds": [packet["files"][0]["id"]],
+            "includeInAccountantHandoff": True,
+            "expense": expense(vendor="Atomic HTTP"),
+        }
+        failed = self.request("POST", path, {
+            **body,
+            "expense": expense(vendor="Invalid before commit", amountCents=True),
+        })
+        self.assertEqual(failed.status_code, 400, failed.text)
+        self.assertEqual(self.request("GET", "expenses").json()["items"], [])
+        unchanged = self.request("GET", "receipt-reviews").json()["items"][0]["review"]
+        self.assertEqual(unchanged["revision"], 0)
+        self.assertEqual(unchanged["status"], "reviewing")
+
+        request_id = str(uuid4())
+        first = self.request("POST", path, body, request_id)
+        self.assertEqual(first.status_code, 200, first.text)
+        self.assertEqual(self.request("POST", path, body, request_id).json(), first.json())
+        refused = self.request("POST", path, body)
+        self.assertEqual(refused.status_code, 409, refused.text)
+        ledger = self.request("GET", "expenses").json()
+        self.assertEqual(len(ledger["items"]), 1)
+        self.assertEqual(ledger["items"][0]["vendor"], "Atomic HTTP")
+
+        self.app.dependency_overrides[verify_firebase_token] = lambda: {"uid": "team-member"}
+        self.db.set_document("users/team-member", {"profile": {"role": "teamMember", "routeNumber": "989262"}})
+        self.assertEqual(self.request("POST", path, body).status_code, 403)
+        self.app.dependency_overrides[verify_firebase_token] = lambda: {"uid": "owner"}
+        self.db.set_document("routes/989262", {"ownerUid": "someone-else"})
+        self.assertEqual(self.request("POST", path, body).status_code, 403)
 
 
 if __name__ == "__main__":

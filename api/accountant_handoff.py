@@ -11,7 +11,7 @@ import re
 
 from fastapi import HTTPException
 
-from .accounting_domain import Accounting, fail, now
+from .accounting_domain import Accounting, CATEGORIES, fail, now
 from .accounting_performance import gross_sales_cents
 from . import accounting_evidence as evidence
 
@@ -244,6 +244,63 @@ def _copy_expense(item):
     }
 
 
+def _paid_expense_categories(expenses):
+    totals = {}
+    for expense in expenses:
+        allocations = expense["splits"] or [{
+            "category": expense["category"], "amountCents": expense["amountCents"],
+        }]
+        for allocation in allocations:
+            category = allocation.get("category")
+            cents = allocation.get("amountCents")
+            if category not in CATEGORIES or type(cents) is not int:
+                _unverified()
+            totals[category] = totals.get(category, 0) + cents
+    return [{"category": category, "valueCents": totals[category]} for category in sorted(totals)]
+
+
+def _current_bills(bills_ledger, expenses_ledger, year_text):
+    active_payments = [item for item in expenses_ledger["items"]
+                       if not item.get("archivedAt") and item.get("billId")]
+    rows = []
+    seen = set()
+    for bill in bills_ledger["items"]:
+        try:
+            bill_id = bill["id"]
+            created_at = bill["createdAt"]
+            if (type(bill_id) is not str or bill_id in seen or not _is_timestamp(created_at)
+                    or not isinstance(bill.get("vendor"), str) or not bill["vendor"].strip()
+                    or bill.get("category") not in CATEGORIES or type(bill.get("amountCents")) is not int
+                    or bill["amountCents"] <= 0 or not isinstance(bill.get("note"), str)
+                    or bill.get("frequency") not in ("once", "monthly")
+                    or bill.get("status") not in ("active", "stopped")
+                    or not _is_day(bill.get("dueDate")) or type(bill.get("anchorDay")) is not int
+                    or not 1 <= bill["anchorDay"] <= 31):
+                _unverified()
+            seen.add(bill_id)
+            payments = [item for item in active_payments
+                        if item.get("billId") == bill_id and item.get("date", "")[:4] == year_text]
+            if created_at[:4] > year_text and not payments:
+                continue
+            rows.append({
+                "billId": bill_id,
+                "createdAt": created_at,
+                "vendor": bill["vendor"],
+                "category": bill["category"],
+                "note": bill["note"],
+                "status": bill["status"],
+                "frequency": bill["frequency"],
+                "dueDate": bill["dueDate"],
+                "anchorDay": bill["anchorDay"],
+                "amountCents": bill["amountCents"],
+                "paymentCount": len(payments),
+                "paymentTotalCents": sum(item["amountCents"] for item in payments),
+            })
+        except (KeyError, TypeError, ValueError):
+            _unverified()
+    return sorted(rows, key=lambda item: (item["createdAt"], item["billId"]))
+
+
 def _gap(code, record_type, record_id, dates, fields=()):
     return {
         "code": code,
@@ -272,6 +329,7 @@ def build_handoff_preview(store, route, year, *, generated_at=None):
     year_text = _year(year)
     accounting = Accounting(store, route, f"{year_text}-12-31")
     expenses_ledger = accounting.load("expenses")
+    bills_ledger = accounting.load("bills")
     money_ledger = accounting.load("money-in")
     cash_ledger = accounting.load("cash-accounts")
 
@@ -329,10 +387,13 @@ def build_handoff_preview(store, route, year, *, generated_at=None):
     )
     if len({item["id"] for item in paid_expenses}) != len(paid_expenses):
         _unverified()
+    bills = _current_bills(bills_ledger, expenses_ledger, year_text)
     expenses_by_id = {item["id"]: item for item in paid_expenses}
     all_active_expense_ids = {item["id"] for item in expenses_ledger["items"] if not item.get("archivedAt")}
 
     supporting_purchases = []
+    receipts_not_recorded = []
+    receipts_left_out_count = 0
     relevant_reviews = []
     seen_purchase_ids = set()
     expenses_with_unverified_documents = set()
@@ -370,34 +431,66 @@ def build_handoff_preview(store, route, year, *, generated_at=None):
                 "includeInAccountantHandoff": included,
                 "groupedFileIds": grouped,
             })
-        if archived or not included:
+        if archived:
+            continue
+        if not included:
+            if linked in expenses_by_id:
+                gaps.append(_gap("LINKED_PURCHASE_NOT_MARKED", "purchase", purchase_id,
+                                 {"createdAt": created_at[:10]}))
+                expenses_with_unverified_documents.add(linked)
+            elif not linked and created_at[:4] == year_text:
+                receipts_left_out_count += 1
             continue
         if linked not in expenses_by_id:
             if linked in all_active_expense_ids:
                 continue
             if created_at[:4] == year_text and not linked:
-                gaps.append(_gap("MARKED_PURCHASE_WITHOUT_PAID_EXPENSE", "purchase", purchase_id,
-                                 {"createdAt": created_at}))
+                pass
             elif created_at[:4] == year_text and linked:
                 gaps.append(_gap("MARKED_PURCHASE_WITHOUT_PAID_EXPENSE", "purchase", purchase_id,
-                                 {"createdAt": created_at}, ["linkedExpenseId"]))
-            continue
+                                 {"createdAt": created_at[:10]}, ["linkedExpenseId"]))
+                continue
+            else:
+                continue
+        try:
+            integrity = evidence.saved_receipt_integrity(store, purchase_id)
+        except HTTPException:
+            _unverified(details)
         files = []
-        unverified_documents = False
-        for file_id in grouped:
-            try:
-                descriptor = _original_descriptor(store, route, "receipt", purchase_id, file_id, details)
-            except HandoffEvidenceUnverified:
-                unverified_documents = True
-                break
-            files.append(descriptor)
+        unverified_documents = integrity is not None
+        if not unverified_documents:
+            for file_id in grouped:
+                try:
+                    descriptor = _original_descriptor(store, route, "receipt", purchase_id, file_id, details)
+                except HandoffEvidenceUnverified:
+                    unverified_documents = True
+                    break
+                files.append(descriptor)
         if unverified_documents:
             gaps.append(_gap("SUPPORTING_DOCUMENT_EVIDENCE_UNVERIFIED", "purchase", purchase_id,
                              {"createdAt": created_at[:10]}))
-            expenses_with_unverified_documents.add(linked)
+            if linked in expenses_by_id:
+                expenses_with_unverified_documents.add(linked)
+            elif created_at[:4] == year_text:
+                receipts_not_recorded.append({
+                    "purchaseId": purchase_id,
+                    "createdAt": created_at,
+                    "documentCount": len(grouped),
+                    "fileStatus": "unverified",
+                    "files": [],
+                })
             continue
         source_file_count += len(files)
         source_bytes += sum(descriptor["bytes"] for descriptor in files)
+        if not linked:
+            receipts_not_recorded.append({
+                "purchaseId": purchase_id,
+                "createdAt": created_at,
+                "documentCount": len(grouped),
+                "fileStatus": "included",
+                "files": sorted(files, key=lambda item: item["fileId"]),
+            })
+            continue
         purchase = {
             "purchaseId": purchase_id,
             "expenseId": linked,
@@ -408,6 +501,11 @@ def build_handoff_preview(store, route, year, *, generated_at=None):
         expenses_by_id[linked]["supportingPurchaseIds"].append(purchase_id)
 
     supporting_purchases.sort(key=lambda item: (item["createdAt"], item["purchaseId"]))
+    for index, item in enumerate(supporting_purchases, 1):
+        item["folder"] = f'supporting-documents/{item["createdAt"][:10]}-{index:03d}'
+    receipts_not_recorded.sort(key=lambda item: (item["createdAt"], item["purchaseId"]))
+    for index, item in enumerate(receipts_not_recorded, 1):
+        item["folder"] = f'receipts-not-recorded/{item["createdAt"][:10]}-{index:03d}'
     for item in paid_expenses:
         item["supportingPurchaseIds"].sort()
         if not item["supportingPurchaseIds"] and item["id"] not in expenses_with_unverified_documents:
@@ -420,6 +518,7 @@ def build_handoff_preview(store, route, year, *, generated_at=None):
         "expenses": expenses_ledger["revision"],
         "moneyIn": money_ledger["revision"],
         "cashAccounts": cash_ledger["revision"],
+        "bills": bills_ledger["revision"],
         "receiptReviewsDigest": receipt_digest,
     }
     placement = {
@@ -433,6 +532,18 @@ def build_handoff_preview(store, route, year, *, generated_at=None):
         "settlementPayments": {"valueCents": sum(item["amountCents"] for item in settlement_payments), "count": len(settlement_payments)},
         "cashAccountCollections": {"valueCents": sum(item["amountCents"] for item in cash_collections), "count": len(cash_collections)},
         "paidExpenses": {"valueCents": sum(item["amountCents"] for item in paid_expenses), "count": len(paid_expenses)},
+        "paidExpensesByCategory": _paid_expense_categories(paid_expenses),
+        "bills": {
+            "count": len(bills),
+            "paymentCount": sum(item["paymentCount"] for item in bills),
+            "paymentTotalCents": sum(item["paymentTotalCents"] for item in bills),
+        },
+    }
+    money_in = {
+        "verifiedStatementCount": len(statement_periods),
+        "unverifiedStatementCount": len(selected_periods) - len(statement_periods),
+        "paymentCount": len(settlement_payments),
+        "collectionCount": len(cash_collections),
     }
     snapshot_material = {
         "schemaVersion": 1,
@@ -440,11 +551,15 @@ def build_handoff_preview(store, route, year, *, generated_at=None):
         "year": year,
         "revisions": revisions,
         "placement": placement,
+        "moneyIn": money_in,
         "statementPeriods": statement_periods,
         "settlementPayments": settlement_payments,
         "cashAccountCollections": cash_collections,
         "paidExpenses": paid_expenses,
+        "bills": bills,
         "supportingPurchases": supporting_purchases,
+        "receiptsNotRecorded": receipts_not_recorded,
+        "receiptsLeftOutCount": receipts_left_out_count,
         "summaries": summaries,
         "gaps": gaps,
     }
@@ -457,6 +572,9 @@ def build_handoff_preview(store, route, year, *, generated_at=None):
             "available": not too_large,
             "sourceFileCount": source_file_count,
             "sourceBytes": source_bytes,
+            "statementFileCount": len(statement_periods),
+            "supportingDocumentFileCount": sum(len(item["files"]) for item in supporting_purchases),
+            "unrecordedReceiptFileCount": sum(len(item["files"]) for item in receipts_not_recorded),
             "maximumSourceFileCount": MAX_SOURCE_FILES,
             "maximumSourceBytes": MAX_SOURCE_BYTES,
             "reasonCode": "HANDOFF_EXPORT_TOO_LARGE" if too_large else None,

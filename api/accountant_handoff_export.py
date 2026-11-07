@@ -19,7 +19,7 @@ from .accountant_handoff import HandoffEvidenceUnverified
 # Machine keys and archive paths are fixed by the API contract; these visible
 # headings can change without changing the JSON preview schema.
 DEFAULT_EXPORT_COPY = {
-    "version": "labels-20261106-2",
+    "version": "labels-20261107-3",
     "title": "Accountant handoff",
     "route": "Route",
     "year": "Year",
@@ -33,6 +33,13 @@ DEFAULT_EXPORT_COPY = {
     "cashAccountCollections": "Cash-account collections",
     "paidExpenses": "Paid expenses",
     "supportingDocuments": "Supporting documents",
+    "bills": "Bills",
+    "receiptsNotRecorded": "Receipts not recorded as paid expenses",
+    "moneyInNotRecorded": (
+        "None recorded in RouteSpark for this year. This is not a statement that no income was received. "
+        "See the year-end tax paperwork the owner received."
+    ),
+    "statementsNotIncluded": "No settlement statements are included for this year.",
     "dataGaps": "Items to check",
     "yes": "Yes",
     "no": "No",
@@ -67,6 +74,7 @@ DEFAULT_EXPORT_COPY = {
         "PAID_EXPENSE_WITHOUT_SUPPORTING_DOCUMENTS": "Paid expense has no supporting documents",
         "STATEMENT_EVIDENCE_UNVERIFIED": "Saved settlement statement could not be verified and is not included",
         "SUPPORTING_DOCUMENT_EVIDENCE_UNVERIFIED": "Supporting documents could not be verified and are not included",
+        "LINKED_PURCHASE_NOT_MARKED": "Receipt linked to a paid expense is unchecked and is not included",
         "STATEMENT_FACTS_UNKNOWN": "Some statement figures are not available",
         "PRELIMINARY_STATEMENT_ONLY": "Only a preliminary statement is confirmed for this billing period",
         "BILLING_PERIOD_CROSSES_CALENDAR_YEAR": "Billing period crosses into another calendar year",
@@ -110,6 +118,11 @@ DEFAULT_EXPORT_COPY = {
         "Item to check", "Record type", "Billing period start", "Billing period end",
         "Payment date", "Date added", "Missing details",
     ],
+    "billHeaders": [
+        "Date added", "Payee", "Category", "Note", "Status today", "Schedule today",
+        "Expected amount today", "Payments recorded in year", "Total recorded in year",
+    ],
+    "receiptHeaders": ["Date added", "Documents", "Folder", "File status"],
 }
 
 
@@ -166,9 +179,13 @@ def _statement_path(period):
 
 
 def _supporting_folder(purchase):
-    expense_id = _safe_id(purchase["expenseId"])
-    purchase_id = _safe_id(purchase["purchaseId"])
-    return f'supporting-documents/{purchase["createdAt"][:10]}/{expense_id}/{purchase_id}'
+    return _evidence_folder(purchase.get("folder"), "supporting-documents")
+
+
+def _evidence_folder(value, prefix):
+    if type(value) is not str or re.fullmatch(prefix + r"/[0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{3}", value) is None:
+        _unverified()
+    return value
 
 
 def _supporting_folders(snapshot):
@@ -242,6 +259,32 @@ def _expenses_csv(snapshot, copy):
     return _csv_bytes(headers, rows)
 
 
+def _bills_csv(snapshot, copy):
+    rows = []
+    for bill in snapshot["bills"]:
+        schedule = (f'Monthly on day {bill["anchorDay"]}' if bill["frequency"] == "monthly"
+                    else f'One time, due {bill["dueDate"]}')
+        rows.append([
+            bill["createdAt"][:10], bill["vendor"], copy["categoryLabels"][bill["category"]],
+            bill.get("note", ""), "Active" if bill["status"] == "active" else "Stopped", schedule,
+            _csv_money(bill["amountCents"]), bill["paymentCount"], _csv_money(bill["paymentTotalCents"]),
+        ])
+    return _csv_bytes(copy["billHeaders"], rows)
+
+
+def _receipts_not_recorded_csv(snapshot, copy):
+    rows = []
+    for receipt in snapshot["receiptsNotRecorded"]:
+        folder = (_evidence_folder(receipt.get("folder"), "receipts-not-recorded") + "/"
+                  if receipt["fileStatus"] == "included" else "")
+        rows.append([
+            receipt["createdAt"][:10], receipt["documentCount"],
+            folder,
+            "Included" if receipt["fileStatus"] == "included" else "Could not be verified, file not included",
+        ])
+    return _csv_bytes(copy["receiptHeaders"], rows)
+
+
 def _gaps_csv(snapshot, copy):
     headers = copy["gapHeaders"]
     rows = []
@@ -300,30 +343,39 @@ def _summary_lines(snapshot, copy):
         f'{copy["generated"]}: {_generated_at(snapshot["generatedAt"])}',
         "",
         copy["disclaimer"],
-        "",
-        copy["statementActivity"],
-        f'Billing periods: {len(snapshot["statementPeriods"])}',
     ]
-    for key in ("grossSalesCents", "marginCents", "amountToPayCents", "handheldRentalCents", "cashAccountSalesCents"):
-        total = summaries["statementFacts"][key]
-        lines.append(_statement_fact_summary(copy["factLabels"][key], total))
-    lines += [
-        "",
-        copy["settlementPayments"],
-        f'{_money(summaries["settlementPayments"]["valueCents"])} from {_count(summaries["settlementPayments"]["count"], "payment")}',
-        "",
-        copy["cashAccountCollections"],
-        f'{_money(summaries["cashAccountCollections"]["valueCents"])} from {_count(summaries["cashAccountCollections"]["count"], "collection")}',
-        "",
-        copy["paidExpenses"],
-        f'{_money(summaries["paidExpenses"]["valueCents"])} from {_count(summaries["paidExpenses"]["count"], "expense")}',
-        "",
-        copy["supportingDocuments"],
-        _count(snapshot["export"]["sourceFileCount"] - len(snapshot["statementPeriods"]), "file"),
-        "",
-        copy["dataGaps"],
-        _count(len(snapshot["gaps"]), "item") if snapshot["gaps"] else "None",
-    ]
+    money_in = snapshot["moneyIn"]
+    if not any(money_in.values()):
+        lines += ["", "Money in", copy["moneyInNotRecorded"]]
+    if snapshot["statementPeriods"]:
+        lines += ["", copy["statementActivity"], f'Billing periods: {len(snapshot["statementPeriods"])}']
+        for key in ("grossSalesCents", "marginCents", "amountToPayCents", "handheldRentalCents", "cashAccountSalesCents"):
+            lines.append(_statement_fact_summary(copy["factLabels"][key], summaries["statementFacts"][key]))
+    if money_in["unverifiedStatementCount"]:
+        lines += ["", f'{_count(money_in["unverifiedStatementCount"], "saved statement")} could not be verified and is not included. See items to check.']
+    if (not money_in["verifiedStatementCount"] and not money_in["unverifiedStatementCount"]
+            and (money_in["paymentCount"] or money_in["collectionCount"])):
+        lines += ["", copy["statementsNotIncluded"]]
+    if snapshot["settlementPayments"]:
+        lines += ["", copy["settlementPayments"], f'{_money(summaries["settlementPayments"]["valueCents"])} from {_count(summaries["settlementPayments"]["count"], "payment")}']
+    if snapshot["cashAccountCollections"]:
+        lines += ["", copy["cashAccountCollections"], f'{_money(summaries["cashAccountCollections"]["valueCents"])} from {_count(summaries["cashAccountCollections"]["count"], "collection")}']
+    if snapshot["paidExpenses"]:
+        lines += ["", copy["paidExpenses"], f'{_money(summaries["paidExpenses"]["valueCents"])} from {_count(summaries["paidExpenses"]["count"], "expense")}']
+        lines += [
+            f'{copy["categoryLabels"][item["category"]]}: {_money(item["valueCents"])}'
+            for item in summaries["paidExpensesByCategory"]
+        ]
+    if snapshot["export"]["supportingDocumentFileCount"]:
+        lines += ["", copy["supportingDocuments"], _count(snapshot["export"]["supportingDocumentFileCount"], "file")]
+    if snapshot["bills"]:
+        lines += ["", copy["bills"], f'{_count(len(snapshot["bills"]), "bill")}, as of this download. Recorded payments are already in paid expenses. This list does not show whether a payment was owed or missed.']
+    if snapshot["receiptsNotRecorded"]:
+        lines += ["", copy["receiptsNotRecorded"], f'{_count(len(snapshot["receiptsNotRecorded"]), "receipt")}, {_count(snapshot["export"]["unrecordedReceiptFileCount"], "file")}. Not included in paid expense totals.']
+    if snapshot["receiptsLeftOutCount"]:
+        lines += [f'{_count(snapshot["receiptsLeftOutCount"], "unchecked receipt")} left out.']
+    if snapshot["gaps"]:
+        lines += ["", copy["dataGaps"], _count(len(snapshot["gaps"]), "item")]
     return lines
 
 
@@ -396,14 +448,14 @@ def _safe_id(value):
 
 
 def _source(store, route, kind, upload_id, file_id, expected, details=None):
-    source = store.original(kind, upload_id, file_id)
     try:
+        source = store.original(kind, upload_id, file_id)
         content = bytes(source["content"])
         if (source["sha256"] != expected["sha256"] or source["mediaType"] != expected["mediaType"]
                 or len(content) != expected["bytes"] or hashlib.sha256(content).hexdigest() != expected["sha256"]):
             _unverified(details)
         return content
-    except (KeyError, TypeError, ValueError):
+    except (KeyError, TypeError, ValueError, RuntimeError):
         _unverified(details)
 
 
@@ -425,9 +477,17 @@ def create_handoff_export(store, route, snapshot, copy, *, temp_directory=None):
     try:
         with zipfile.ZipFile(path, "w", allowZip64=True) as bundle:
             _entry(bundle, entries, "summary.pdf", _pdf_bytes(_summary_lines(snapshot, copy)), "application/pdf")
-            _entry(bundle, entries, "income-by-billing-period.csv", _income_csv(snapshot, copy), "text/csv")
-            _entry(bundle, entries, "paid-expenses.csv", _expenses_csv(snapshot, copy), "text/csv")
-            _entry(bundle, entries, "items-to-check.csv", _gaps_csv(snapshot, copy), "text/csv")
+            if (snapshot["statementPeriods"] or snapshot["settlementPayments"]
+                    or snapshot["cashAccountCollections"]):
+                _entry(bundle, entries, "income-by-billing-period.csv", _income_csv(snapshot, copy), "text/csv")
+            if snapshot["paidExpenses"]:
+                _entry(bundle, entries, "paid-expenses.csv", _expenses_csv(snapshot, copy), "text/csv")
+            if snapshot["bills"]:
+                _entry(bundle, entries, "bills.csv", _bills_csv(snapshot, copy), "text/csv")
+            if snapshot["receiptsNotRecorded"]:
+                _entry(bundle, entries, "receipts-not-recorded.csv", _receipts_not_recorded_csv(snapshot, copy), "text/csv")
+            if snapshot["gaps"]:
+                _entry(bundle, entries, "items-to-check.csv", _gaps_csv(snapshot, copy), "text/csv")
 
             for period in snapshot["statementPeriods"]:
                 source = period["source"]
@@ -462,6 +522,19 @@ def create_handoff_export(store, route, snapshot, copy, *, temp_directory=None):
                         _unverified(details)
                     filename = f'{_supporting_folder(purchase)}/{index:02d}.{extension}'
                     _entry(bundle, entries, filename, content, source["mediaType"], compress=False)
+
+            for receipt in snapshot["receiptsNotRecorded"]:
+                purchase_id = _safe_id(receipt["purchaseId"])
+                details = {"recordType": "receipt", "createdDate": receipt["createdAt"][:10]}
+                folder = _evidence_folder(receipt.get("folder"), "receipts-not-recorded")
+                for index, source in enumerate(receipt["files"], 1):
+                    file_id = _safe_id(source["fileId"])
+                    content = _source(store, route, "receipt", purchase_id, file_id, source, details)
+                    extension = {"image/jpeg": "jpg", "image/png": "png", "application/pdf": "pdf"}.get(source["mediaType"])
+                    if extension is None:
+                        _unverified(details)
+                    _entry(bundle, entries, f"{folder}/{index:02d}.{extension}", content,
+                           source["mediaType"], compress=False)
 
             manifest = {
                 "schemaVersion": 1,

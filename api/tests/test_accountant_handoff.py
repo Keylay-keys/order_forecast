@@ -62,6 +62,13 @@ class AccountantHandoffBuilderTests(unittest.TestCase):
             "expense": expense(**changes),
         })["items"][0]
 
+    def saved_bill(self, **changes):
+        revision = self.accounting.load("bills")["revision"]
+        value = dict(vendor="Storage Co", category="storage", amountCents=28400,
+                     dueDate="2026-09-20", frequency="monthly", note="")
+        value.update(changes)
+        return self.accounting.bills("POST", "", {"revision": revision, "bill": value})["items"][0]
+
     def receipt(self, name, linked=None, included=True, archived=False, created_at="2026-09-12T18:00:00Z"):
         content = b"\xff\xd8\xff\xc0\x00\x02\xff\xda\x00\x02" + name.encode() + b"\xff\xd9"
         manifest = evidence.upload(self.store, "123456", "receipt", [(name + ".jpg", "image/jpeg", content)])
@@ -150,7 +157,7 @@ class AccountantHandoffBuilderTests(unittest.TestCase):
         supported = self.paid_expense(vendor="Supported")
         missing = self.paid_expense(vendor="Missing")
         included = self.receipt("included", linked=supported["id"])
-        self.receipt("unlinked", linked=None)
+        unlinked = self.receipt("unlinked", linked=None)
         self.receipt("deleted", linked=missing["id"], archived=True)
         self.receipt("not-marked", linked=missing["id"], included=False)
         outside = self.paid_expense(date="2025-09-12", vendor="Prior year")
@@ -159,13 +166,15 @@ class AccountantHandoffBuilderTests(unittest.TestCase):
         result = self.preview()
 
         self.assertEqual([row["purchaseId"] for row in result["supportingPurchases"]], [included["id"]])
+        self.assertEqual([row["purchaseId"] for row in result["receiptsNotRecorded"]], [unlinked["id"]])
         paid = {row["vendor"]: row for row in result["paidExpenses"]}
         self.assertEqual(paid["Supported"]["supportingPurchaseIds"], [included["id"]])
         self.assertEqual(paid["Missing"]["supportingPurchaseIds"], [])
         codes = [gap["code"] for gap in result["gaps"]]
-        self.assertEqual(codes.count("MARKED_PURCHASE_WITHOUT_PAID_EXPENSE"), 1)
-        self.assertIn("PAID_EXPENSE_WITHOUT_SUPPORTING_DOCUMENTS", codes)
-        self.assertEqual(result["export"]["sourceFileCount"], 1)
+        self.assertNotIn("MARKED_PURCHASE_WITHOUT_PAID_EXPENSE", codes)
+        self.assertIn("LINKED_PURCHASE_NOT_MARKED", codes)
+        self.assertNotIn("PAID_EXPENSE_WITHOUT_SUPPORTING_DOCUMENTS", codes)
+        self.assertEqual(result["export"]["sourceFileCount"], 2)
 
     def test_unverified_statement_is_omitted_and_becomes_a_dated_gap(self):
         manifest, reading = self.statement("verified")
@@ -227,6 +236,184 @@ class AccountantHandoffBuilderTests(unittest.TestCase):
         self.paid_expense(vendor="New")
         changed = self.preview()
         self.assertNotEqual(first["snapshotId"], changed["snapshotId"])
+
+    def test_money_out_only_snapshot_has_current_bills_unrecorded_receipts_and_split_totals(self):
+        bill = self.saved_bill()
+        self.paid_expense(vendor="Split payment", billId=bill["id"], category="fuel", amountCents=17500,
+                          splits=[{"category": "fuel", "amountCents": 15000},
+                                  {"category": "route_supplies", "amountCents": 2500}])
+        included = self.receipt("scan-only")
+        self.receipt("left-out", included=False)
+
+        result = self.preview()
+
+        self.assertEqual(result["moneyIn"], {
+            "verifiedStatementCount": 0,
+            "unverifiedStatementCount": 0,
+            "paymentCount": 0,
+            "collectionCount": 0,
+        })
+        self.assertEqual(result["receiptsLeftOutCount"], 1)
+        self.assertEqual([item["purchaseId"] for item in result["receiptsNotRecorded"]], [included["id"]])
+        self.assertNotIn(included["id"], result["receiptsNotRecorded"][0]["folder"])
+        self.assertEqual(result["summaries"]["paidExpensesByCategory"], [
+            {"category": "fuel", "valueCents": 15000},
+            {"category": "route_supplies", "valueCents": 2500},
+        ])
+        self.assertEqual(len(result["bills"]), 1)
+        self.assertEqual(result["bills"][0]["paymentCount"], 1)
+        self.assertEqual(result["bills"][0]["paymentTotalCents"], 17500)
+        self.assertEqual(result["revisions"]["bills"], 1)
+        self.assertEqual(result["export"]["unrecordedReceiptFileCount"], 1)
+
+        with tempfile.TemporaryDirectory() as directory:
+            artifact = create_handoff_export(self.store, "123456", result, DEFAULT_EXPORT_COPY,
+                                             temp_directory=directory)
+            with zipfile.ZipFile(artifact.path) as bundle:
+                names = set(bundle.namelist())
+                summary = bundle.read("summary.pdf")
+                self.assertIn(b"Fuel: $150.00", summary)
+                self.assertIn(b"Route supplies: $25.00", summary)
+                self.assertNotIn("income-by-billing-period.csv", names)
+                self.assertIn("bills.csv", names)
+                self.assertIn("receipts-not-recorded.csv", names)
+                receipt_files = [name for name in names if name.startswith("receipts-not-recorded/")]
+                self.assertEqual(len(receipt_files), 1)
+                self.assertNotIn(included["id"], receipt_files[0])
+                bills = list(csv.DictReader(io.StringIO(bundle.read("bills.csv").decode("utf-8-sig"))))
+                self.assertEqual(bills[0]["Payments recorded in year"], "1")
+                self.assertEqual(bills[0]["Total recorded in year"], "175.00")
+                receipts = list(csv.DictReader(io.StringIO(bundle.read("receipts-not-recorded.csv").decode("utf-8-sig"))))
+                self.assertEqual(receipts[0]["Documents"], "1")
+                self.assertEqual(receipts[0]["File status"], "Included")
+
+    def test_payment_only_year_explains_that_no_statements_are_included(self):
+        self.store.put("money-in", {
+            "schemaVersion": 1,
+            "route": "123456",
+            "revision": 1,
+            "settlements": [],
+            "remittances": [{
+                "id": "payment-one",
+                "periodEnd": "2026-09-09",
+                "receivedDate": "2026-09-14",
+                "amountCents": 100000,
+                "method": "bank",
+                "note": "",
+            }],
+        })
+        snapshot = self.preview()
+        with tempfile.TemporaryDirectory() as directory:
+            artifact = create_handoff_export(self.store, "123456", snapshot, DEFAULT_EXPORT_COPY,
+                                             temp_directory=directory)
+            with zipfile.ZipFile(artifact.path) as bundle:
+                summary = bundle.read("summary.pdf")
+                self.assertIn(b"No settlement statements are included for this year.", summary)
+                self.assertNotIn(b"None recorded in RouteSpark for this year.", summary)
+
+    def test_current_bill_list_handles_stopped_one_time_archived_and_prior_year_payments(self):
+        stopped = self.saved_bill(vendor="Stopped monthly")
+        bills = self.accounting.load("bills")
+        self.accounting.bills("PATCH", stopped["id"], {"revision": bills["revision"], "action": "stop"})
+        one_time = self.saved_bill(vendor="One time", frequency="once", dueDate="2026-10-15")
+        archived = self.paid_expense(vendor="Archived", billId=one_time["id"])
+        expenses = self.accounting.load("expenses")
+        self.accounting.expenses("PATCH", archived["id"], {"revision": expenses["revision"], "action": "archive"})
+
+        current = {item["vendor"]: item for item in self.preview(2026)["bills"]}
+        self.assertEqual(current["Stopped monthly"]["status"], "stopped")
+        self.assertEqual(current["One time"]["frequency"], "once")
+        self.assertEqual(current["One time"]["paymentCount"], 0)
+
+        late_without_payment = self.saved_bill(vendor="Added later")
+        late_with_payment = self.saved_bill(vendor="Added later but paid")
+        self.paid_expense(vendor="Prior payment", billId=late_with_payment["id"], date="2025-12-31")
+        prior = {item["vendor"]: item for item in self.preview(2025)["bills"]}
+        self.assertNotIn(late_without_payment["vendor"], prior)
+        self.assertEqual(prior[late_with_payment["vendor"]]["paymentCount"], 1)
+
+    def test_unrecorded_receipt_moves_from_upload_year_to_paid_expense_year(self):
+        receipt = self.receipt("january-upload", created_at="2027-01-02T12:00:00Z")
+        self.assertEqual(self.preview(2026)["receiptsNotRecorded"], [])
+        self.assertEqual([item["purchaseId"] for item in self.preview(2027)["receiptsNotRecorded"]],
+                         [receipt["id"]])
+
+        paid = self.paid_expense(date="2026-12-30", vendor="Late December")
+        evidence.change_receipt_review(self.accounting, receipt["id"], {
+            "revision": 0,
+            "action": "record",
+            "expenseId": paid["id"],
+        })
+        self.assertEqual([item["purchaseId"] for item in self.preview(2026)["supportingPurchases"]],
+                         [receipt["id"]])
+        self.assertEqual(self.preview(2027)["receiptsNotRecorded"], [])
+
+    def test_known_damage_is_a_gap_for_linked_and_unlinked_receipts_without_blocking_export(self):
+        paid = self.paid_expense(vendor="Linked damage")
+        linked = self.receipt("linked-damage", linked=paid["id"])
+        unlinked = self.receipt("unlinked-damage")
+        integrity = {
+            "schemaVersion": 1,
+            "status": "needs_rescan",
+            "reason": "stored_original_hash_mismatch",
+            "detectedAt": "2026-11-07T12:00:00Z",
+        }
+        self.store.put("receipt-integrity:" + linked["id"], integrity)
+        self.store.put("receipt-integrity:" + unlinked["id"], integrity)
+
+        result = self.preview()
+
+        self.assertEqual(result["supportingPurchases"], [])
+        self.assertEqual(len(result["receiptsNotRecorded"]), 1)
+        self.assertEqual(result["receiptsNotRecorded"][0]["fileStatus"], "unverified")
+        self.assertEqual(result["receiptsNotRecorded"][0]["documentCount"], 1)
+        self.assertEqual(result["receiptsNotRecorded"][0]["files"], [])
+        codes = [item["code"] for item in result["gaps"]]
+        self.assertEqual(codes.count("SUPPORTING_DOCUMENT_EVIDENCE_UNVERIFIED"), 2)
+        self.assertNotIn("PAID_EXPENSE_WITHOUT_SUPPORTING_DOCUMENTS", codes)
+        with tempfile.TemporaryDirectory() as directory:
+            artifact = create_handoff_export(self.store, "123456", result, DEFAULT_EXPORT_COPY,
+                                             temp_directory=directory)
+            with zipfile.ZipFile(artifact.path) as bundle:
+                self.assertFalse(any(name.startswith("receipts-not-recorded/") for name in bundle.namelist()))
+                csv_text = bundle.read("receipts-not-recorded.csv").decode("utf-8-sig")
+                self.assertIn("Could not be verified, file not included", csv_text)
+                rows = list(csv.DictReader(io.StringIO(csv_text)))
+                self.assertEqual(rows[0]["Documents"], "1")
+                self.assertEqual(rows[0]["Folder"], "")
+
+    def test_real_store_style_hash_failure_returns_safe_receipt_and_statement_dates(self):
+        manifest, reading = self.statement("final")
+        self.confirm(reading, 0)
+        paid = self.paid_expense(vendor="Hash receipt")
+        receipt = self.receipt("hash-receipt", linked=paid["id"])
+        snapshot = self.preview()
+        original = self.store.original
+
+        def hashing_original(kind, upload, file):
+            value = original(kind, upload, file)
+            if value is not None and hashlib.sha256(value["content"]).hexdigest() != value["sha256"]:
+                raise RuntimeError("Original integrity mismatch with private storage details")
+            return value
+
+        cases = [
+            (("receipt", receipt["id"], receipt["files"][0]["id"]),
+             {"recordType": "receipt", "createdDate": "2026-09-12"}),
+            (("statement", manifest["id"], manifest["files"][0]["id"]),
+             {"recordType": "statement", "periodStart": "2026-09-03", "periodEnd": "2026-09-09"}),
+        ]
+        for key, expected in cases:
+            with self.subTest(kind=key[0]):
+                saved = self.store.originals[key]["content"]
+                self.store.originals[key]["content"] += b"tampered"
+                with patch.object(self.store, "original", side_effect=hashing_original):
+                    with tempfile.TemporaryDirectory() as directory:
+                        with self.assertRaises(HandoffEvidenceUnverified) as raised:
+                            create_handoff_export(self.store, "123456", snapshot, DEFAULT_EXPORT_COPY,
+                                                  temp_directory=directory)
+                        self.assertEqual(raised.exception.details, expected)
+                        self.assertEqual(list(Path(directory).iterdir()), [])
+                self.store.originals[key]["content"] = saved
 
     def test_cluster_timestamp_format_is_accepted_and_malformed_dates_fail_closed(self):
         paid = self.paid_expense(vendor="Timestamp format")
@@ -310,7 +497,7 @@ class AccountantHandoffBuilderTests(unittest.TestCase):
                 self.assertEqual(gaps[0]["Missing details"], "Gross sales")
                 manifest = json.loads(bundle.read("manifest.json"))
                 self.assertEqual(manifest["snapshot"]["snapshotId"], snapshot["snapshotId"])
-                self.assertEqual(manifest["copyVersion"], "labels-20261106-2")
+                self.assertEqual(manifest["copyVersion"], "labels-20261107-3")
                 self.assertNotIn("manifest.json", {entry["path"] for entry in manifest["entries"]})
                 for entry in manifest["entries"]:
                     content = bundle.read(entry["path"])

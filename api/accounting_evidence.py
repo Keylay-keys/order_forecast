@@ -130,6 +130,9 @@ def upload(store, route, kind, files):
         store.add_original(kind, upload_id, item, content)
     store.put(f"{kind}-upload:{upload_id}", manifest)
     if kind == "receipt":
+        review = receipt_review(store, route, manifest)
+        review["includeInAccountantHandoff"] = True
+        store.put("receipt-review:" + upload_id, review)
         store.queue_receipt(upload_id)
     return manifest
 
@@ -472,6 +475,69 @@ def change_receipt_review(accounting, packet_id, body):
     review.update(revision=review["revision"] + 1, updatedAt=now())
     accounting.store.put("receipt-review:" + packet_id, review)
     return receipt_inbox(accounting.store, accounting.route)
+
+
+def record_receipt_expense(accounting, packet_id, body):
+    """Save the review, create one expense and link it in one transaction.
+
+    The caller's accounting transaction is the atomic boundary. The recorded
+    receipt state is also the duplicate guard for a new-key retry after a lost
+    response.
+    """
+    identifier(packet_id)
+    fields(body, (
+        "reviewRevision", "expenseRevision", "groupedFileIds",
+        "includeInAccountantHandoff", "expense",
+    ), (
+        "reviewRevision", "expenseRevision", "groupedFileIds",
+        "includeInAccountantHandoff", "expense",
+    ))
+    manifest = accounting.store.get("receipt-upload:" + packet_id)
+    if manifest is None:
+        fail("Receipt packet not found.", 404)
+    if (type(manifest) is not dict or manifest.get("route") != accounting.route
+            or manifest.get("id") != packet_id or type(manifest.get("files")) is not list):
+        fail("Receipt evidence could not be verified.", 503)
+    review = receipt_review(accounting.store, accounting.route, manifest)
+    if (type(review) is not dict or review.get("schemaVersion") != 1
+            or review.get("route") != accounting.route or review.get("packetId") != packet_id):
+        fail("Receipt review could not be verified.", 503)
+    accounting.revision(review, {"revision": body["reviewRevision"]})
+    if review.get("archivedAt"):
+        fail("Restore this receipt before recording it.", 409)
+    if review.get("status") == "recorded":
+        fail("This receipt group is already linked to an expense.", 409)
+    grouped = body["groupedFileIds"]
+    if (type(grouped) is not list or not grouped
+            or any(not isinstance(item, str) for item in grouped)
+            or len(set(grouped)) != len(grouped)
+            or set(grouped) - {item["id"] for item in manifest["files"]}
+            or type(body["includeInAccountantHandoff"]) is not bool):
+        fail("Choose the supporting images for this purchase.")
+
+    before = {item["id"] for item in accounting.load("expenses")["items"]}
+    expense_ledger = accounting.expenses("POST", "", {
+        "revision": body["expenseRevision"],
+        "expense": body["expense"],
+    })
+    created = [item for item in expense_ledger["items"] if item["id"] not in before]
+    if len(created) != 1:
+        fail("The paid expense could not be recorded.", 503)
+    review.update(
+        groupedFileIds=list(grouped),
+        includeInAccountantHandoff=body["includeInAccountantHandoff"],
+        status="recorded",
+        linkedExpenseId=created[0]["id"],
+        revision=review["revision"] + 1,
+        updatedAt=now(),
+    )
+    accounting.store.put("receipt-review:" + packet_id, review)
+    return {
+        "schemaVersion": 1,
+        "route": accounting.route,
+        "expenseLedger": expense_ledger,
+        "receiptInbox": receipt_inbox(accounting.store, accounting.route),
+    }
 
 
 def accept_receipt_attempt(store, route, packet_id, report):

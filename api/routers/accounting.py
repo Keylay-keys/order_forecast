@@ -109,6 +109,8 @@ def dispatch(store, route, today, method, path, body, files, refresh):
             return evidence.original(store, "receipt", parts[0], parts[2])
         if len(parts) == 1 and method == "PATCH":
             return evidence.change_receipt_review(accounting, suffix, body)
+        if len(parts) == 2 and parts[1] == "record-expense" and method == "POST":
+            return evidence.record_receipt_expense(accounting, parts[0], body)
         if len(parts) == 2 and parts[1] == "manifest" and method == "GET":
             identifier(parts[0])
             manifest = store.get("receipt-upload:" + parts[0])
