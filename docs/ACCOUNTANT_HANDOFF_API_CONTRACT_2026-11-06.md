@@ -1,6 +1,11 @@
 # Accountant Handoff API Contract - 2026-11-06
 
-Status: **Backend contract approved for implementation. No endpoint is deployed.**
+Status: **Implemented and verified locally. No endpoint is deployed.**
+
+Local verification on 2026-11-06 covered 175 Accounting, access, and rate-limit
+tests plus 29 subtests. The generated synthetic archive passed ZIP integrity,
+entry-hash, manifest, path-safety, and PDF-render checks. Live HTTP verification
+and the cluster-hardware export benchmark remain deployment gates.
 
 This contract is the boundary between the cluster and the Accounting portal for
 the Accountant handoff. One canonical, read-only builder supplies both the JSON
