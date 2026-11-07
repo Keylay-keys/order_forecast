@@ -164,10 +164,14 @@ Response:
 {
   "schemaVersion": 1,
   "route": "989262",
-  "expenseLedger": {"schemaVersion": 1, "route": "989262", "revision": 4, "items": []},
+  "expenseLedger": {"schemaVersion": 1, "route": "989262", "revision": 4, "items": [], "bills": []},
   "receiptInbox": {"schemaVersion": 1, "route": "989262", "items": [], "archivedItems": []}
 }
 ```
+
+`expenseLedger.bills` is the existing current-bill convenience list returned by
+expense writes. It is not a second ledger revision and does not change the
+atomic boundary.
 
 The normal `Idempotency-Key` replay contract applies. If the response is lost after commit and the portal retries with a new key, the committed `recorded` state or stale revision returns `409` before a second expense is created. The portal reloads the receipt inbox after that conflict.
 

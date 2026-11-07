@@ -279,6 +279,7 @@ class AccountingBehaviorTests(unittest.TestCase):
         })
         self.assertEqual(result["route"], "123456")
         self.assertEqual(len(result["expenseLedger"]["items"]), 1)
+        self.assertEqual(result["expenseLedger"]["bills"], [])
         linked = result["receiptInbox"]["items"][0]["review"]
         self.assertEqual(linked["status"], "recorded")
         self.assertEqual(linked["linkedExpenseId"], result["expenseLedger"]["items"][0]["id"])
@@ -620,6 +621,7 @@ class AccountingHttpTests(unittest.TestCase):
         request_id = str(uuid4())
         first = self.request("POST", path, body, request_id)
         self.assertEqual(first.status_code, 200, first.text)
+        self.assertEqual(first.json()["expenseLedger"]["bills"], [])
         self.assertEqual(self.request("POST", path, body, request_id).json(), first.json())
         refused = self.request("POST", path, body)
         self.assertEqual(refused.status_code, 409, refused.text)
