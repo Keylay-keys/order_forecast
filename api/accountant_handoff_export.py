@@ -1,6 +1,7 @@
 """Bounded Accountant handoff ZIP generation from a canonical snapshot."""
 from dataclasses import dataclass
 import csv
+from datetime import datetime, timezone
 import hashlib
 import io
 import json
@@ -14,11 +15,11 @@ from .accounting_domain import fail
 from .accountant_handoff import HandoffEvidenceUnverified
 
 
-# Provisional v1 copy for Claude's review before the endpoint is released.
+# Approved v1 copy for the Accountant handoff export.
 # Machine keys and archive paths are fixed by the API contract; these visible
 # headings can change without changing the JSON preview schema.
 DEFAULT_EXPORT_COPY = {
-    "version": "draft-20261106",
+    "version": "labels-20261106",
     "title": "Accountant handoff",
     "route": "Route",
     "year": "Year",
@@ -32,7 +33,7 @@ DEFAULT_EXPORT_COPY = {
     "cashAccountCollections": "Cash-account collections",
     "paidExpenses": "Paid expenses",
     "supportingDocuments": "Supporting documents",
-    "dataGaps": "Data gaps",
+    "dataGaps": "Items to check",
     "yes": "Yes",
     "no": "No",
     "recordTypes": {
@@ -43,8 +44,13 @@ DEFAULT_EXPORT_COPY = {
     },
     "factLabels": {
         "grossSalesCents": "Gross sales",
-        "marginCents": "Margin",
-        "amountToPayCents": "Total amount to pay",
+        "marginCents": "Total Margin Discount",
+        "inventoryCents": "Truck inventory",
+        "totalAdjustmentsCents": "Total Adjustments",
+        "newSettlementCents": "New Settlement",
+        "previousBalanceCents": "Previous Balance",
+        "statementPaymentCents": "Payment as of (statement)",
+        "amountToPayCents": "Total Amount To Pay",
         "handheldRentalCents": "Handheld rental",
         "cashAccountSalesCents": "Cash-account sales",
     },
@@ -57,27 +63,50 @@ DEFAULT_EXPORT_COPY = {
         "licenses_tax": "Licenses & tax", "technology": "Technology", "other": "Other",
     },
     "gapLabels": {
-        "MARKED_PURCHASE_WITHOUT_PAID_EXPENSE": "Marked supporting documents are not linked to a paid expense",
-        "PAID_EXPENSE_WITHOUT_SUPPORTING_DOCUMENTS": "Paid expense has no supporting documents in the handoff",
-        "STATEMENT_FACTS_UNKNOWN": "Some settlement statement facts are unavailable",
-        "PRELIMINARY_STATEMENT_ONLY": "Only a preliminary settlement statement is confirmed",
-        "BILLING_PERIOD_CROSSES_CALENDAR_YEAR": "Billing period crosses calendar years",
+        "MARKED_PURCHASE_WITHOUT_PAID_EXPENSE": "Purchase marked for the handoff is not linked to a paid expense",
+        "PAID_EXPENSE_WITHOUT_SUPPORTING_DOCUMENTS": "Paid expense has no supporting documents",
+        "STATEMENT_FACTS_UNKNOWN": "Some statement figures are not available",
+        "PRELIMINARY_STATEMENT_ONLY": "Only a preliminary statement is confirmed for this billing period",
+        "BILLING_PERIOD_CROSSES_CALENDAR_YEAR": "Billing period crosses into another calendar year",
+    },
+    "gapRecordTypes": {
+        "settlementStatement": "Settlement statement",
+        "purchase": "Purchase",
+        "paidExpense": "Paid expense",
+    },
+    "statementStatuses": {"final": "Final", "preliminary": "Preliminary"},
+    "paymentMethods": {
+        "card": "Card", "bank": "Bank transfer", "cash": "Cash",
+        "check": "Check", "other": "Other",
+    },
+    "fieldLabels": {
+        "grossSalesCents": "Gross sales",
+        "marginCents": "Total Margin Discount",
+        "inventoryCents": "Truck inventory",
+        "totalAdjustmentsCents": "Total Adjustments",
+        "newSettlementCents": "New Settlement",
+        "previousBalanceCents": "Previous Balance",
+        "statementPaymentCents": "Payment as of (statement)",
+        "amountToPayCents": "Total Amount To Pay",
+        "handheldRentalCents": "Handheld rental",
+        "cashAccountSalesCents": "Cash-account sales",
+        "linkedExpenseId": "Paid expense link",
     },
     "incomeHeaders": [
-        "Record type", "Record ID", "Billing period start", "Billing period end", "Received date",
-        "Crosses calendar year", "Statement version", "Gross sales cents", "Margin cents",
-        "Inventory cents", "Total adjustments cents", "New settlement cents", "Previous balance cents",
-        "Statement payment cents", "Total amount to pay cents", "Handheld rental cents",
-        "Cash-account sales cents", "Adjustment key", "Adjustment source label", "Amount cents",
-        "Payment method", "Customer", "Store ID", "Note",
+        "Record type", "Billing period start", "Billing period end", "Received date",
+        "Crosses calendar year", "Statement status", "Gross sales", "Total Margin Discount",
+        "Truck inventory", "Total Adjustments", "New Settlement", "Previous Balance",
+        "Payment as of (statement)", "Total Amount To Pay", "Handheld rental",
+        "Cash-account sales", "Adjustment", "Amount", "Payment method", "Customer", "Note",
+        "Statement file",
     ],
     "expenseHeaders": [
-        "Expense ID", "Payment date", "Payee", "Category", "Category amount cents",
-        "Expense total cents", "Payment method", "Note", "Supporting purchase IDs",
+        "Payment date", "Payee", "Category", "Category amount", "Expense total",
+        "Payment method", "Note", "Supporting documents folder",
     ],
     "gapHeaders": [
-        "Issue", "Gap code", "Record type", "Record ID", "Billing period start", "Billing period end",
-        "Payment date", "Created at", "Fields",
+        "Item to check", "Record type", "Billing period start", "Billing period end",
+        "Payment date", "Date added", "Missing details",
     ],
 }
 
@@ -100,13 +129,60 @@ def _spreadsheet_text(value):
     return text
 
 
+class _SpreadsheetNumber(str):
+    """A server-generated decimal that spreadsheet programs may parse as numeric."""
+
+
+def _csv_money(cents):
+    if cents is None:
+        return ""
+    if type(cents) is not int:
+        _unverified()
+    sign = "-" if cents < 0 else ""
+    absolute = abs(cents)
+    return _SpreadsheetNumber(f"{sign}{absolute // 100}.{absolute % 100:02d}")
+
+
 def _csv_bytes(headers, rows):
     output = io.StringIO(newline="")
     writer = csv.writer(output, lineterminator="\r\n")
     writer.writerow(headers)
     for row in rows:
-        writer.writerow([_spreadsheet_text(value) if not isinstance(value, int) else value for value in row])
+        if len(row) != len(headers):
+            _unverified()
+        writer.writerow([
+            str(value) if isinstance(value, _SpreadsheetNumber)
+            else value if isinstance(value, int)
+            else _spreadsheet_text(value)
+            for value in row
+        ])
     return output.getvalue().encode("utf-8-sig")
+
+
+def _statement_path(period):
+    return f'settlement-statements/{period["periodStart"]}_to_{period["periodEnd"]}.pdf'
+
+
+def _supporting_folder(purchase):
+    expense_id = _safe_id(purchase["expenseId"])
+    purchase_id = _safe_id(purchase["purchaseId"])
+    return f'supporting-documents/{purchase["createdAt"][:10]}/{expense_id}/{purchase_id}'
+
+
+def _supporting_folders(snapshot):
+    folders = {}
+    for purchase in snapshot["supportingPurchases"]:
+        folders.setdefault(purchase["expenseId"], set()).add(_supporting_folder(purchase))
+    return {key: "; ".join(sorted(value)) for key, value in folders.items()}
+
+
+def _payment_method(copy, value):
+    if value in (None, ""):
+        return ""
+    try:
+        return copy["paymentMethods"][value]
+    except KeyError:
+        _unverified()
 
 
 def _income_csv(snapshot, copy):
@@ -115,47 +191,51 @@ def _income_csv(snapshot, copy):
     rows = []
     for period in snapshot["statementPeriods"]:
         facts = period["facts"]
-        source = period["source"]
+        statement_path = _statement_path(period)
         rows.append([
-            record_types["statement"], source["attemptId"], period["periodStart"], period["periodEnd"], "",
-            copy["yes"] if period["crossesCalendarYear"] else copy["no"], period["version"], facts["grossSalesCents"],
-            facts["marginCents"], facts["inventoryCents"], facts["totalAdjustmentsCents"],
-            facts["newSettlementCents"], facts["previousBalanceCents"], facts["statementPaymentCents"],
-            facts["amountToPayCents"], facts["handheldRentalCents"], facts["cashAccountSalesCents"],
-            "", "", "", "", "", "", "",
+            record_types["statement"], period["periodStart"], period["periodEnd"], "",
+            copy["yes"] if period["crossesCalendarYear"] else copy["no"],
+            copy["statementStatuses"][period["version"]], _csv_money(facts["grossSalesCents"]),
+            _csv_money(facts["marginCents"]), _csv_money(facts["inventoryCents"]),
+            _csv_money(facts["totalAdjustmentsCents"]), _csv_money(facts["newSettlementCents"]),
+            _csv_money(facts["previousBalanceCents"]), _csv_money(facts["statementPaymentCents"]),
+            _csv_money(facts["amountToPayCents"]), _csv_money(facts["handheldRentalCents"]),
+            _csv_money(facts["cashAccountSalesCents"]), "", "", "", "", "", statement_path,
         ])
         for adjustment in facts["adjustments"]:
             rows.append([
-                record_types["adjustment"], source["attemptId"], period["periodStart"], period["periodEnd"], "",
-                copy["yes"] if period["crossesCalendarYear"] else copy["no"], period["version"], "", "", "", "", "",
-                "", "", "", "", "", adjustment["key"], adjustment["sourceLabel"], adjustment["cents"],
-                "", "", "", "",
+                record_types["adjustment"], period["periodStart"], period["periodEnd"], "",
+                copy["yes"] if period["crossesCalendarYear"] else copy["no"],
+                copy["statementStatuses"][period["version"]], "", "", "", "", "", "", "", "", "", "",
+                adjustment["sourceLabel"], _csv_money(adjustment["cents"]), "", "", "", statement_path,
             ])
     for payment in snapshot["settlementPayments"]:
         rows.append([
-            record_types["settlementPayment"], payment["id"], "", payment["periodEnd"], payment["receivedDate"], "", "",
-            "", "", "", "", "", "", "", "", "", "", "", "", payment["amountCents"],
-            payment["method"], "", "", payment.get("note", ""),
+            record_types["settlementPayment"], "", payment["periodEnd"], payment["receivedDate"], "", "",
+            "", "", "", "", "", "", "", "", "", "", "", _csv_money(payment["amountCents"]),
+            _payment_method(copy, payment["method"]), "", payment.get("note", ""), "",
         ])
     for payment in snapshot["cashAccountCollections"]:
         rows.append([
-            record_types["cashCollection"], payment["id"], "", payment["periodEnd"], payment["receivedDate"], "", "",
-            "", "", "", "", "", "", "", "", "", "", "", "", payment["amountCents"],
-            payment["method"], payment.get("customer", ""), payment.get("storeId", ""), payment.get("note", ""),
+            record_types["cashCollection"], "", payment["periodEnd"], payment["receivedDate"], "", "",
+            "", "", "", "", "", "", "", "", "", "", "", _csv_money(payment["amountCents"]),
+            _payment_method(copy, payment["method"]), payment.get("customer", ""), payment.get("note", ""), "",
         ])
     return _csv_bytes(headers, rows)
 
 
 def _expenses_csv(snapshot, copy):
     headers = copy["expenseHeaders"]
+    supporting_folders = _supporting_folders(snapshot)
     rows = []
     for expense in snapshot["paidExpenses"]:
         allocations = expense["splits"] or [{"category": expense["category"], "amountCents": expense["amountCents"]}]
         for allocation in allocations:
             rows.append([
-                expense["id"], expense["date"], expense["vendor"], copy["categoryLabels"][allocation["category"]],
-                allocation["amountCents"], expense["amountCents"], expense.get("paymentMethod") or "",
-                expense.get("note", ""), ";".join(expense["supportingPurchaseIds"]),
+                expense["date"], expense["vendor"], copy["categoryLabels"][allocation["category"]],
+                _csv_money(allocation["amountCents"]), _csv_money(expense["amountCents"]),
+                _payment_method(copy, expense.get("paymentMethod")),
+                expense.get("note", ""), supporting_folders.get(expense["id"], ""),
             ])
     return _csv_bytes(headers, rows)
 
@@ -165,10 +245,16 @@ def _gaps_csv(snapshot, copy):
     rows = []
     for gap in snapshot["gaps"]:
         dates = gap["dates"]
+        try:
+            issue = copy["gapLabels"][gap["code"]]
+            fields = [copy["fieldLabels"][name] for name in gap["fields"]]
+            record_type = copy["gapRecordTypes"][gap["recordType"]]
+        except KeyError:
+            _unverified()
         rows.append([
-            copy["gapLabels"][gap["code"]], gap["code"], gap["recordType"], gap["recordId"], dates.get("periodStart", ""),
-            dates.get("periodEnd", ""), dates.get("paymentDate", ""), dates.get("createdAt", ""),
-            ";".join(gap["fields"]),
+            issue, record_type, dates.get("periodStart", ""),
+            dates.get("periodEnd", ""), dates.get("paymentDate", ""), dates.get("createdAt", "")[:10],
+            ", ".join(fields),
         ])
     return _csv_bytes(headers, rows)
 
@@ -179,13 +265,37 @@ def _money(cents):
     return f"{sign}${cents // 100:,}.{cents % 100:02d}"
 
 
+def _count(value, singular, plural=None):
+    return f"{value} {singular if value == 1 else (plural or singular + 's')}"
+
+
+def _generated_at(value):
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(timezone.utc)
+    except (AttributeError, ValueError):
+        _unverified()
+    hour = parsed.strftime("%I").lstrip("0") or "0"
+    return f'{parsed.strftime("%B")} {parsed.day}, {parsed.year}, {hour}:{parsed.strftime("%M %p")} UTC'
+
+
+def _statement_fact_summary(label, total):
+    known = total["knownCount"]
+    unknown = total["unknownCount"]
+    if known:
+        line = f'{label}: {_money(total["valueCents"])} from {_count(known, "billing period")}'
+        if unknown:
+            line += f'. {_count(unknown, "billing period")} not available.'
+        return line
+    return f'{label}: Not available for {_count(unknown, "billing period")}'
+
+
 def _summary_lines(snapshot, copy):
     summaries = snapshot["summaries"]
     lines = [
         copy["title"],
         f'{copy["route"]}: {snapshot["route"]}',
         f'{copy["year"]}: {snapshot["year"]}',
-        f'{copy["generated"]}: {snapshot["generatedAt"]}',
+        f'{copy["generated"]}: {_generated_at(snapshot["generatedAt"])}',
         "",
         copy["disclaimer"],
         "",
@@ -194,24 +304,23 @@ def _summary_lines(snapshot, copy):
     ]
     for key in ("grossSalesCents", "marginCents", "amountToPayCents", "handheldRentalCents", "cashAccountSalesCents"):
         total = summaries["statementFacts"][key]
-        suffix = f'; {total["unknownCount"]} unavailable' if total["unknownCount"] else ""
-        lines.append(f'{copy["factLabels"][key]}: {_money(total["valueCents"])} across {total["knownCount"]} known{suffix}')
+        lines.append(_statement_fact_summary(copy["factLabels"][key], total))
     lines += [
         "",
         copy["settlementPayments"],
-        f'{_money(summaries["settlementPayments"]["valueCents"])} across {summaries["settlementPayments"]["count"]} records',
+        f'{_money(summaries["settlementPayments"]["valueCents"])} from {_count(summaries["settlementPayments"]["count"], "payment")}',
         "",
         copy["cashAccountCollections"],
-        f'{_money(summaries["cashAccountCollections"]["valueCents"])} across {summaries["cashAccountCollections"]["count"]} records',
+        f'{_money(summaries["cashAccountCollections"]["valueCents"])} from {_count(summaries["cashAccountCollections"]["count"], "collection")}',
         "",
         copy["paidExpenses"],
-        f'{_money(summaries["paidExpenses"]["valueCents"])} across {summaries["paidExpenses"]["count"]} records',
+        f'{_money(summaries["paidExpenses"]["valueCents"])} from {_count(summaries["paidExpenses"]["count"], "expense")}',
         "",
         copy["supportingDocuments"],
-        f'{snapshot["export"]["sourceFileCount"] - len(snapshot["statementPeriods"])} files',
+        _count(snapshot["export"]["sourceFileCount"] - len(snapshot["statementPeriods"]), "file"),
         "",
         copy["dataGaps"],
-        f'{len(snapshot["gaps"])} items',
+        _count(len(snapshot["gaps"]), "item") if snapshot["gaps"] else "None",
     ]
     return lines
 
@@ -316,7 +425,7 @@ def create_handoff_export(store, route, snapshot, copy, *, temp_directory=None):
             _entry(bundle, entries, "summary.pdf", _pdf_bytes(_summary_lines(snapshot, copy)), "application/pdf")
             _entry(bundle, entries, "income-by-billing-period.csv", _income_csv(snapshot, copy), "text/csv")
             _entry(bundle, entries, "paid-expenses.csv", _expenses_csv(snapshot, copy), "text/csv")
-            _entry(bundle, entries, "data-gaps.csv", _gaps_csv(snapshot, copy), "text/csv")
+            _entry(bundle, entries, "items-to-check.csv", _gaps_csv(snapshot, copy), "text/csv")
 
             for period in snapshot["statementPeriods"]:
                 source = period["source"]
@@ -331,7 +440,7 @@ def create_handoff_export(store, route, snapshot, copy, *, temp_directory=None):
                     _unverified()
                 expected = {"sha256": source["sha256"], "mediaType": source["mediaType"], "bytes": match.get("bytes")}
                 content = _source(store, route, "statement", source["uploadId"], source["fileId"], expected)
-                filename = f'settlement-statements/{period["periodStart"]}_to_{period["periodEnd"]}.pdf'
+                filename = _statement_path(period)
                 _entry(bundle, entries, filename, content, "application/pdf", compress=False)
 
             for purchase in snapshot["supportingPurchases"]:
@@ -343,7 +452,7 @@ def create_handoff_export(store, route, snapshot, copy, *, temp_directory=None):
                     extension = {"image/jpeg": "jpg", "image/png": "png", "application/pdf": "pdf"}.get(source["mediaType"])
                     if extension is None:
                         _unverified()
-                    filename = f'supporting-documents/{purchase["createdAt"][:10]}/{expense_id}/{purchase_id}/{index:02d}.{extension}'
+                    filename = f'{_supporting_folder(purchase)}/{index:02d}.{extension}'
                     _entry(bundle, entries, filename, content, source["mediaType"], compress=False)
 
             manifest = {

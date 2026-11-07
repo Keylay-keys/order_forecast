@@ -249,7 +249,7 @@ The archive contains:
 summary.pdf
 income-by-billing-period.csv
 paid-expenses.csv
-data-gaps.csv
+items-to-check.csv
 manifest.json
 settlement-statements/YYYY-MM-DD_to_YYYY-MM-DD.pdf
 supporting-documents/YYYY-MM-DD/<expense-id>/<purchase-id>/<sequence>.<jpg|png|pdf>
@@ -319,7 +319,7 @@ the ID.
 4. Payments, collections, expenses, and cross-year periods follow the approved
    placement rules while retaining every relevant date.
 5. A marked unlinked purchase and an expense without documents both appear in
-   `data-gaps.csv`.
+   `items-to-check.csv`.
 6. Archived expenses, archived collections, and deleted receipts are absent.
 7. Any source-pointer, manifest, byte-count, or hash mismatch fails closed.
 8. Owner, assigned team member, unrelated owner, and anonymous HTTP cases prove

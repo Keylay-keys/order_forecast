@@ -1,6 +1,7 @@
 """Canonical Accountant handoff facts, placement and evidence boundaries."""
 from copy import deepcopy
 from contextlib import contextmanager
+import csv
 import hashlib
 import io
 import json
@@ -217,7 +218,11 @@ class AccountantHandoffBuilderTests(unittest.TestCase):
 
     def test_zip_uses_same_snapshot_hashes_entries_and_escapes_spreadsheet_cells(self):
         _, reading = self.statement("final")
-        self.confirm(reading, 0)
+        money = self.confirm(reading, 0)
+        self.accounting.remittances("POST", "", {"revision": money["revision"], "remittance": {
+            "periodEnd": "2026-09-09", "receivedDate": "2026-09-14", "amountCents": 100000,
+            "method": "bank", "note": "=private formula",
+        }})
         paid = self.paid_expense(vendor="=FORMULA", note="@hidden", amountCents=17500)
         self.receipt("support", linked=paid["id"])
         self.receipt("support-two", linked=paid["id"])
@@ -232,18 +237,56 @@ class AccountantHandoffBuilderTests(unittest.TestCase):
             with zipfile.ZipFile(artifact.path) as bundle:
                 names = set(bundle.namelist())
                 self.assertTrue({"summary.pdf", "income-by-billing-period.csv", "paid-expenses.csv",
-                                 "data-gaps.csv", "manifest.json"}.issubset(names))
+                                 "items-to-check.csv", "manifest.json"}.issubset(names))
+                self.assertNotIn("data-gaps.csv", names)
                 self.assertTrue(any(name.startswith("settlement-statements/") for name in names))
                 supporting = [name for name in names if name.startswith("supporting-documents/")]
                 self.assertEqual(len(supporting), 2)
                 self.assertEqual(len(set(supporting)), 2)
-                self.assertTrue(bundle.read("summary.pdf").startswith(b"%PDF-1.4"))
-                self.assertTrue(bundle.read("summary.pdf").endswith(b"%%EOF\n"))
+                summary = bundle.read("summary.pdf")
+                self.assertTrue(summary.startswith(b"%PDF-1.4"))
+                self.assertTrue(summary.endswith(b"%%EOF\n"))
+                self.assertIn(b"Generated: November 6, 2026, 10:30 PM UTC", summary)
+                self.assertIn(b"Gross sales: Not available for 1 billing period", summary)
+                self.assertIn(b"Total Margin Discount: $1,000.00 from 1 billing period", summary)
+                self.assertIn(b"$1,000.00 from 1 payment", summary)
+
+                income_csv = bundle.read("income-by-billing-period.csv").decode("utf-8-sig")
+                income = list(csv.DictReader(io.StringIO(income_csv)))
+                self.assertEqual(list(income[0]), DEFAULT_EXPORT_COPY["incomeHeaders"])
+                self.assertNotIn("Record ID", income[0])
+                statement = next(row for row in income if row["Record type"] == "Settlement statement")
+                self.assertEqual(statement["Statement status"], "Final")
+                self.assertEqual(statement["Gross sales"], "")
+                self.assertEqual(statement["Total Margin Discount"], "1000.00")
+                self.assertEqual(statement["Cash-account sales"], "50.00")
+                self.assertTrue(statement["Statement file"].startswith("settlement-statements/"))
+                negative = next(row for row in income if row["Adjustment"] == "Net Cash Sales")
+                self.assertEqual(negative["Amount"], "-50.00")
+                payment = next(row for row in income if row["Record type"] == "Settlement payment")
+                self.assertEqual(payment["Payment method"], "Bank transfer")
+                self.assertEqual(payment["Note"], "'=private formula")
+
                 expenses_csv = bundle.read("paid-expenses.csv").decode("utf-8-sig")
                 self.assertIn("'=FORMULA", expenses_csv)
                 self.assertIn("'@hidden", expenses_csv)
+                expenses = list(csv.DictReader(io.StringIO(expenses_csv)))
+                self.assertEqual(list(expenses[0]), DEFAULT_EXPORT_COPY["expenseHeaders"])
+                self.assertNotIn("Expense ID", expenses[0])
+                self.assertEqual(expenses[0]["Category amount"], "175.00")
+                self.assertEqual(expenses[0]["Expense total"], "175.00")
+                self.assertEqual(expenses[0]["Payment method"], "Bank transfer")
+                self.assertIn("supporting-documents/", expenses[0]["Supporting documents folder"])
+
+                gaps_csv = bundle.read("items-to-check.csv").decode("utf-8-sig")
+                gaps = list(csv.DictReader(io.StringIO(gaps_csv)))
+                self.assertEqual(list(gaps[0]), DEFAULT_EXPORT_COPY["gapHeaders"])
+                self.assertNotIn("Gap code", gaps[0])
+                self.assertEqual(gaps[0]["Record type"], "Settlement statement")
+                self.assertEqual(gaps[0]["Missing details"], "Gross sales")
                 manifest = json.loads(bundle.read("manifest.json"))
                 self.assertEqual(manifest["snapshot"]["snapshotId"], snapshot["snapshotId"])
+                self.assertEqual(manifest["copyVersion"], "labels-20261106")
                 self.assertNotIn("manifest.json", {entry["path"] for entry in manifest["entries"]})
                 for entry in manifest["entries"]:
                     content = bundle.read(entry["path"])
