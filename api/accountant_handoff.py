@@ -9,6 +9,8 @@ import hashlib
 import json
 import re
 
+from fastapi import HTTPException
+
 from .accounting_domain import Accounting, fail, now
 from .accounting_performance import gross_sales_cents
 from . import accounting_evidence as evidence
@@ -30,8 +32,15 @@ STATEMENT_FACT_FIELDS = (
 )
 
 
+class HandoffEvidenceUnverified(HTTPException):
+    """Canonical handoff evidence failed closed during reconciliation."""
+
+    def __init__(self):
+        super().__init__(503, "Accountant handoff evidence could not be verified.")
+
+
 def _unverified():
-    fail("Accountant handoff evidence could not be verified.", 503)
+    raise HandoffEvidenceUnverified()
 
 
 def _canonical(value):

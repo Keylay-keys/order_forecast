@@ -130,7 +130,16 @@ async def _custom_rate_limit_handler(request: Request, exc: RateLimitExceeded) -
         request.method == "PUT"
         and re.fullmatch(r"/api/orders/[^/]+", request.url.path) is not None
     )
-    code = "RATE_LIMIT_ORDER_UPDATE" if is_order_update else "RATE_LIMIT_EXCEEDED"
+    is_accounting_export = (
+        request.method == "GET"
+        and request.url.path == "/api/business/accounting/handoff/export"
+    )
+    if is_order_update:
+        code = "RATE_LIMIT_ORDER_UPDATE"
+    elif is_accounting_export:
+        code = "HANDOFF_EXPORT_RATE_LIMITED"
+    else:
+        code = "RATE_LIMIT_EXCEEDED"
     request.state.api_error_code = code
 
     response = structured_error_response(

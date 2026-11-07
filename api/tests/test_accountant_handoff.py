@@ -13,7 +13,7 @@ import zipfile
 
 from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
-from order_forecast.api.accountant_handoff import build_handoff_preview
+from order_forecast.api.accountant_handoff import build_handoff_preview, HandoffEvidenceUnverified
 from order_forecast.api.accountant_handoff_export import create_handoff_export, DEFAULT_EXPORT_COPY
 from order_forecast.api.accounting_store import AccountingExportBusy, accounting_export_scope
 from order_forecast.api.accounting_domain import Accounting
@@ -415,6 +415,31 @@ class AccountantHandoffHttpTests(unittest.TestCase):
             busy = self.export()
         self.assertEqual(busy.status_code, 409)
         self.assertEqual(busy.json()["code"], "HANDOFF_EXPORT_BUSY")
+
+        limiter.reset()
+        with patch.object(accounting, "execute_handoff_export", side_effect=HandoffEvidenceUnverified()):
+            unverified = self.export()
+        self.assertEqual(unverified.status_code, 503)
+        self.assertEqual(unverified.json()["code"], "HANDOFF_EVIDENCE_UNVERIFIED")
+
+        limiter.reset()
+        with patch.object(accounting, "execute_handoff_export", side_effect=HTTPException(503, "private")):
+            unavailable = self.export()
+        self.assertEqual(unavailable.status_code, 503)
+        self.assertEqual(unavailable.json()["code"], "HANDOFF_EXPORT_UNAVAILABLE")
+        self.assertNotIn("private", unavailable.text)
+
+    def test_preview_distinguishes_unverified_evidence_from_unavailable_storage(self):
+        with patch.object(accounting, "execute_handoff_preview", side_effect=HandoffEvidenceUnverified()):
+            unverified = self.get()
+        self.assertEqual(unverified.status_code, 503)
+        self.assertEqual(unverified.json()["code"], "HANDOFF_EVIDENCE_UNVERIFIED")
+
+        with patch.object(accounting, "execute_handoff_preview", side_effect=HTTPException(503, "private")):
+            unavailable = self.get()
+        self.assertEqual(unavailable.status_code, 503)
+        self.assertEqual(unavailable.json()["code"], "HANDOFF_PREVIEW_UNAVAILABLE")
+        self.assertNotIn("private", unavailable.text)
 
     def test_team_member_and_transferred_owner_cannot_preview(self):
         self.app.dependency_overrides[verify_firebase_token] = lambda: {"uid": "team-member"}

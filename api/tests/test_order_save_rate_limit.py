@@ -9,6 +9,7 @@ from fastapi.testclient import TestClient
 from order_forecast.api.errors import install_api_error_handlers
 from order_forecast.api.middleware.rate_limit import (
     limiter,
+    rate_limit_accounting_export,
     rate_limit_order_read,
     rate_limit_order_update,
     setup_rate_limiting,
@@ -45,6 +46,14 @@ def _build_app() -> FastAPI:
     @app.get("/api/orders/active")
     @rate_limit_order_read
     async def active_orders(
+        request: Request,
+        _token: dict = Depends(_test_auth),
+    ):
+        return {"ok": True}
+
+    @app.get("/api/business/accounting/handoff/export")
+    @rate_limit_accounting_export
+    async def accounting_export_rate_limit_contract(
         request: Request,
         _token: dict = Depends(_test_auth),
     ):
@@ -151,6 +160,27 @@ class OrderSaveRateLimitTests(unittest.TestCase):
                 for _index in range(60):
                     self.assertEqual(client.put("/api/orders/order-a", headers=headers).status_code, 200)
                 self.assertEqual(client.put("/api/orders/order-a", headers=headers).status_code, 429)
+
+    def test_accounting_export_limit_uses_contract_error_code(self):
+        app = self.app
+        with patch("order_forecast.api.middleware.usage_analytics.enqueue_api_request"):
+            with TestClient(app, raise_server_exceptions=False) as client:
+                headers = {"Origin": PRODUCTION_ORIGIN, "X-Test-Uid": "handoff-owner"}
+                for _index in range(2):
+                    response = client.get(
+                        "/api/business/accounting/handoff/export",
+                        headers=headers,
+                    )
+                    self.assertEqual(response.status_code, 200)
+                rejected = client.get(
+                    "/api/business/accounting/handoff/export",
+                    headers=headers,
+                )
+
+        self.assertEqual(rejected.status_code, 429)
+        self.assertEqual(rejected.json()["code"], "HANDOFF_EXPORT_RATE_LIMITED")
+        self.assertEqual(rejected.json()["details"]["retryAfterSeconds"], 60)
+        self.assertEqual(rejected.headers["retry-after"], "60")
 
     def test_blank_authenticated_identity_falls_back_to_a_real_bucket(self):
         app = self.app

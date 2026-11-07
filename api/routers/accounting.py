@@ -19,7 +19,7 @@ from ..dependencies import get_firestore, verify_firebase_token
 from ..middleware.rate_limit import rate_limit_accounting_export, rate_limit_history
 from ..accounting_domain import Accounting, fail, identifier, now
 from ..accounting_store import AccountingExportBusy, accounting_export_scope, accounting_transaction
-from ..accountant_handoff import build_handoff_preview
+from ..accountant_handoff import build_handoff_preview, HandoffEvidenceUnverified
 from ..accountant_handoff_export import create_handoff_export, DEFAULT_EXPORT_COPY
 from ..accounting_pdf_capacity import request_capacity
 from ..errors import StructuredApiError
@@ -219,10 +219,13 @@ async def accountant_handoff_preview(
     selected_year = handoff_year(year)
     try:
         result = await run_in_threadpool(execute_handoff_preview, decoded_token["uid"], route, selected_year)
+    except HandoffEvidenceUnverified:
+        raise StructuredApiError(503, "Accountant handoff evidence could not be verified",
+                                 "HANDOFF_EVIDENCE_UNVERIFIED") from None
     except HTTPException as error:
         if error.status_code == 503:
-            raise StructuredApiError(503, "Accountant handoff evidence could not be verified",
-                                     "HANDOFF_EVIDENCE_UNVERIFIED") from None
+            raise StructuredApiError(503, "Accountant handoff is temporarily unavailable",
+                                     "HANDOFF_PREVIEW_UNAVAILABLE") from None
         raise
     except Exception:
         logger.warning("Accountant handoff preview could not complete")
@@ -247,13 +250,16 @@ async def accountant_handoff_export(
     except AccountingExportBusy:
         raise StructuredApiError(409, "An Accountant handoff download is already being prepared",
                                  "HANDOFF_EXPORT_BUSY") from None
+    except HandoffEvidenceUnverified:
+        raise StructuredApiError(503, "Accountant handoff evidence could not be verified",
+                                 "HANDOFF_EVIDENCE_UNVERIFIED") from None
     except HTTPException as error:
         if error.status_code == 413:
             raise StructuredApiError(413, "This handoff is too large for one download",
                                      "HANDOFF_EXPORT_TOO_LARGE") from None
         if error.status_code == 503:
-            raise StructuredApiError(503, "Accountant handoff evidence could not be verified",
-                                     "HANDOFF_EVIDENCE_UNVERIFIED") from None
+            raise StructuredApiError(503, "Accountant handoff download is temporarily unavailable",
+                                     "HANDOFF_EXPORT_UNAVAILABLE") from None
         raise
     except Exception:
         logger.warning("Accountant handoff export could not complete")

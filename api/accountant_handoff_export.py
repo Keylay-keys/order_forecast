@@ -11,6 +11,7 @@ import textwrap
 import zipfile
 
 from .accounting_domain import fail
+from .accountant_handoff import HandoffEvidenceUnverified
 
 
 # Provisional v1 copy for Claude's review before the endpoint is released.
@@ -89,7 +90,7 @@ class ExportArtifact:
 
 
 def _unverified():
-    fail("Accountant handoff evidence could not be verified.", 503)
+    raise HandoffEvidenceUnverified()
 
 
 def _spreadsheet_text(value):
