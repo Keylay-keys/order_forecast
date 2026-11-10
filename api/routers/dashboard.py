@@ -7,6 +7,7 @@ from typing import Any, Dict
 
 from fastapi import APIRouter, Depends, HTTPException, Path, Request
 from google.cloud import firestore
+from psycopg2.errors import UndefinedTable
 
 from ..dependencies import (
     get_firestore,
@@ -17,6 +18,7 @@ from ..dependencies import (
 )
 from ..middleware.rate_limit import rate_limit_history
 from ..models import ErrorResponse
+from ..dashboard_summary import get_dashboard_summary_payload
 from ..pcf_active_serving import (
     ProjectionContractError,
     ProjectionUnavailable,
@@ -25,6 +27,31 @@ from ..pcf_active_serving import (
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
+
+
+def _dashboard_fallback(db: firestore.Client, conn: Any, route_number: str) -> Dict[str, Any]:
+    """Serve the existing compact Firebase summary when projection serving is unavailable."""
+    try:
+        conn.rollback()
+    except Exception:
+        logger.exception("dashboard_projection_fallback_rollback_failed")
+        raise HTTPException(
+            503,
+            {"code": "dashboard_unavailable", "reason": "postgres_rollback_failed"},
+        )
+
+    try:
+        return get_dashboard_summary_payload(
+            db=db,
+            conn=conn,
+            route_number=route_number,
+        )
+    except Exception as exc:
+        logger.exception("dashboard_projection_fallback_failed")
+        raise HTTPException(
+            503,
+            {"code": "dashboard_unavailable", "reason": "fallback_failed"},
+        ) from exc
 
 
 @router.get(
@@ -57,17 +84,14 @@ async def get_dashboard_summary(
         conn = get_pg_connection()
         return get_dashboard_summary_from_postgres(conn, route_number)
     except ProjectionUnavailable as exc:
-        logger.info("dashboard_projection_unavailable reason=%s", exc.reason)
-        raise HTTPException(
-            503,
-            {"code": "projection_unavailable", "reason": exc.reason},
-        ) from exc
-    except ProjectionContractError as exc:
-        logger.exception("dashboard_projection_contract_error")
-        raise HTTPException(
-            503,
-            {"code": "projection_unusable", "reason": "contract_error"},
-        ) from exc
+        logger.warning("dashboard_projection_fallback reason=%s", exc.reason)
+        return _dashboard_fallback(db, conn, route_number)
+    except ProjectionContractError:
+        logger.exception("dashboard_projection_contract_error_fallback")
+        return _dashboard_fallback(db, conn, route_number)
+    except UndefinedTable:
+        logger.exception("dashboard_projection_schema_missing_fallback")
+        return _dashboard_fallback(db, conn, route_number)
     finally:
         if conn is not None:
             return_pg_connection(conn)

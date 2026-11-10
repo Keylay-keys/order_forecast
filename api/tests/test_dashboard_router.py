@@ -3,6 +3,7 @@ import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
 from fastapi import HTTPException
+from psycopg2.errors import UndefinedTable
 
 from order_forecast.api.routers import dashboard
 
@@ -43,6 +44,48 @@ class DashboardRouterAuthorizationTests(unittest.IsolatedAsyncioTestCase):
         load_payload.assert_called_once_with(conn, "989262")
         return_connection.assert_called_once_with(conn)
         self.assertEqual(result["routeNumber"], "989262")
+
+    async def test_missing_projection_table_uses_compact_firebase_fallback(self):
+        handler = inspect.unwrap(dashboard.get_dashboard_summary)
+        db = object()
+        conn = Mock()
+        fallback = {
+            "routeNumber": "989262",
+            "activePcfs": [],
+            "expiringItems": [],
+            "freshness": {"fresh": True, "source": "firebase_readthrough"},
+        }
+
+        with patch.object(
+            dashboard,
+            "require_route_access",
+            new=AsyncMock(return_value={"profile": {"routeNumber": "989262"}}),
+        ), patch.object(
+            dashboard, "get_pg_connection", return_value=conn
+        ), patch.object(
+            dashboard,
+            "get_dashboard_summary_from_postgres",
+            side_effect=UndefinedTable("pcf_projection_routes"),
+        ), patch.object(
+            dashboard, "get_dashboard_summary_payload", return_value=fallback
+        ) as load_fallback, patch.object(
+            dashboard, "return_pg_connection"
+        ) as return_connection:
+            result = await handler(
+                request=Mock(),
+                route_number="989262",
+                decoded_token={"uid": "route-member"},
+                db=db,
+            )
+
+        conn.rollback.assert_called_once_with()
+        load_fallback.assert_called_once_with(
+            db=db,
+            conn=conn,
+            route_number="989262",
+        )
+        return_connection.assert_called_once_with(conn)
+        self.assertEqual(result, fallback)
 
     async def test_route_denial_is_terminal_before_postgres_read(self):
         handler = inspect.unwrap(dashboard.get_dashboard_summary)
